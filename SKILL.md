@@ -1,6 +1,6 @@
 ---
 name: orchestrate-implementation
-description: Run an implementation end to end. First read the plans and settle every undecided thing with the user in plain language; then break the work into tasks and put up a chip for every one at once, blocked ones included. Once the user has created them it runs the job autonomously — messaging each agent to release it when its requirements land, checking returned work, merging it, and moving on to what that frees. Use when asked to orchestrate an implementation, work through a plan, grill a plan, settle open decisions before building, hand out tasks as chips, run work in parallel worktrees, coordinate agents, or drive a plan to done.
+description: Run an implementation end to end. First read the plans and settle every undecided thing with the user in plain language; then send an agent into the codebase to refine each plan into something buildable; then put up a chip for every task at once, blocked ones included. Once the user has created them it runs the job autonomously — messaging each agent to release it when its requirements land, checking returned work, merging it, and moving on to what that frees. Use when asked to orchestrate an implementation, work through a plan, grill a plan, settle open decisions before building, hand out tasks as chips, run work in parallel worktrees, coordinate agents, or drive a plan to done.
 ---
 
 Two acts, in order, and the second must not start before the first has finished.
@@ -32,7 +32,7 @@ command from the project root. State lives in
 again. If a directory or glob came, expand it, show what matched, and confirm
 that is the set. Only ask from scratch when nothing was given.
 
-There are **four** places it stops and waits for a real answer. They are all in
+There are **five** places it stops and waits for a real answer. They are all in
 the first half, and they all end at the same moment — when the chips are on
 screen:
 
@@ -41,7 +41,8 @@ screen:
 | 1 | Confirm which plans | You name them, or agree to what matched |
 | 2 | Ask the questions, a few at a time, as many rounds as it takes | Every undecided thing in the work has your answer |
 | 3 | Show the small ones as one list | You say they are fine, or correct them |
-| 4 | Show the rounds, then put up **every** chip — including the ones that must wait | You have created them |
+| 4 | Ask again, if refining the plans against real code turned up something nobody had decided | Those are answered too |
+| 5 | Show the rounds, then put up **every** chip — including the ones that must wait | You have created them |
 
 **After you create the chips, it is not yours any more.** From there the
 orchestrator runs the job itself: it tells each blocked agent when its
@@ -169,9 +170,74 @@ passes.**
 
 ---
 
+# Act one and a half — refinement
+
+The grill settles *what*. It does not make a plan buildable: nothing yet says
+which modules this work sits on, which files it touches, or what would prove it
+works. That is this act, and it is where the plan stops being prose.
+
+## 6. Refine each plan against the code that exists
+
+One agent per plan, run in parallel — they only ever write to their own plan
+file, so they cannot collide. Use the **Agent** tool with `model: "opus"`, and
+pass the generated brief as the prompt:
+
+```bash
+node $DRV refine list              # which plans still need it
+node $DRV refine brief docs/plans/2.1-flashcards.md
+```
+
+The brief hands the agent the settled decisions that bind this plan, tells it to
+read the codebase and find what the work must build on, and tells it to rewrite
+the plan so every decided thing is stated as decided. It is bounded hard: it may
+touch no file but that plan, it writes no product code, and —
+
+**it may decide nothing.** If it finds something the plan needs that nobody has
+settled — a number, a method, a rule that only became visible against the real
+code — it reports it and does not choose. That is the whole arrangement.
+
+Record what comes back:
+
+```bash
+node $DRV refine done docs/plans/2.1-flashcards.md <<'J'
+{"summary":"wrote the settled scheduler into the plan and named the queue it uses",
+ "builtOn":[{"path":"packages/offline/src/outbox.ts","what":"the queue a phone already uses"}],
+ "tasks":[{"key":"2.1","title":"the flashcard scheduler","needs":["0.14"],
+           "owns":["apps/api/src/core/cards"],"verify":["pnpm -C apps/api test"]}],
+ "newGaps":[{"title":"how long a phone keeps changes it could not send","why":"nothing says what happens after a week offline"}]}
+J
+```
+
+The tasks it proposes become the task records Act two hands out — `owns`,
+`needs` and `verify` come from here, worked out against real code rather than
+guessed at a desk.
+
+## 7. If refinement reopened anything, go back and ask
+
+A `newGap` is not a footnote. It lands in the register as an unanswered gap and
+**the grill reopens**:
+
+```
+⚠ 1 NEW undecided thing(s) found against the real code.
+These are gaps, not decisions. The grill reopens — ask the user before any chip exists:
+```
+
+Gather the new gaps from every refinement, research them, and put them to the
+user the same way as act one — plain question, real costs, recommended first.
+Then answer them and re-run the gate:
+
+```bash
+node $DRV refine check
+```
+
+It exits 1 while any plan is unrefined, any reopened gap is unanswered, or no
+tasks were produced. **Nothing is handed out until it passes.**
+
+---
+
 # Act two — driving it out
 
-## 6. Say who you are
+## 8. Say who you are
 
 Chips must know where to report. `ListAgents` never lists you, so your own name
 is the one in the registry that it does not show:
@@ -181,11 +247,19 @@ node $DRV whoami                    # lists the sessions in this directory
 node $DRV iam proj-a1             # record it — every brief will carry it
 ```
 
-## 7. Break the plans into tasks
+## 9. Check over the tasks refinement produced
 
-One task is one thing that can be built and proved on its own. For each, record
-what it needs, **what files it owns**, what it must build on, and what counts as
-proof:
+**Refinement already wrote these** — `refine done` recorded each plan's proposed
+tasks, with `owns`, `needs` and `verify` worked out against real code. Your job
+here is to read them, not to invent them:
+
+```bash
+node $DRV list --status gap >/dev/null; node $DRV board
+```
+
+Fix or fill anything thin with the same command that created them — `task add`
+updates a task that already exists, so you can correct one field without
+rewriting the record:
 
 ```bash
 cat <<'J' | node $DRV task add
@@ -206,7 +280,7 @@ the same time may never touch one file.** `owns` is how that is enforced. Get it
 from the plans — a step that says what it owns and what it only uses has already
 told you.
 
-## 8. Show the work in the chat, and let it refuse
+## 10. Show the work in the chat, and let it refuse
 
 ```bash
 node $DRV graph
@@ -225,7 +299,7 @@ Paste the output into the chat. That is the shared picture of what can be
 launched in parallel and what each thing is waiting for. Fix the plan until it
 is green. **Do not create a single chip while `graph` exits 1.**
 
-## 9. Create every chip at once
+## 11. Create every chip at once
 
 **Every one of them, up front — including the ones that cannot start yet.** Put
 them all on screen in one go so the user creates the whole set in one sitting.
@@ -270,7 +344,7 @@ Keep the board in view; it shows who has checked in and who has not:
 node $DRV board
 ```
 
-## 10. Release when the requirements have landed
+## 12. Release when the requirements have landed
 
 ```bash
 node $DRV release 2.1
@@ -288,7 +362,7 @@ That check matters because **a chip makes its own copy of the repository the
 moment it is opened**, which for a held chip is long before its requirements
 landed. A stale copy is the most expensive way this goes wrong.
 
-## 11. Take the work back
+## 13. Take the work back
 
 A chip reports two ways — a message so you hear it now, and a written line so it
 survives the window being closed:
@@ -325,7 +399,7 @@ If the joined run fails, or the merge conflicts, it goes **back to whoever wrote
 it** — they know what the code meant. Recover with
 `git -C .claude/worktrees/joined merge --abort`; the main line is untouched.
 
-## 12. Run it to the end without being driven
+## 14. Run it to the end without being driven
 
 Once the chips exist the user is out of it. The loop is yours, and it is only
 ever these four moves:
@@ -361,6 +435,13 @@ You are finished when every task is `landed` and `board` says so.
 - **A chip makes its own copy when it is opened, not when it is released.** A
   held chip opened on day one and released on day three is three days stale.
   This is why every release message carries a base check.
+- **A refining agent that decides something has broken the arrangement.** It is
+  there to make the plan buildable, not to fill its holes. A `newGap` coming
+  back is the step working, not failing — it means the code showed you something
+  the plans could not.
+- **Refinement is the only place `owns` can honestly come from.** Worked out at
+  a desk it is a guess; worked out against the real tree it is a fact. That
+  matters because the whole parallel arrangement rests on it.
 - **A chip's copy of the repository gets a random name**, so you cannot work out
   its address in advance. The check-in message is the only reliable way to get
   it — which is why every brief demands one before the agent does anything else,
@@ -393,6 +474,9 @@ You are finished when every task is `landed` and `board` says so.
 - **`error: no register at ...`**: wrong directory. Run from the project root or
   pass `--register <path>`. A chip reporting in from its own copy needs the
   absolute path — its brief already has it.
+- **`refine check` says "no tasks proposed"**: the refining agents returned
+  summaries but no `tasks` array. Without it there is nothing to hand out — send
+  them back with the shape spelled out.
 - **`graph` exits 1 with "would both change the same files"**: split the work, or
   make one wait for the other. Do not proceed.
 - **`✗ cannot release X — still waiting for Y (not landed)`**: Y reported but was

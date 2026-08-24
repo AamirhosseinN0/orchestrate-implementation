@@ -96,6 +96,29 @@ turned down and why, what conditions the choice carries, what it reaches back
 into — and a settled-decisions table is pasted into each plan, so the vague
 sentence stops being what a builder reads.
 
+## Act one and a half — refinement
+
+Settling *what* does not make a plan buildable. Nothing yet says which modules
+the work sits on, which files it touches, or what would prove it works.
+
+So one agent per plan goes into the actual codebase, finds what already exists
+that the work must build on, and rewrites the plan so every settled decision is
+stated as a decision. It is bounded hard: it may touch no file but its own plan,
+it writes no product code, and **it may decide nothing.**
+
+If it finds something the plan needs that nobody settled — a number, a method, a
+rule that only became visible against real code — it reports it and does not
+choose. The grill reopens:
+
+```
+⚠ 1 NEW undecided thing(s) found against the real code.
+These are gaps, not decisions. The grill reopens — ask the user before any chip exists:
+```
+
+What comes back is what Act two hands out. `owns`, `needs` and `verify` are
+worked out against the real tree rather than guessed at a desk — which matters,
+because the whole parallel arrangement rests on `owns` being true.
+
 ## Act two — driving it out
 
 The settled plans become tasks. Each declares what it needs, **what files it
@@ -151,7 +174,7 @@ main line move.
 
 | file | what it is |
 |---|---|
-| `SKILL.md` | the workflow — what the agent reads and follows |
+| `SKILL.md` | the workflow — the three acts, what the agent reads and follows |
 | `driver.mjs` | the bookkeeping: scanning, the question linter, the task graph, the board |
 | `reference/plain-words.md` | the vocabulary to reach for instead of jargon |
 

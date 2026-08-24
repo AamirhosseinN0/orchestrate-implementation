@@ -485,6 +485,134 @@ function cmdRender(flags) {
 }
 
 
+// ==================================================== act one and a half: refine
+// The grill settles what to do. Refinement makes the plan buildable against the
+// code that actually exists — and is not allowed to decide anything itself.
+
+function planEntry(r, needle) {
+  const hits = r.plans.filter((x) => x.path.includes(needle));
+  if (!hits.length) die('no plan matching "' + needle + '"');
+  if (hits.length > 1) die('"' + needle + '" matches ' + hits.length + ': ' + hits.map((h) => h.path).join(', '));
+  return hits[0];
+}
+
+function cmdRefineList() {
+  const r = readReg();
+  const done = r.gaps.filter((g) => g.status === 'answered');
+  console.log('plan'.padEnd(46) + 'decided'.padEnd(9) + 'refined');
+  console.log('-'.repeat(72));
+  for (const p of r.plans) {
+    const mine = done.filter((g) => g.plan === p.path).length;
+    console.log(p.path.padEnd(46) + String(mine).padEnd(9) + (p.refined ? '✓ ' + (p.refinedAt || '').slice(0, 10) : '—'));
+  }
+  const todo = r.plans.filter((x) => !x.refined);
+  console.log('\n' + todo.length + ' still to refine' + (todo.length ? ': ' + todo.map((x) => x.path).join(', ') : ''));
+}
+
+function cmdRefineBrief(needle) {
+  const r = readReg(); const p = planEntry(r, needle);
+  const mine = r.gaps.filter((g) => g.status === 'answered' && g.plan === p.path);
+  const B = [];
+  B.push('Refine one implementation plan so it can be built from, without anyone having to guess.');
+  B.push('');
+  B.push('**The plan:** `' + p.path + '` — read all ' + p.lines + ' lines before you change a word.');
+  B.push('');
+  B.push('**Already settled with the author. These are decided. Do not reopen them, do not improve');
+  B.push('on them, do not pick differently because the code suggests otherwise:**');
+  B.push('');
+  if (mine.length) for (const g of mine) {
+    B.push('- **' + (g.title || g.quote.slice(0, 60)) + '** → ' + g.answer.choice +
+           (g.answer.note ? '. ' + g.answer.note : ''));
+    for (const c of g.answer.carries || []) B.push('    - condition, not optional: ' + c);
+  } else B.push('- (none recorded for this plan)');
+  B.push('');
+  B.push('**What to do.**');
+  B.push('');
+  B.push('1. Read the codebase. Find what already exists that this plan must build on — the modules,');
+  B.push('   the helpers, the patterns it should use rather than reinvent. Name them by real path.');
+  B.push('2. Rewrite the plan so every settled decision is stated in it as a decision, and every');
+  B.push('   sentence that dodged a decision now says the decided thing. Keep the author\'s voice.');
+  B.push('3. Work out what building it actually touches: which files this work would create or');
+  B.push('   change, what it must wait for, and what would prove it works.');
+  B.push('');
+  B.push('**What you must not do.**');
+  B.push('');
+  B.push('- Do not decide anything that is still open. If you find something the plan needs and');
+  B.push('  nobody has settled — a number, a method, a rule — **report it, do not choose it.** That');
+  B.push('  is the whole point of this arrangement.');
+  B.push('- Do not write product code. You are finishing the plan, not building it.');
+  B.push('- Do not touch any file except `' + p.path + '`.');
+  B.push('');
+  B.push('**Report back exactly this shape, as JSON:**');
+  B.push('');
+  B.push('```json');
+  B.push('{');
+  B.push('  "summary": "what you changed in the plan, in two or three sentences",');
+  B.push('  "builtOn": [{"path": "real/path", "what": "what it is and why this work uses it"}],');
+  B.push('  "tasks": [{"key": "2.1", "title": "plain title", "needs": ["0.14"],');
+  B.push('             "owns": ["paths this work creates or changes"],');
+  B.push('             "verify": ["the exact commands that prove it"]}],');
+  B.push('  "newGaps": [{"title": "the thing nobody has decided", "why": "why it blocks", "quote": "the sentence"}]');
+  B.push('}');
+  B.push('```');
+  B.push('');
+  B.push('`owns` matters more than it looks: two tasks running at once may never touch one file, so');
+  B.push('be exact and be narrow. If two pieces of this plan must change the same file, they are one');
+  B.push('task, or one waits for the other — say which.');
+  console.log(B.join('\n'));
+}
+
+function cmdRefineDone(needle) {
+  const r = readReg(); const p = planEntry(r, needle);
+  const rep = stdinJson();
+  p.refined = true; p.refinedAt = now(); p.refineSummary = rep.summary || '';
+  p.builtOn = rep.builtOn || [];
+  let added = 0;
+  for (const g of rep.newGaps || []) {
+    r.gaps.push({
+      id: nextId(r), plan: p.path, line: g.line || 0, marker: 'refine',
+      why: g.why || 'found while refining against the code', hit: '', quote: g.quote || '',
+      section: '', title: g.title, scope: 'in', status: 'gap',
+      research: [], question: null, answer: null,
+    });
+    added++;
+  }
+  for (const t of rep.tasks || []) {
+    if (!t.key || !t.owns) continue;
+    const ex = (r.tasks ||= []).findIndex((x) => x.key === t.key);
+    const rec = { key: t.key, title: t.title || t.key, plan: p.path, needs: t.needs || [],
+      owns: t.owns, context: p.builtOn, verify: t.verify || [], decisions: [], notes: '',
+      branch: 'step/' + t.key, worktree: '', chip: '', status: 'planned', reports: [] };
+    if (ex >= 0) r.tasks[ex] = { ...r.tasks[ex], ...rec }; else r.tasks.push(rec);
+  }
+  writeReg(r);
+  console.log(p.path + ' refined.');
+  console.log('  ' + (rep.tasks || []).length + ' task(s) proposed');
+  console.log('  ' + (p.builtOn || []).length + ' existing thing(s) to build on');
+  if (added) {
+    console.log('\n⚠ ' + added + ' NEW undecided thing(s) found against the real code.');
+    console.log('These are gaps, not decisions. The grill reopens — ask the user before any chip exists:');
+    console.log('  driver.mjs list --status gap');
+  }
+}
+
+function cmdRefineCheck() {
+  const r = readReg();
+  const unrefined = r.plans.filter((x) => !x.refined);
+  const open = r.gaps.filter((g) => g.scope === 'in' && !['answered', 'dropped'].includes(g.status));
+  let fail = false;
+  if (unrefined.length) { console.error('✗ ' + unrefined.length + ' plan(s) not refined: ' + unrefined.map((x) => x.path).join(', ')); fail = true; }
+  if (open.length) {
+    console.error('✗ ' + open.length + ' gap(s) reopened by refinement and still unanswered:');
+    for (const g of open) console.error('    ' + g.id + '  ' + (g.title || g.quote.slice(0, 60)));
+    fail = true;
+  }
+  const noTasks = (r.tasks || []).length === 0;
+  if (noTasks) { console.error('✗ no tasks proposed — refinement produced nothing to hand out'); fail = true; }
+  if (fail) { console.error('\nnot ready to hand anything out.'); process.exit(1); }
+  console.log('✓ every plan refined, nothing left undecided, ' + r.tasks.length + ' task(s) ready. Run `graph`.');
+}
+
 // ============================================================ act two: driving
 // The grill settles what to build. These commands hand it out, hold back what
 // must wait, and refuse to let anything land unproved.
@@ -862,6 +990,13 @@ const HELP = `orchestrate-implementation driver — bookkeeping for a grill sess
   check                     exit 1 unless every candidate is judged and every in-scope gap answered.
   render [--out p] [--title t] [--name n] | --plan <p>
 
+making the plans buildable, between the grill and the work:
+
+  refine list               which plans still need it.
+  refine brief <plan>       the prompt for the refining agent. It may decide nothing.
+  refine done <plan> < json {summary, builtOn, tasks, newGaps} — records tasks, reopens gaps.
+  refine check              exits 1 unless every plan is refined and nothing was reopened.
+
 driving the work out, after the grill:
 
   whoami [--session id]     your own peer name, so chips can message you back.
@@ -895,6 +1030,15 @@ switch (cmd) {
   case 'status': cmdStatus(); break;
   case 'check': cmdCheck(); break;
   case 'render': cmdRender(flags); break;
+  case 'refine': {
+    const sub = rest.shift();
+    if (sub === 'list') cmdRefineList();
+    else if (sub === 'brief') cmdRefineBrief(rest[0]);
+    else if (sub === 'done') cmdRefineDone(rest[0]);
+    else if (sub === 'check') cmdRefineCheck();
+    else die('refine list|brief <plan>|done <plan>|check');
+    break;
+  }
   case 'whoami': cmdWhoami(flags); break;
   case 'iam': { const r = readReg(); r.orchestrator = rest[0] || die('need a name'); writeReg(r); console.log('briefs will tell chips to report to ' + r.orchestrator); break; }
   case 'task': if (rest.shift() !== 'add') die('only `task add` is supported'); cmdTaskAdd(); break;

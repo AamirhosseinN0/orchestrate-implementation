@@ -9,6 +9,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { execSync } from 'node:child_process';
 
 const CWD = process.cwd();
 let REG_PATH = path.join(CWD, '.claude', 'orchestration', 'register.json');
@@ -943,6 +944,21 @@ function cmdLanded(key, flags) {
   else console.log('Nothing was freed by it.');
 }
 
+// The orchestrator builds nothing. If work is sitting in the main checkout on
+// files that belong to a task, somebody has done a chip's job here.
+function trespass(r) {
+  let out = [];
+  try {
+    const dirty = execSync('git status --porcelain', { cwd: CWD, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })
+      .split('\n').map((l) => l.slice(3).trim()).filter(Boolean)
+      .map((l) => l.includes(' -> ') ? l.split(' -> ')[1] : l);
+    for (const f of dirty) for (const t of tasks(r)) {
+      if ((t.owns || []).some((o) => collides(f, o))) out.push({ file: f, key: t.key });
+    }
+  } catch { /* not a git repo, or git unavailable — skip */ }
+  return out;
+}
+
 function cmdBoard() {
   const r = readReg();
   if (!tasks(r).length) return console.log('no tasks yet');
@@ -959,6 +975,14 @@ function cmdBoard() {
     n('ready') + ' running · ' + n('held') + ' on hold · ' + n('planned') + ' not yet handed out');
   const stuck = tasks(r).filter((t) => t.status === 'held' && (t.needs || []).every((x) => { const d = tasks(r).find((y) => y.key === x); return d && d.status === 'landed'; }));
   if (stuck.length) console.log('\n⚠ held but nothing is blocking them any more — release: ' + stuck.map((t) => t.key).join(', '));
+  const tres = trespass(r);
+  if (tres.length) {
+    console.log('\n⚠ the main checkout has changes on files that belong to a task:');
+    for (const x of tres.slice(0, 8)) console.log('    ' + x.file + '  → belongs to ' + x.key);
+    if (tres.length > 8) console.log('    …and ' + (tres.length - 8) + ' more');
+    console.log('  You build nothing here. If this is yours, undo it and let ' +
+                [...new Set(tres.map((x) => x.key))].join('/') + ' do it in its own copy.');
+  }
 }
 
 // ------------------------------------------------------------------ dispatch

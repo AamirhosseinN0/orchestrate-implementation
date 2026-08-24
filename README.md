@@ -40,6 +40,33 @@ nothing it asks.
 
 ---
 
+## The orchestrator does not build
+
+It never refines a plan and it never writes product code. Refining goes to an
+agent; building goes out as a chip. The orchestrator reads, asks, dispatches,
+judges, verifies and merges — nothing else.
+
+That is not tidiness. A context stuffed with half-written code and plan prose
+has already made up its mind: it judges its own work kindly, stops seeing what
+it just wrote, and loses the thread of who is waiting on what. Judgement and
+verification are the whole job, and they are the first things to go.
+
+| Work | Who does it |
+|---|---|
+| Reading the plans, finding the gaps, asking you | The orchestrator |
+| Rewriting a plan so it can be built from | An agent, one per plan |
+| Writing any product code at all | A chip, in its own copy of the repository |
+| Running the checks, judging, merging | The orchestrator |
+
+The rule breaks on small jobs, never big ones — the one-line fix, the obviously
+missing import. So it is checked, not just asked for:
+
+```
+⚠ the main checkout has changes on files that belong to a task:
+    apps/api/src/core/cards/scheduler.py  → belongs to 2.1
+  You build nothing here. If this is yours, undo it and let 2.1 do it in its own copy.
+```
+
 ## Act one — the grill
 
 It reads every plan in full, then runs two passes that fail in different ways.

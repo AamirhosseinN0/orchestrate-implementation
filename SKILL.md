@@ -15,6 +15,29 @@ Two acts, in order, and the second must not start before the first has finished.
 task's requirements are not there, it waits — it does not start the part that
 looks independent.
 
+## The orchestrator does not build
+
+**It never refines a plan and it never writes product code.** Not one line, not
+one paragraph, however small the job looks. Refining goes to an agent in the
+chat; building goes out as a chip. The orchestrator reads, asks, dispatches,
+judges, verifies and merges — nothing else.
+
+This is not tidiness. A context stuffed with half-written code and plan prose is
+a context that has already made up its mind: it judges its own work kindly, it
+stops seeing what it just wrote, and it loses the thread of who is waiting on
+what. Judgement and verification are the whole job, and they are the first
+things to go.
+
+| Work | Who does it |
+|---|---|
+| Reading the plans, finding the gaps, asking the user | The orchestrator |
+| Rewriting a plan so it can be built from | An agent, one per plan |
+| Writing any product code at all | A chip, in its own copy of the repository |
+| Running the checks, judging the result, merging | The orchestrator |
+
+Running a test suite is verification, not building — that stays. Fixing what the
+suite caught is building, and goes back to whoever wrote it.
+
 One driver does the bookkeeping, so nothing found in hour one is lost in hour six:
 
 ```bash
@@ -164,9 +187,15 @@ node $DRV render --title "the flashcard grill" --name flashcards
 node $DRV render --plan docs/plans/2.1-flashcards.md
 ```
 
-Write the record, paste the settled-decisions table into each plan, and edit the
-vague sentences to say the decided thing. **Act two does not begin until `check`
-passes.**
+Write the record — that one is yours, it is what the user decided and you are
+the one who heard it.
+
+**Do not edit the plans yourself.** The settled-decisions table and the vague
+sentences that need replacing are handed to the refining agent in the next act,
+along with the codebase. It is the one that rewrites plans; you would be doing
+its job with worse information and a dirtier context.
+
+**Act one and a half does not begin until `check` passes.**
 
 ---
 
@@ -189,7 +218,8 @@ node $DRV refine brief docs/plans/2.1-flashcards.md
 
 The brief hands the agent the settled decisions that bind this plan, tells it to
 read the codebase and find what the work must build on, and tells it to rewrite
-the plan so every decided thing is stated as decided. It is bounded hard: it may
+the plan so every decided thing is stated as decided — **including pasting in the
+settled-decisions table**, which `render --plan` will print for you to include. It is bounded hard: it may
 touch no file but that plan, it writes no product code, and —
 
 **it may decide nothing.** If it finds something the plan needs that nobody has
@@ -435,6 +465,19 @@ You are finished when every task is `landed` and `board` says so.
 - **A chip makes its own copy when it is opened, not when it is released.** A
   held chip opened on day one and released on day three is three days stale.
   This is why every release message carries a base check.
+- **The rule breaks on small jobs, never big ones.** Nobody is tempted to build a
+  subsystem in the orchestrator. They are tempted by the one-line fix, the typo
+  in a plan, the import that is obviously missing. Each one is cheap and each
+  one costs the same thing: a context that has started producing instead of
+  judging. Send it back — it is one message and the author already has the file
+  open.
+- **"The chip is stuck, I'll just finish it" is the worst case**, because it
+  looks like rescuing the schedule. A stuck chip is a question — what is it
+  missing? — and answering that is your job. Finishing its work is not, and the
+  next thing you do is verify the code you just wrote.
+- **`board` will tell you when you have slipped.** It flags any change in the
+  main checkout that sits on a file some task owns. Nothing legitimate of yours
+  ever lands there — the decisions record is yours, the code never is.
 - **A refining agent that decides something has broken the arrangement.** It is
   there to make the plan buildable, not to fill its holes. A `newGap` coming
   back is the step working, not failing — it means the code showed you something

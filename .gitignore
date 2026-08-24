@@ -1,0 +1,5 @@
+# the register is working state for one run, not part of the skill
+.claude/orchestration/
+node_modules/
+*.log
+.DS_Store

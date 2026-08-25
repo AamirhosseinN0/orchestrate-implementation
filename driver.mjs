@@ -1126,7 +1126,7 @@ making the plans buildable, between the grill and the work:
 
   refine list               which plans still need it.
   refine brief <plan>       the prompt for the refining agent. It may decide nothing.
-  refine done <plan> < json {summary, builtOn, tasks, newGaps} — records tasks, reopens gaps.
+  refine done <plan>        read the agent's own report file; records tasks, reopens gaps.
   refine check              exits 1 unless every plan is refined and nothing was reopened.
 
 driving the work out, after the grill:

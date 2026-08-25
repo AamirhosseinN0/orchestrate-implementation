@@ -1,6 +1,6 @@
 ---
 name: orchestrate-implementation
-description: Run an implementation end to end. First read the plans and settle every undecided thing with the user in plain language; then send an agent into the codebase to refine each plan into something buildable; then hand out the work one round at a time, a chip per task. Inside a round it runs autonomously — checking returned work, sending back what is wrong, merging what is right — and no chip of the next round exists until the last one has landed and CI is green on it. Use when asked to orchestrate an implementation, work through a plan, grill a plan, settle open decisions before building, hand out tasks as chips, run work in parallel worktrees, coordinate agents, or drive a plan to done.
+description: Run an implementation end to end. First read the plans and settle every undecided thing with the user in plain language; then send an agent into the codebase to refine each plan into something buildable; then open every chip that can run without interfering — same file or same serialisation point means one waits — widening the set as work lands. It runs autonomously between handovers: checking returned work, merging what is right, recording CI checkpoints, and queueing all heavy checks through one shared machine slot so parallel agents cannot crash the box. Use when asked to orchestrate an implementation, work through a plan, grill a plan, settle open decisions before building, hand out tasks as chips, run work in parallel worktrees, coordinate agents, or drive a plan to done.
 ---
 
 Two acts, in order, and the second must not start before the first has finished.
@@ -120,21 +120,20 @@ screen:
 | 2 | Ask the questions, a few at a time, as many rounds as it takes | Every undecided thing in the work has your answer |
 | 3 | Show the small ones as one list | You say they are fine, or correct them |
 | 4 | Ask again, if refining the plans against real code turned up something nobody had decided | Those are answered too |
-| 5 | Show the rounds, then put up the chips for **one round** | You have created them |
+| 5 | Show the frontier, then put up every chip that can open without interference | You have created them |
 
-And then once more per round, for as many rounds as the work has — the next
-round's chips do not exist until the last one has landed and been proved.
+And then again each time the frontier widens — a landing frees its dependents
+and everything its files were blocking, so new chips become possible as work
+lands, not on a round schedule.
 
-**Inside a round, it is not yours.** From the moment you create a round's chips
-the orchestrator runs it: it takes back finished work, checks it, sends back what
-is wrong, merges what is right, and drives the round to landed and CI-green. It
-talks to the agents by message. You are not the messenger and you are not the
-gate.
+**While chips are open, it is not yours.** The orchestrator takes back finished
+work, checks it, sends back what is wrong, merges what is right, and records CI
+checkpoints as layers complete. It talks to the agents by message. You are not
+the messenger and you are not the gate.
 
-**Between rounds, it comes back to you** — with the previous round merged,
-CI-proved, the next round pre-flighted against the real code and its briefs
-doctored, and its chips ready to create. That is the only handover, and it costs
-you one sitting per round.
+**When the frontier widens, it comes back to you** — with the newly-possible
+tasks pre-flighted against the real code, their briefs doctored, and their chips
+ready to create. That is the only handover.
 
 It comes back to you only when it genuinely cannot proceed — a plan that
 contradicts itself, work that keeps failing its own checks, something nobody
@@ -422,8 +421,9 @@ Refinement wrote each task's `owns` by reading. Nobody has tested it against the
 code — and an untested owns list fails in one direction only: too narrow, one
 stop-and-ask round-trip per missing file, each one your record's fault.
 
-So before a round opens, one **read-only** agent per task goes in with a single
-job: find what the record missed.
+So before a task's chip opens, one **read-only** agent goes in with a single
+job: find what the record missed. `frontier` names the tasks about to open;
+those are the ones to pre-flight.
 
 ```bash
 node $DRV preflight brief 2.1      # the prompt; the agent writes its report to a file
@@ -443,55 +443,44 @@ because a widened owns can create a collision that was not there before.
 `preflight check` gates the round the way `graph` does: nothing opens while a
 task is unflown or a load-bearing gap sits outside its owns.
 
-## 12. Create one round of chips, and only one
+## 12. Open every chip that cannot interfere
 
-**Every chip of the current round, together — and not one chip of the next.**
-Put the round on screen in one go so the user creates it in a single sitting.
-
-**A round is finished when every task in it has landed *and* the main line has
-been through CI.** Not when the last agent reports done, not when the last merge
-goes in — when the whole of it has been proved together, on the main line, by a
-run nobody had a hand in. Until that, no chip of the next round exists.
-
-The driver refuses rather than trusting anyone to remember:
-
-```
-✗ C is in round 2, and an earlier round is not finished.
-  No chip of this round exists yet, and none is created until:
-    round 1: all landed, but CI has not been recorded green
-```
-
-Why it is worth the wait: every task in round two branches from a main line built
-out of round one's merges. If those merges are wrong together — each fine alone,
-broken in combination — then every chip you opened is building on a false floor,
-and you find out at the end of round two instead of the start.
+The unit of dispatch is not the round — it is **interference**. A task may open
+the moment two things are true: everything it builds on has **landed**, and
+nothing it owns — file or serialisation point — is in the hands of a task that
+is currently open. Round membership is irrelevant: a task three layers deep
+opens the instant its actual dependencies land, and a task in the "current"
+round waits if its files are in flight.
 
 ```bash
-node $DRV brief 0.14        # the whole self-contained prompt
-node $DRV chip 0.14 --id <task_id>
+node $DRV frontier
 ```
+
+prints exactly that: what can open right now (most-unblocking first), what is
+buildable but held back and by whom, on which file or point, and what is still
+waiting for work to land. Run it after every landing — a landing frees both its
+dependents *and* every task its files were blocking.
+
+`chip` enforces the same two rules and refuses otherwise:
+
+```
+✗ D would interfere with work that is open right now:
+    B  ↔  src/shared.py
+  Two of them changing one thing is the one failure this arrangement cannot
+  survive. It opens the moment B lands — `frontier` will say.
+```
+
+The needs-landed half is not bureaucracy: a chip copies the repository when it
+is opened, so opening it before its requirements land hands its agent a copy
+that is stale by exactly what it waited for. Nothing is created "on hold" —
+a chip either can start now, or it does not exist yet.
 
 `brief` **writes the brief to a file** and prints the short message to give the
-chip — a path, the check-in line, and whether it is on hold. That short message
-is the chip's `prompt`; the brief itself is read from disk. Nothing the agent
-needs is carried in a chat message, so nothing can be lost from one.
+chip — a path, the check-in line. That short message is the chip's `prompt`;
+the brief itself is read from disk, from the main checkout, by absolute path.
 
-```bash
-node $DRV brief 0.14
-# wrote /path/to/project/.claude/orchestration/briefs/0.14.md
-# Give the chip this, and nothing retyped from memory: …
-```
-
-The file lives in the **main checkout**, and the chip works in its own copy, so
-the path it is given is absolute — the brief will not be inside its worktree.
-
-The brief carries everything and leaves nothing to infer: the plan to read, the
-decisions already settled, the code it must build on (read-only ones marked),
-the only files it may change, the branch, the proof it must run, who to report
-to, and the standing order to stop and ask rather than guess.
-
-`brief --all` rewrites every one at once and names which changed — run it after
-any correction to the record.
+`brief --all` rewrites every live brief at once and names which changed — run it
+after any correction to the record.
 
 **Then `doctor`, before any chip exists.** A brief is handed to somebody who
 will believe it, so everything it cites that can be checked mechanically, is:
@@ -501,28 +490,17 @@ node $DRV doctor
 ```
 
 Every cited path must exist, every verify command's binary must resolve, no
-brief may be stale. It exits 1 otherwise. What it cannot see, you check by hand
-once: that a verify command's *target* is reachable — a database up, a service
-started. And never put a number in a brief that the run itself can change — a
-test count, a baseline, a row count. It is stale the moment the next task lands,
-and an agent hitting a real regression reads it as the expected failure. Write
-where to look it up instead.
+brief may be stale. It exits 1 otherwise. And never put a number in a brief that
+the run itself can change — a test count, a baseline. Write where to look it up
+instead.
 
-A held brief opens with `# ON HOLD — do not start yet`, names what it waits for,
-and says that nothing at all begins until it is told
-**"requirements are done, you may start"**.
-
-**Every brief opens by telling the agent to check in** — one message, sent before
-it reads anything, even when it is on hold. That message is the only way you
-learn where to reach it, because its copy of the repository gets a random name
-you cannot predict. Record each one as it arrives:
+**Every brief opens by telling the agent to check in** — one message, sent
+before it reads anything. That message is the only way you learn where to reach
+it. Record each one as it arrives:
 
 ```bash
 node $DRV agent 2.1 --name proj-b2      # the name the check-in came from
 ```
-
-Reply to a held one straight away so it knows it was heard and must wait. A task
-with no address cannot be released — `release` refuses and tells you so.
 
 Keep the board in view; it shows who has checked in and who has not:
 
@@ -532,17 +510,12 @@ node $DRV board
 
 ## 13. Releasing a held chip — which should never happen
 
-A round only opens once every round before it has landed, and a round never
-contains a task that waits on another task in the same round. So **every chip you
-create is ready to start, and none is ever on hold.**
+`chip` refuses to open a task whose requirements have not landed, so **every
+chip you create is ready to start, and none is ever on hold.**
 
-If one is, something is wrong rather than merely slow — the task is in the wrong
-round, or something was never recorded as landed. `chip` says so:
-
-```
-⚠ This should not have happened. A round only opens once every round before it has
-  landed, so nothing in the round being created can still be waiting.
-```
+If one is on hold anyway, something is wrong rather than merely slow — usually a
+dependency that finished but was never recorded with `landed`. `chip` says so
+when it happens.
 
 Fix the split; do not release your way around it. The machinery below stays for
 that case and for a run that predates this rule, and it refuses while any
@@ -596,7 +569,31 @@ eye, which is where attention goes at task forty of fifty:
 ```
 
 It exits 1 on a trespass, and also on a branch that changed nothing at all —
-which is not finished work either. Log the send-back:
+which is not finished work either.
+
+**The machine is a serialisation point too.** With six or seven chips open, six
+or seven full suites can start at once — and that is a memory panic, not a
+speed-up. So the run's heavy checks share one slot: a claim taken atomically
+(two agents seeing "free" at the same instant cannot both win), freed by the
+holder's process exiting rather than by anyone remembering, stolen if the holder
+is dead or has held it past 30 minutes, polled every ~10 seconds by whoever is
+waiting.
+
+Every brief already wires this in: a wrapper script is generated into
+`.claude/orchestration/bin/with-ci-slot`, and each verify command in a brief is
+printed *through* it. Your own round-closing CI run and any full-suite check you
+run while judging returned work go through the same wrapper:
+
+```bash
+.claude/orchestration/bin/with-ci-slot pnpm -C apps/api test
+node $DRV slot status          # who holds it, since when
+```
+
+Never free the slot by hand while a run may be inside it — `slot free` refuses
+unless the claim is stale, because emptying it under a live run causes the exact
+crash the slot exists to stop.
+
+Log the send-back:
 
 ```bash
 node $DRV say 2.1 --kind sendback --text "src/other/b.py is not yours — back out that change"
@@ -665,40 +662,38 @@ owns. Those are the same holds Act one made — a question, not a guess.
 
 You are finished when every task is `landed` and `board` says so.
 
-## 16. Close the round before opening the next
+## 16. CI checkpoints — prove the main line as it moves
 
-When the last task of a round has landed, the main line has changed in ways no
-single task ever saw. Run CI on it and record what came back.
+The frontier means the main line moves continuously instead of in round-sized
+steps, so CI becomes a **checkpoint** rather than a gate: record one whenever a
+dependency layer has fully landed, and at every natural pause. `frontier` keeps
+the drift visible and gets loud past five unproven landings:
 
-Say why, because it is not ceremony: **CI is the only check in this whole
+```
+⚠ 6 landing(s) since the last CI checkpoint. That is a lot of unproven main line
+```
+
+Why the checkpoint is not ceremony: **CI is the only check in this whole
 arrangement that varies the environment.** A different machine, a different
 checkout path, a clean database, a cold cache. Local green, staging green, and
 every agent's own suite all share one environment, and a bug that depends on it
 — a path parsed from where the repo happens to sit, a test passing on a garbage
 value it never actually checks — is structurally invisible to all of them at
-once. That class of bug is exactly what a round-closing CI run exists to catch:
+once.
 
 ```bash
-node $DRV wave                                   # what is left, and what is holding the next round
-node $DRV ci --status green --ref gh-run-4471    # or red
+node $DRV wave                                   # the dependency layer in flight
+node $DRV ci --status green --ref gh-run-4471    # or red, or skipped --why "..."
 ```
 
-`ci --status green` refuses while anything in the round is unlanded — a green run
-that predates a merge does not cover it. `red` blocks the next round outright:
-send the break back to whoever owns those files, exactly as you would a failed
-check, and record green only when a fresh run says so.
+`ci` records against a fully-landed layer (it refuses to certify one still in
+flight), a landing invalidates any CI result that predates it, and `red` means
+what it always meant: send the break back to whoever owns those files before
+anything else opens on top of it.
 
-If the project genuinely has no CI, say so once and say why — a missing run is a
-decision, not an omission:
-
-```bash
-node $DRV ci --status skipped --why "no CI on this repo; ran the full suite by hand on main"
-```
-
-A round also must not close *silently* over work that only a window makes
-possible. When an agent offers something outside its scope — a backfill only
-possible before a table gains data, an addition only its tree can make — record
-it the moment it is offered, because free-text notes die with contexts:
+A checkpoint also must not close over work that only a window makes possible.
+When an agent offers something outside its scope, record it the moment it is
+offered, because free-text notes die with contexts:
 
 ```bash
 node $DRV owed add --what "backfill the two rows 1.10a offered" \
@@ -706,11 +701,9 @@ node $DRV owed add --what "backfill the two rows 1.10a offered" \
 node $DRV owed assign o01 --to 1.10c    # and put it in that task's brief
 ```
 
-`ci --status green` lists every open owed item as it closes the round — assign
-each to a task that can still do it, or mark it done. A window that closes on an
-unassigned item closes for good.
-
-Then, and only then, put up the next round.
+`ci` lists every open owed item as it records — assign each to a task that can
+still do it, or mark it done. A window that closes on an unassigned item closes
+for good.
 
 ## 17. If the session running this ends, take it over
 
@@ -736,10 +729,21 @@ answer coming, and the agent is still waiting.
 - **A chip makes its own copy when it is opened, not when it is released.** A
   held chip opened on day one and released on day three is three days stale.
   This is why every release message carries a base check.
+- **The slot frees itself; hands off.** The wrapper ties freeing to the process
+  exiting, so a crashed suite still releases it. The failure mode left is a
+  human or an agent "helpfully" emptying a live claim — which starts the second
+  suite mid-first-suite and causes the crash everyone was queueing to avoid.
+  `slot free` refusing without `--force` is load-bearing.
+- **An agent waiting on the slot looks exactly like an agent working.** The
+  wrapper says so on stderr and `slot status` names the holder and the wait —
+  check it before diagnosing a "stuck" chip.
 - **A round that has landed is not a round that is finished.** Every merge passed
   its own staging run, and the last merge changed a main line that none of the
   earlier ones were tested against. CI on the finished round is the only thing
   that has seen all of it at once.
+- **Interference includes what an open task might still do.** A task counts as
+  in-flight until it *lands* — not until it reports. Reported-but-unmerged work
+  still collides, because its files are not yet where a new copy would get them.
 - **The gate is at chip creation, not at release.** Once a chip exists somebody
   can click it, and then work is happening on a floor you have not proved. That
   is why the refusal is there and not one step later.
@@ -836,9 +840,12 @@ answer coming, and the agent is still waiting.
   and somebody will debug a phantom.
 - **`task add` says "ignored: status, chip"**: working as intended — live state
   is not writable from a bulk edit. `set`, `chip`, `done` and `landed` own those.
-- **`chip` says "is in round N, and an earlier round is not finished"**: working
-  as intended. `wave` names what is missing — usually a CI result nobody
-  recorded.
+- **`chip` says "would interfere with work that is open right now"**: working as
+  intended — `frontier` says when it opens. Do not shrink the task's owns to
+  dodge the refusal; the overlap is real.
+- **`slot run` says "still held after 90 min"**: the holder is wedged but its
+  process is alive, so it cannot be auto-stolen. `slot status` names it; talk to
+  that agent, and only then `slot free ci --force`.
 - **`ci --status green` says "has not all landed yet"**: the run you are pointing
   at predates a merge still to come, so it does not cover the round. Land the
   rest, then run CI again.

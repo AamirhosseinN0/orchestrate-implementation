@@ -9,7 +9,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { execSync } from 'node:child_process';
+import { execSync, spawnSync } from 'node:child_process';
+import os from 'node:os';
 
 const CWD = process.cwd();
 let REG_PATH = path.join(CWD, '.claude', 'orchestration', 'register.json');
@@ -938,6 +939,66 @@ function cmdGraph() {
   console.log('\nNothing clashes. Every round above can run side by side.');
 }
 
+
+// ------------------------------------------------------------------ frontier
+// The old rule was a round at a time. The better rule: open every task whose
+// requirements have landed and whose files and serialisation points touch
+// nothing that is currently open. Interference, not round membership, is what
+// actually breaks parallel work.
+function interference(t, other) {
+  const files = overlap(t, other);
+  const points = (t.serialises || []).filter((x) => (other.serialises || []).includes(x));
+  return files.length || points.length ? { files, points } : null;
+}
+function openTasks(r, except) {
+  return tasks(r).filter((x) => x.key !== except && x.chip && !['landed', 'cancelled'].includes(x.status));
+}
+
+function cmdFrontier() {
+  const r = readReg();
+  const open = openTasks(r, null);
+  const unblocksOf = (key) => tasks(r).filter((x) => (x.needs || []).includes(key)).length;
+  const cands = tasks(r)
+    .filter((t) => t.status === 'planned' && !t.chip && heldNeeds(r, t).length === 0)
+    .sort((a, b) => unblocksOf(b.key) - unblocksOf(a.key) || (a.key < b.key ? -1 : 1));
+  const accepted = [], blocked = [];
+  for (const t of cands) {
+    const against = [...open, ...accepted];
+    const clash = against.map((o) => ({ o, i: interference(t, o) })).filter((x) => x.i);
+    if (clash.length) blocked.push({ t, why: clash });
+    else accepted.push(t);
+  }
+  const waiting = tasks(r).filter((t) => t.status === 'planned' && !t.chip && heldNeeds(r, t).length > 0);
+  if (open.length) {
+    console.log('Already open (' + open.length + '): ' + open.map((t) => t.key + '[' + t.status + ']').join('  '));
+    console.log('');
+  }
+  if (accepted.length) {
+    console.log('Can open RIGHT NOW, nothing they touch is in flight (' + accepted.length + '):');
+    for (const t of accepted) console.log('  ' + t.key.padEnd(10) + t.title.slice(0, 50) + (unblocksOf(t.key) ? '   → unblocks ' + unblocksOf(t.key) : ''));
+    console.log('\nFor each: preflight if not done, brief, then chip.');
+  } else console.log('Nothing new can open right now.');
+  if (blocked.length) {
+    console.log('\nBuildable but held back — they would interfere:');
+    for (const { t, why } of blocked) {
+      for (const { o, i } of why) {
+        const what = [...i.files, ...i.points.map((x) => 'serialisation point ' + x)].join('; ');
+        console.log('  ' + t.key.padEnd(10) + '↔ ' + o.key + '  on ' + what);
+      }
+    }
+  }
+  if (waiting.length) console.log('\nStill waiting on work to land: ' + waiting.map((t) => t.key).join('  '));
+  // CI checkpoints are no longer a hard gate, so keep the drift visible instead
+  const ciAts = Object.values(r.ci || {}).map((c) => Date.parse(c.at)).filter(Boolean);
+  const lastCi = ciAts.length ? Math.max(...ciAts) : 0;
+  const unproven = tasks(r).filter((t) => t.status === 'landed' && Date.parse(t.landedAt || 0) > lastCi).length;
+  if (unproven) {
+    console.log('\n' + (unproven >= 5 ? '⚠ ' : '') + unproven + ' landing(s) since the last CI checkpoint.' +
+      (unproven >= 5 ? ' That is a lot of unproven main line — record one at the next pause:' : ' Record one when the frontier pauses:'));
+    console.log('  driver.mjs ci --status green --ref <run>   (or red, or skipped --why)');
+  }
+}
+
 function cmdWhoami(flags) {
   const dir = path.join(process.env.HOME, '.claude', 'sessions');
   if (!fs.existsSync(dir)) die('no session registry at ' + dir);
@@ -955,6 +1016,23 @@ function cmdWhoami(flags) {
   for (const s of here) console.log('  ' + s.name.padEnd(24) + s.sessionId);
   console.log('\nYours is the one ListAgents does NOT show (it never lists you).');
   console.log('Or pass your own session id: driver.mjs whoami --session <id>');
+}
+
+
+// One wrapper, generated into the project, so every agent queues for the
+// machine the same way instead of six of them implementing six poll loops.
+function ensureSlotWrapper() {
+  const bin = orchDir('bin');
+  const f = path.join(bin, 'with-ci-slot');
+  const body = '#!/bin/sh\n' +
+    '# Heavy checks share one machine: two full suites at once is a memory panic.\n' +
+    '# This waits for the shared CI slot (checking every ~10s), takes it atomically,\n' +
+    '# runs your command, and frees the slot even if the command fails or dies.\n' +
+    'exec node "' + path.resolve(process.argv[1] || 'driver.mjs') + '" --register "' +
+    path.resolve(CWD, REG_PATH) + '" slot run ci -- "$@"\n';
+  fs.writeFileSync(f, body);
+  fs.chmodSync(f, 0o755);
+  return f;
 }
 
 function depOf(r, key) { return tasks(r).find((x) => x.key === key) || null; }
@@ -1059,10 +1137,18 @@ function cmdBrief(key, flags) {
   B.push('infer a decision from what you find in another copy of the repository — a change appearing');
   B.push('there is somebody mid-edit, not an answer.');
   B.push('');
-  B.push('**Before you say you are done, all of these must pass, and you must paste the output:**');
+  const wrapper = ensureSlotWrapper();
+  B.push('**Before you say you are done, all of these must pass, and you must paste the output.**');
+  B.push('');
+  B.push('The machine is shared: several copies running the full suite at once crashes it. So every');
+  B.push('check runs through the slot wrapper below — it waits its turn (checking every ~10 seconds),');
+  B.push('runs your command, and frees the slot by itself even if the run fails or you crash. Never');
+  B.push('run a heavy check bare, and never empty the slot by hand — another agent\'s run may be');
+  B.push('inside it, and freeing under it causes the exact crash the slot exists to stop. If the');
+  B.push('wait ever times out, say so and ask — do not run without the slot.');
   B.push('');
   B.push('```bash');
-  if ((t.verify || []).length) for (const v of t.verify) B.push(v);
+  if ((t.verify || []).length) for (const v of t.verify) B.push('"' + wrapper + '" ' + v);
   else B.push('# ⚠ nothing recorded. Ask what counts as proof before you start.');
   B.push('```');
   B.push('');
@@ -1342,6 +1428,108 @@ function cmdOwed(sub, rest, flags) {
   } else die('owed add|assign <id> --to <key>|done <id>|list');
 }
 
+
+// --------------------------------------------------------------------- slots
+// Six agents running the full suite at once is a memory panic. A slot is a
+// shared, single-holder claim on something the machine can only do once at a
+// time. Taking it is atomic (mkdir — only one wins), freeing is tied to the
+// holder's process exiting rather than to anyone remembering, and a holder
+// that died or held too long is stolen. Slot commands never read the register,
+// so waiting on a slot never blocks anyone else's bookkeeping.
+function slotLockPath(name) {
+  const d = path.join(path.dirname(REG_PATH), 'slots');
+  fs.mkdirSync(d, { recursive: true });
+  return path.join(d, slug(name) + '.lock');
+}
+function slotHolder(lock) {
+  try { return JSON.parse(fs.readFileSync(path.join(lock, 'holder.json'), 'utf8')); } catch { return null; }
+}
+function slotTryTake(name, task) {
+  const lock = slotLockPath(name);
+  try { fs.mkdirSync(lock, { recursive: false }); } catch { return null; }
+  fs.writeFileSync(path.join(lock, 'holder.json'), JSON.stringify({
+    pid: process.pid, host: os.hostname(), task: task || '', since: now(),
+  }, null, 2) + '\n');
+  return lock;
+}
+function slotIsStale(lock, staleMs) {
+  const h = slotHolder(lock);
+  if (!h) { try { return Date.now() - fs.statSync(lock).mtimeMs > 10000; } catch { return false; } }
+  if (Date.now() - Date.parse(h.since || 0) > staleMs) return true;
+  if (h.host === os.hostname() && h.pid) {
+    try { process.kill(h.pid, 0); return false; } catch (e) { return e.code === 'ESRCH'; }
+  }
+  return false;
+}
+function describeHolder(lock) {
+  const h = slotHolder(lock);
+  if (!h) return 'held (holder unknown — claim being written, or leftover)';
+  const mins = Math.round((Date.now() - Date.parse(h.since || 0)) / 60000);
+  return 'held by ' + (h.task || 'pid ' + h.pid) + ' on ' + h.host + ' for ' + mins + ' min';
+}
+
+function cmdSlot(sub, rest, flags, raw) {
+  const name = rest[0] || 'ci';
+  const lock = slotLockPath(name);
+  const staleMs = (Number(flags.stale) > 0 ? Number(flags.stale) : 30) * 60000;
+
+  if (sub === 'status') {
+    const d = path.dirname(lock);
+    const all = fs.readdirSync(d).filter((f) => f.endsWith('.lock'));
+    if (!all.length) return console.log('no slot is held.');
+    for (const f of all) console.log(f.replace(/\.lock$/, '') + ': ' + describeHolder(path.join(d, f)));
+    return;
+  }
+  if (sub === 'free') {
+    if (!fs.existsSync(lock)) return console.log(name + ' is already free.');
+    if (!flags.force && !slotIsStale(lock, staleMs))
+      die(name + ' is ' + describeHolder(lock) + " — its run may be inside it right now.\n" +
+          '       Freeing under a live run causes the exact crash the slot exists to stop.\n' +
+          '       If you are certain the holder is gone: slot free ' + name + ' --force');
+    fs.rmSync(lock, { recursive: true, force: true });
+    console.log(name + ' freed.');
+    return;
+  }
+  if (sub === 'take') {
+    const got = slotTryTake(name, flags.task);
+    if (got) return console.log(name + ' taken. You MUST free it when done: slot free ' + name + ' --force');
+    die(name + ' is ' + describeHolder(lock) + '. Prefer `slot run` — it frees itself.');
+  }
+  if (sub === 'wait' || sub === 'run') {
+    if (sub === 'run' && !raw.length) die('slot run ' + name + ' -- <command> — the command goes after the --');
+    const timeoutMs = (Number(flags.timeout) > 0 ? Number(flags.timeout) : 90) * 60000;
+    const t0 = Date.now();
+    let told = false;
+    let mine = null;
+    for (;;) {
+      mine = slotTryTake(name, flags.task);
+      if (mine) break;
+      if (slotIsStale(lock, staleMs)) {
+        console.error('slot ' + name + ': holder is dead or over the ' + Math.round(staleMs / 60000) + ' min limit — taking over.');
+        fs.rmSync(lock, { recursive: true, force: true });
+        continue;
+      }
+      if (Date.now() - t0 > timeoutMs)
+        die('slot ' + name + ' still ' + describeHolder(lock) + ' after ' + Math.round(timeoutMs / 60000) +
+            ' min.\n       Something is wedged — check `slot status` and talk to the orchestrator. Do NOT run without the slot.');
+      if (!told) { console.error('slot ' + name + ': ' + describeHolder(lock) + ' — waiting, checking every ~10s.'); told = true; }
+      // ~10s with jitter, so a crowd of waiters does not stampede the same instant
+      try { execSync('sleep ' + (8 + Math.floor(Math.random() * 5))); } catch { /* keep waiting */ }
+    }
+    const free = () => { try { fs.rmSync(mine, { recursive: true, force: true }); } catch { /* gone */ } };
+    if (sub === 'wait') { free(); return console.log(name + ' became free.'); }
+    process.on('exit', free);
+    for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(sig, () => { free(); process.exit(130); });
+    const q = raw.map((x) => "'" + String(x).replace(/'/g, "'\\''") + "'").join(' ');
+    console.error('slot ' + name + ': taken — running: ' + raw.join(' '));
+    const res = spawnSync('/bin/bash', ['-c', q], { stdio: 'inherit', cwd: process.cwd() });
+    free();
+    console.error('slot ' + name + ': freed.');
+    process.exit(res.status === null ? 1 : res.status);
+  }
+  die('slot run <name> -- <cmd> | status | wait <name> | take <name> | free <name> [--force]   (default name: ci)');
+}
+
 // -------------------------------------------------------------- wave gating
 // A wave is finished when every task in it has landed AND the main line has
 // been through CI. Not before, and no chip of the next wave exists until then.
@@ -1446,17 +1634,26 @@ function cmdChip(key, flags) {
   const r = readReg(); const t = getTask(r, key);
   if (['landed', 'reported', 'cancelled'].includes(t.status))
     die(key + ' is ' + t.status + ' — a chip cannot rewind it. If this is really meant to run again, that is a new task.');
-  const n = waveOf(r, key);
-  const stop = blocking(r, n);
-  if (stop.length && !t.chip) {
-    console.error('✗ ' + key + ' is in round ' + (n + 1) + ', and an earlier round is not finished.');
-    console.error('  No chip of this round exists yet, and none is created until:');
-    for (const x of stop) console.error('    ' + x);
-    console.error('\n  Everything already merged has to be proved together before more work starts');
-    console.error('  from it. Finish the round, land it, run CI, record it:');
-    console.error('    node driver.mjs wave');
-    console.error('    node driver.mjs ci --status green --ref <run>');
-    process.exit(1);
+  if (!t.chip) {
+    const pending = heldNeeds(r, t);
+    if (pending.length) {
+      console.error('✗ ' + key + ' still waits for ' + pending.join(', ') + ' to land.');
+      console.error('  A chip opens only when everything it builds on is already in the main line —');
+      console.error('  a copy taken earlier is stale by exactly what it waited for. Run `frontier`');
+      console.error('  to see what can open instead.');
+      process.exit(1);
+    }
+    const clashes = openTasks(r, key).map((o) => ({ o, i: interference(t, o) })).filter((x) => x.i);
+    if (clashes.length) {
+      console.error('✗ ' + key + ' would interfere with work that is open right now:');
+      for (const { o, i } of clashes) {
+        for (const f of i.files) console.error('    ' + o.key + '  ↔  ' + f);
+        for (const x of i.points) console.error('    ' + o.key + '  ↔  serialisation point ' + x);
+      }
+      console.error('  Two of them changing one thing is the one failure this arrangement cannot');
+      console.error('  survive. It opens the moment ' + [...new Set(clashes.map((c) => c.o.key))].join('/') + ' lands — `frontier` will say.');
+      process.exit(1);
+    }
   }
   if (flags.id) t.chip = flags.id;
   if (flags.worktree) t.worktree = flags.worktree;
@@ -1466,10 +1663,9 @@ function cmdChip(key, flags) {
   console.log(t.key + '  ' + t.status + (held.length ? '  waiting for ' + held.join(', ') : '  can start now'));
   if (held.length) {
     console.log('');
-    console.log('⚠ This should not have happened. A round only opens once every round before it has');
-    console.log('  landed, so nothing in the round being created can still be waiting. Either this');
-    console.log('  task is in the wrong round, or ' + held.join(', ') + ' was never recorded as landed.');
-    console.log('  Check `wave` and `graph` before you let anyone click that chip.');
+    console.log('⚠ This should not have happened — a chip only opens once everything it needs has');
+    console.log('  landed, so none is ever created on hold. Most likely ' + held.join(', ') + ' finished but was');
+    console.log('  never recorded with `landed`. Check `board` and `frontier` before anyone clicks this.');
   }
 }
 
@@ -1585,8 +1781,9 @@ function cmdLanded(key, flags) {
   const freed = tasks(r).filter((x) => x.status === 'held' && (x.needs || []).includes(key) &&
     heldNeeds(r, x).length === 0);
   console.log(key + ' landed.');
-  if (freed.length) { console.log('\nThese were waiting only on it and can be released now:'); for (const f of freed) console.log('  driver.mjs release ' + f.key); }
-  else console.log('Nothing was freed by it.');
+  if (freed.length) { console.log('\nHeld chips waiting only on it (legacy — new chips open instead of waiting):'); for (const f of freed) console.log('  driver.mjs release ' + f.key); }
+  console.log('\nRun `frontier` — this landing may have opened more than its direct dependents,');
+  console.log('and its files are no longer in flight, so tasks it was blocking can open too.');
 }
 
 // The orchestrator builds nothing. If work is sitting in the main checkout on
@@ -1754,7 +1951,9 @@ function cmdBoard() {
 const argv = process.argv.slice(2);
 const flags = {}; const rest = [];
 const BOOL_FLAGS = new Set(['stdout', 'all', 'load-bearing']);
+const raw = [];   // everything after `--`, verbatim — the command a slot runs
 for (let i = 0; i < argv.length; i++) {
+  if (argv[i] === '--') { raw.push(...argv.slice(i + 1)); break; }
   if (argv[i].startsWith('--')) {
     const k = argv[i].slice(2);
     flags[k] = (!BOOL_FLAGS.has(k) && argv[i + 1] && !argv[i + 1].startsWith('--')) ? argv[++i] : true;
@@ -1815,6 +2014,10 @@ driving the work out, after the grill:
   resume --name <peer>      take over a run after the session running it ended.
   landed <key>              record the merge, and name who that frees.
   board                     every task, its state, and what it waits for.
+  frontier                  every chip that can open right now without touching anything in
+                            flight, and exactly why the rest cannot.
+  slot run <n> -- <cmd>     wait for the shared machine slot (~10s polls), run the command,
+                            free the slot even if it fails. Also: slot status|wait|take|free.
   wave [--wave n]           the round in flight: what is left, and whether the next may open.
   ci --status green|red|skipped [--ref r] [--why w]   record CI for the round just landed.
 
@@ -1868,6 +2071,8 @@ switch (cmd) {
   }
   case 'doctor': cmdDoctor(); break;
   case 'owed': cmdOwed(rest.shift(), rest, flags); break;
+  case 'slot': cmdSlot(rest.shift(), rest, flags, raw); break;
+  case 'frontier': cmdFrontier(); break;
   case 'ci': cmdCi(flags); break;
   case 'say': cmdSay(rest[0], flags); break;
   case 'heard': cmdHeard(rest[0], flags); break;

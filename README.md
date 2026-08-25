@@ -234,28 +234,36 @@ reports every file the record missed, with the file:line that proves it. A
 mechanically: every path exists, every verify command's binary resolves, no
 brief is stale. Neither agent fixes anything; both write files, not chat.
 
-The work goes out **one round at a time**. Inside a round the orchestrator runs
-it alone: takes back finished work, checks it, sends back what is wrong, merges
-what is right.
-
-**A round is finished when every task in it has landed *and* the main line has
-been through CI** — not when the last agent reports done, not when the last merge
-goes in. Every merge passed its own staging run, and the last one changed a main
-line none of the earlier ones were tested against. CI on the finished round is
-the only thing that has seen all of it at once.
-
-No chip of the next round exists until then, and the driver refuses rather than
-trusting anyone to remember:
+The work goes out by **interference, not by round**: a task opens the moment
+everything it builds on has landed and nothing it owns — file or serialisation
+point — is in the hands of a task currently open. `frontier` prints what can
+open right now and exactly why the rest cannot; every landing widens it.
 
 ```
-✗ C is in round 2, and an earlier round is not finished.
-  No chip of this round exists yet, and none is created until:
-    round 1: all landed, but CI has not been recorded green
+✗ D would interfere with work that is open right now:
+    B  ↔  src/shared.py
+  It opens the moment B lands — `frontier` will say.
 ```
 
-The refusal is at chip creation rather than at release, because once a chip
-exists somebody can click it — and then work is happening on a floor nobody has
-proved.
+The refusal is at chip creation, because once a chip exists somebody can click
+it. And nothing opens before its requirements land — a chip copies the
+repository when it is opened, so an early chip is stale by exactly what it
+waited for.
+
+**The machine itself is a serialisation point.** Seven open chips means seven
+full test suites can start at once — a memory panic, not a speed-up. So heavy
+checks share one slot: taken atomically (two agents seeing "free" at the same
+instant cannot both win), freed by the holder's process exiting rather than by
+anyone remembering, stolen if the holder dies or overstays, polled every ~10
+seconds by whoever is waiting. A generated wrapper makes it one word long:
+
+```bash
+.claude/orchestration/bin/with-ci-slot pnpm -C apps/api test
+```
+
+CI on the moving main line becomes a checkpoint the frontier keeps visible —
+it gets loud past five unproven landings — and stays the only check in the
+arrangement that varies the environment.
 
 ```
 key           state      waits for     address           title

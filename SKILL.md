@@ -1,6 +1,6 @@
 ---
 name: orchestrate-implementation
-description: Run an implementation end to end. First read the plans and settle every undecided thing with the user in plain language; then send an agent into the codebase to refine each plan into something buildable; then put up a chip for every task at once, blocked ones included. Once the user has created them it runs the job autonomously — messaging each agent to release it when its requirements land, checking returned work, merging it, and moving on to what that frees. Use when asked to orchestrate an implementation, work through a plan, grill a plan, settle open decisions before building, hand out tasks as chips, run work in parallel worktrees, coordinate agents, or drive a plan to done.
+description: Run an implementation end to end. First read the plans and settle every undecided thing with the user in plain language; then send an agent into the codebase to refine each plan into something buildable; then hand out the work one round at a time, a chip per task. Inside a round it runs autonomously — checking returned work, sending back what is wrong, merging what is right — and no chip of the next round exists until the last one has landed and CI is green on it. Use when asked to orchestrate an implementation, work through a plan, grill a plan, settle open decisions before building, hand out tasks as chips, run work in parallel worktrees, coordinate agents, or drive a plan to done.
 ---
 
 Two acts, in order, and the second must not start before the first has finished.
@@ -102,13 +102,20 @@ screen:
 | 2 | Ask the questions, a few at a time, as many rounds as it takes | Every undecided thing in the work has your answer |
 | 3 | Show the small ones as one list | You say they are fine, or correct them |
 | 4 | Ask again, if refining the plans against real code turned up something nobody had decided | Those are answered too |
-| 5 | Show the rounds, then put up **every** chip — including the ones that must wait | You have created them |
+| 5 | Show the rounds, then put up the chips for **one round** | You have created them |
 
-**After you create the chips, it is not yours any more.** From there the
-orchestrator runs the job itself: it tells each blocked agent when its
-requirements have landed, takes back finished work, checks it, sends back what
-is wrong, merges what is right, and moves on to whatever that frees. It talks to
-the agents by message. You are not the messenger and you are not the gate.
+And then once more per round, for as many rounds as the work has — the next
+round's chips do not exist until the last one has landed and been proved.
+
+**Inside a round, it is not yours.** From the moment you create a round's chips
+the orchestrator runs it: it takes back finished work, checks it, sends back what
+is wrong, merges what is right, and drives the round to landed and CI-green. It
+talks to the agents by message. You are not the messenger and you are not the
+gate.
+
+**Between rounds, it comes back to you** — with the previous round merged and
+proved, and the next round's chips ready to create. That is the only handover,
+and it costs you one sitting per round.
 
 It comes back to you only when it genuinely cannot proceed — a plan that
 contradicts itself, work that keeps failing its own checks, something nobody
@@ -384,16 +391,28 @@ Paste the output into the chat. That is the shared picture of what can be
 launched in parallel and what each thing is waiting for. Fix the plan until it
 is green. **Do not create a single chip while `graph` exits 1.**
 
-## 11. Create every chip at once
+## 11. Create one round of chips, and only one
 
-**Every one of them, up front — including the ones that cannot start yet.** Put
-them all on screen in one go so the user creates the whole set in one sitting.
-A task that must wait still gets its chip now; it is simply created **on hold**,
-and its brief opens by saying so.
+**Every chip of the current round, together — and not one chip of the next.**
+Put the round on screen in one go so the user creates it in a single sitting.
 
-Do not stagger them, do not hold some back to suggest later, and do not wait for
-one round to finish before offering the next. The user's job is to create the
-set. Everything after that is yours.
+**A round is finished when every task in it has landed *and* the main line has
+been through CI.** Not when the last agent reports done, not when the last merge
+goes in — when the whole of it has been proved together, on the main line, by a
+run nobody had a hand in. Until that, no chip of the next round exists.
+
+The driver refuses rather than trusting anyone to remember:
+
+```
+✗ C is in round 2, and an earlier round is not finished.
+  No chip of this round exists yet, and none is created until:
+    round 1: all landed, but CI has not been recorded green
+```
+
+Why it is worth the wait: every task in round two branches from a main line built
+out of round one's merges. If those merges are wrong together — each fine alone,
+broken in combination — then every chip you opened is building on a false floor,
+and you find out at the end of round two instead of the start.
 
 ```bash
 node $DRV brief 0.14        # the whole self-contained prompt
@@ -444,7 +463,23 @@ Keep the board in view; it shows who has checked in and who has not:
 node $DRV board
 ```
 
-## 12. Release when the requirements have landed
+## 12. Releasing a held chip — which should never happen
+
+A round only opens once every round before it has landed, and a round never
+contains a task that waits on another task in the same round. So **every chip you
+create is ready to start, and none is ever on hold.**
+
+If one is, something is wrong rather than merely slow — the task is in the wrong
+round, or something was never recorded as landed. `chip` says so:
+
+```
+⚠ This should not have happened. A round only opens once every round before it has
+  landed, so nothing in the round being created can still be waiting.
+```
+
+Fix the split; do not release your way around it. The machinery below stays for
+that case and for a run that predates this rule, and it refuses while any
+requirement has not landed:
 
 ```bash
 node $DRV release 2.1
@@ -550,7 +585,31 @@ owns. Those are the same holds Act one made — a question, not a guess.
 
 You are finished when every task is `landed` and `board` says so.
 
-## 15. If the session running this ends, take it over
+## 15. Close the round before opening the next
+
+When the last task of a round has landed, the main line has changed in ways no
+single task ever saw. Run CI on it and record what came back:
+
+```bash
+node $DRV wave                                   # what is left, and what is holding the next round
+node $DRV ci --status green --ref gh-run-4471    # or red
+```
+
+`ci --status green` refuses while anything in the round is unlanded — a green run
+that predates a merge does not cover it. `red` blocks the next round outright:
+send the break back to whoever owns those files, exactly as you would a failed
+check, and record green only when a fresh run says so.
+
+If the project genuinely has no CI, say so once and say why — a missing run is a
+decision, not an omission:
+
+```bash
+node $DRV ci --status skipped --why "no CI on this repo; ran the full suite by hand on main"
+```
+
+Then, and only then, put up the next round.
+
+## 16. If the session running this ends, take it over
 
 Sessions die. When one does, fifty agents are messaging an address nobody reads,
 and none of them will work that out on their own.
@@ -574,6 +633,13 @@ answer coming, and the agent is still waiting.
 - **A chip makes its own copy when it is opened, not when it is released.** A
   held chip opened on day one and released on day three is three days stale.
   This is why every release message carries a base check.
+- **A round that has landed is not a round that is finished.** Every merge passed
+  its own staging run, and the last merge changed a main line that none of the
+  earlier ones were tested against. CI on the finished round is the only thing
+  that has seen all of it at once.
+- **The gate is at chip creation, not at release.** Once a chip exists somebody
+  can click it, and then work is happening on a floor you have not proved. That
+  is why the refusal is there and not one step later.
 - **Task states say where the work is; they never say what you promised.** That
   the board shows `2.1 ready` tells you nothing about the question its agent
   asked you an hour ago. Only the ledger does, and only if you wrote to it.
@@ -650,6 +716,12 @@ answer coming, and the agent is still waiting.
 - **`error: no register at ...`**: wrong directory. Run from the project root or
   pass `--register <path>`. A chip reporting in from its own copy needs the
   absolute path — its brief already has it.
+- **`chip` says "is in round N, and an earlier round is not finished"**: working
+  as intended. `wave` names what is missing — usually a CI result nobody
+  recorded.
+- **`ci --status green` says "has not all landed yet"**: the run you are pointing
+  at predates a merge still to come, so it does not cover the round. Land the
+  rest, then run CI again.
 - **`guard` says "changed nothing at all against main"**: the agent reported
   finished but its branch is empty. Either it committed to the wrong branch or it
   never committed. Ask which — do not go looking in its worktree yourself.

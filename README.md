@@ -221,17 +221,35 @@ door:
   same round. It would be reading somebody mid-edit. Make 2.1 wait for 2.5.
 ```
 
-Every task then goes up as a chip at once — blocked ones included, created on
-hold. **Once you have created them, the rest is not yours.** The orchestrator
-releases each blocked agent by message when its requirements land, takes back
-finished work, checks it, sends back what is wrong, merges what is right, and
-moves on to whatever that frees.
+The work goes out **one round at a time**. Inside a round the orchestrator runs
+it alone: takes back finished work, checks it, sends back what is wrong, merges
+what is right.
+
+**A round is finished when every task in it has landed *and* the main line has
+been through CI** — not when the last agent reports done, not when the last merge
+goes in. Every merge passed its own staging run, and the last one changed a main
+line none of the earlier ones were tested against. CI on the finished round is
+the only thing that has seen all of it at once.
+
+No chip of the next round exists until then, and the driver refuses rather than
+trusting anyone to remember:
+
+```
+✗ C is in round 2, and an earlier round is not finished.
+  No chip of this round exists yet, and none is created until:
+    round 1: all landed, but CI has not been recorded green
+```
+
+The refusal is at chip creation rather than at release, because once a chip
+exists somebody can click it — and then work is happening on a floor nobody has
+proved.
 
 ```
 key           state      waits for     address           title
 0.14          ● landed   —             proj-a1         the sweeper and the shelf
 2.1           ▶ ready    —             proj-b2         the flashcard scheduler
-2.9           ⏸ held     2.1,2.5       proj-c3         the knowledge bar
+
+round 2 of 6: 1/2 landed — next round is not created yet
 ```
 
 Each brief is self-contained: the plan to read, the decisions already settled,

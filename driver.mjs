@@ -978,14 +978,116 @@ function staleBriefs(r) {
   return tasks(r).filter((t) => t.briefSha && t.briefSha !== briefSha(t));
 }
 
+
+// -------------------------------------------------------------- wave gating
+// A wave is finished when every task in it has landed AND the main line has
+// been through CI. Not before, and no chip of the next wave exists until then.
+function waveOf(r, key) {
+  for (const w of waves(r)) if (w.tasks.some((t) => t.key === key)) return w.wave;
+  return -1;
+}
+function waveState(r, n) {
+  const w = waves(r).find((x) => x.wave === n);
+  if (!w) return null;
+  const landed = w.tasks.filter((t) => t.status === 'landed');
+  const ci = (r.ci || {})[String(n)] || null;
+  return { n, tasks: w.tasks, landed, allLanded: landed.length === w.tasks.length, ci,
+           green: !!ci && ['green', 'skipped'].includes(ci.status) };
+}
+// Why the next wave may not be opened yet — empty means it may.
+function blocking(r, n) {
+  const out = [];
+  for (let i = 0; i < n; i++) {
+    const st = waveState(r, i);
+    if (!st) continue;
+    if (!st.allLanded) out.push('round ' + (i + 1) + ': ' +
+      st.tasks.filter((t) => t.status !== 'landed').map((t) => t.key + '(' + t.status + ')').join(' '));
+    else if (!st.green) out.push('round ' + (i + 1) + ': all landed, but CI has not been recorded green');
+  }
+  return out;
+}
+
+function cmdCi(flags) {
+  const r = readReg();
+  const n = flags.wave !== undefined ? Number(flags.wave) - 1 : currentWave(r);
+  const st = waveState(r, n);
+  if (!st) die('there is no round ' + (n + 1));
+  const status = flags.status;
+  if (!['green', 'red', 'skipped'].includes(status)) die('--status must be green, red or skipped');
+  if (status === 'skipped' && !flags.why) die('--status skipped needs --why "..." — a missing CI run is a decision, not an omission');
+  if (!st.allLanded && status === 'green')
+    die('round ' + (n + 1) + ' has not all landed yet, so a green run does not cover it:\n       ' +
+        st.tasks.filter((t) => t.status !== 'landed').map((t) => t.key).join(' '));
+  (r.ci ||= {})[String(n)] = { status, ref: flags.ref || '', why: flags.why || '', at: now() };
+  writeReg(r);
+  console.log('round ' + (n + 1) + ' CI: ' + status + (flags.ref ? '  ' + flags.ref : ''));
+  if (status === 'green') {
+    const nxt = waveState(r, n + 1);
+    console.log(nxt ? 'Round ' + (n + 2) + ' may now be opened: ' + nxt.tasks.map((t) => t.key).join(' ')
+                    : 'That was the last round.');
+  } else if (status === 'red') console.log('Nothing of the next round is created. Send the break back to whoever owns those files.');
+}
+
+// The round that needs attention. A round that has fully landed but has no CI
+// recorded is the one holding everything up — it comes first, ahead of whatever
+// is nominally in flight.
+function currentWave(r) {
+  const ws = waves(r).filter((w) => w.wave >= 0);
+  for (const w of ws) {
+    const st = waveState(r, w.wave);
+    if (st.allLanded && !st.green) return w.wave;
+  }
+  for (const w of ws) if (w.tasks.some((t) => t.status !== 'landed')) return w.wave;
+  return Math.max(0, ws.length - 1);
+}
+
+function cmdWave(flags) {
+  const r = readReg();
+  const n = flags.wave !== undefined ? Number(flags.wave) - 1 : currentWave(r);
+  const st = waveState(r, n);
+  if (!st) die('there is no round ' + (n + 1));
+  console.log('Round ' + (n + 1) + ' of ' + waves(r).filter((w) => w.wave >= 0).length +
+              '  —  ' + st.landed.length + ' of ' + st.tasks.length + ' landed');
+  console.log('');
+  for (const t of st.tasks) console.log('  ' + (t.status === 'landed' ? '●' : '·') + ' ' +
+    t.key.padEnd(12) + t.status.padEnd(11) + t.title.slice(0, 44));
+  console.log('');
+  if (!st.allLanded) console.log('Not finished. The next round does not exist yet.');
+  else if (!st.green) {
+    console.log('All landed. CI has not been recorded — the next round still does not exist.');
+    console.log('  node driver.mjs ci --status green --ref <run>');
+  } else console.log('Finished and CI ' + st.ci.status + '. The next round may be opened.');
+  const b = blocking(r, n);
+  if (b.length) { console.log('\nEarlier rounds still holding this one up:'); for (const x of b) console.log('  ' + x); }
+}
+
 function cmdChip(key, flags) {
   const r = readReg(); const t = getTask(r, key);
+  const n = waveOf(r, key);
+  const stop = blocking(r, n);
+  if (stop.length && !t.chip) {
+    console.error('✗ ' + key + ' is in round ' + (n + 1) + ', and an earlier round is not finished.');
+    console.error('  No chip of this round exists yet, and none is created until:');
+    for (const x of stop) console.error('    ' + x);
+    console.error('\n  Everything already merged has to be proved together before more work starts');
+    console.error('  from it. Finish the round, land it, run CI, record it:');
+    console.error('    node driver.mjs wave');
+    console.error('    node driver.mjs ci --status green --ref <run>');
+    process.exit(1);
+  }
   if (flags.id) t.chip = flags.id;
   if (flags.worktree) t.worktree = flags.worktree;
   const held = (t.needs || []).filter((n) => getTask(r, n).status !== 'landed');
   t.status = held.length ? 'held' : 'ready';
   writeReg(r);
   console.log(t.key + '  ' + t.status + (held.length ? '  waiting for ' + held.join(', ') : '  can start now'));
+  if (held.length) {
+    console.log('');
+    console.log('⚠ This should not have happened. A round only opens once every round before it has');
+    console.log('  landed, so nothing in the round being created can still be waiting. Either this');
+    console.log('  task is in the wrong round, or ' + held.join(', ') + ' was never recorded as landed.');
+    console.log('  Check `wave` and `graph` before you let anyone click that chip.');
+  }
 }
 
 function cmdAgent(key, flags) {
@@ -1227,6 +1329,15 @@ function cmdBoard() {
     n('ready') + ' running · ' + n('held') + ' on hold · ' + n('planned') + ' not yet handed out');
   const stuck = tasks(r).filter((t) => t.status === 'held' && (t.needs || []).every((x) => { const d = tasks(r).find((y) => y.key === x); return d && d.status === 'landed'; }));
   if (stuck.length) console.log('\n⚠ held but nothing is blocking them any more — release: ' + stuck.map((t) => t.key).join(', '));
+  const cw = currentWave(r);
+  const cst = waveState(r, cw);
+  if (cst) {
+    console.log('\nround ' + (cw + 1) + ' of ' + waves(r).filter((w) => w.wave >= 0).length + ': ' +
+      cst.landed.length + '/' + cst.tasks.length + ' landed' +
+      (cst.allLanded ? (cst.green ? ', CI ' + cst.ci.status + ' — next round may be opened'
+                                  : ', CI not recorded — next round is not created yet')
+                     : ' — next round is not created yet'));
+  }
   const stale = staleBriefs(r);
   if (stale.length) {
     console.log('\n⚠ the record changed after these briefs were written — the agent holding one is');
@@ -1298,6 +1409,8 @@ driving the work out, after the grill:
   resume --name <peer>      take over a run after the session running it ended.
   landed <key>              record the merge, and name who that frees.
   board                     every task, its state, and what it waits for.
+  wave [--wave n]           the round in flight: what is left, and whether the next may open.
+  ci --status green|red|skipped [--ref r] [--why w]   record CI for the round just landed.
 
   --register <path>         default .claude/orchestration/register.json`;
 
@@ -1338,6 +1451,8 @@ switch (cmd) {
   case 'guard': cmdGuard(rest[0], flags); break;
   case 'landed': cmdLanded(rest[0], flags); break;
   case 'board': cmdBoard(); break;
+  case 'wave': cmdWave(flags); break;
+  case 'ci': cmdCi(flags); break;
   case 'say': cmdSay(rest[0], flags); break;
   case 'heard': cmdHeard(rest[0], flags); break;
   case 'outstanding': cmdOutstanding(); break;

@@ -38,6 +38,32 @@ things to go.
 Running a test suite is verification, not building — that stays. Fixing what the
 suite caught is building, and goes back to whoever wrote it.
 
+## Nothing an agent is told lives only in your context
+
+You will be compacted. It happens silently, and what it takes is detail — a file
+dropped from a list, a condition dropped from a decision. An agent then builds
+against something you no longer have, and neither of you can see the gap.
+
+So **nothing is retyped from memory.** Every brief is written to a file and the
+agent is given the path. Every refining agent writes its own report to a file
+and you read that file. Your context carries the pointer, never the payload.
+
+```
+.claude/orchestration/
+  register.json          every decision, gap and task
+  refine/<plan>.json     what each refining agent found, in its own words
+  briefs/<key>.md        exactly what each chip was told
+```
+
+Two habits follow, and they are not optional:
+
+- **Never summarise an agent's report into the record.** If a report is missing,
+  ask the agent to write the file — do not reconstruct it from what it said in
+  the chat. `refine done` refuses rather than letting you type it in.
+- **When you correct a record, the briefs are now wrong.** `board` tells you
+  which; `brief --all` rewrites them and names what changed, so you know which
+  agents to send back to their brief.
+
 One driver does the bookkeeping, so nothing found in hour one is lost in hour six:
 
 ```bash
@@ -226,16 +252,34 @@ touch no file but that plan, it writes no product code, and —
 settled — a number, a method, a rule that only became visible against the real
 code — it reports it and does not choose. That is the whole arrangement.
 
-Record what comes back:
+**The agent writes its report to a file** — the brief names the exact path — and
+you read that file. It never passes through your context, so it cannot lose a
+line on the way:
 
 ```bash
-node $DRV refine done docs/plans/2.1-flashcards.md <<'J'
+node $DRV refine done docs/plans/2.1-flashcards.md
+# read the agent's own report: .claude/orchestration/refine/docs-plans-2.1-flashcards.json
+```
+
+If the file is not there, `refine done` refuses. Ask the agent to write it.
+Do not type in what it told you — that is exactly how a file goes missing:
+
+```
+error: no report at .claude/orchestration/refine/docs-plans-2.1-flashcards.json
+       and nothing on stdin.
+       The agent was told to write its report to that path. Ask it to,
+       rather than retyping what it told you — that is how files get dropped.
+```
+
+The shape it must write:
+
+```bash
+# .claude/orchestration/refine/docs-plans-2.1-flashcards.json
 {"summary":"wrote the settled scheduler into the plan and named the queue it uses",
  "builtOn":[{"path":"packages/offline/src/outbox.ts","what":"the queue a phone already uses"}],
  "tasks":[{"key":"2.1","title":"the flashcard scheduler","needs":["0.14"],
            "owns":["apps/api/src/core/cards"],"verify":["pnpm -C apps/api test"]}],
  "newGaps":[{"title":"how long a phone keeps changes it could not send","why":"nothing says what happens after a week offline"}]}
-J
 ```
 
 The tasks it proposes become the task records Act two hands out — `owns`,
@@ -345,12 +389,27 @@ node $DRV brief 0.14        # the whole self-contained prompt
 node $DRV chip 0.14 --id <task_id>
 ```
 
-Take `brief`'s output as the chip's `prompt` — use `spawn_task` with a `title`
-and a `tldr`, and record the returned `task_id` with `chip`. The brief already
-carries everything the agent needs and nothing it has to infer: the plan to
-read, the decisions already settled, the code it must build on (with read-only
-ones marked), the only files it may change, the branch, the proof it must run,
-who to report to, and the standing order to stop and ask rather than guess.
+`brief` **writes the brief to a file** and prints the short message to give the
+chip — a path, the check-in line, and whether it is on hold. That short message
+is the chip's `prompt`; the brief itself is read from disk. Nothing the agent
+needs is carried in a chat message, so nothing can be lost from one.
+
+```bash
+node $DRV brief 0.14
+# wrote /path/to/project/.claude/orchestration/briefs/0.14.md
+# Give the chip this, and nothing retyped from memory: …
+```
+
+The file lives in the **main checkout**, and the chip works in its own copy, so
+the path it is given is absolute — the brief will not be inside its worktree.
+
+The brief carries everything and leaves nothing to infer: the plan to read, the
+decisions already settled, the code it must build on (read-only ones marked),
+the only files it may change, the branch, the proof it must run, who to report
+to, and the standing order to stop and ask rather than guess.
+
+`brief --all` rewrites every one at once and names which changed — run it after
+any correction to the record.
 
 A held brief opens with `# ON HOLD — do not start yet`, names what it waits for,
 and says that nothing at all begins until it is told
@@ -465,6 +524,19 @@ You are finished when every task is `landed` and `board` says so.
 - **A chip makes its own copy when it is opened, not when it is released.** A
   held chip opened on day one and released on day three is three days stale.
   This is why every release message carries a base check.
+- **Compaction takes detail, not headlines.** You will not notice it. What goes
+  is a file dropped from a list or a condition dropped from a decision — and the
+  agent then builds against something you no longer hold. This is not
+  hypothetical: it has happened, twice in one round, and both times it was the
+  agent's ask-don't-guess rule that caught it rather than anything on this side.
+  Keep the payload in files and carry only pointers.
+- **A corrected record does not correct a brief already handed out.** The agent
+  is still holding the old one. `board` flags it; `brief --all` rewrites it; and
+  you still have to tell that agent to re-read it, because it will not know.
+- **An agent that had to ask you for a missing file has found a bug in your
+  record, not in itself.** Fix the record and rewrite the brief — do not just
+  answer the question in the chat, or the next agent to read that brief hits the
+  same hole.
 - **The rule breaks on small jobs, never big ones.** Nobody is tempted to build a
   subsystem in the orchestrator. They are tempted by the one-line fix, the typo
   in a plan, the import that is obviously missing. Each one is cheap and each
@@ -517,6 +589,11 @@ You are finished when every task is `landed` and `board` says so.
 - **`error: no register at ...`**: wrong directory. Run from the project root or
   pass `--register <path>`. A chip reporting in from its own copy needs the
   absolute path — its brief already has it.
+- **`refine done` says "no report at … and nothing on stdin"**: the agent has not
+  written its file yet, or wrote it elsewhere. Ask it to write it to the path in
+  its brief. Do not paste the JSON in from the chat.
+- **`board` warns "the record changed after these briefs were written"**: run
+  `brief --all`, then message each named agent to re-read its brief.
 - **`refine check` says "no tasks proposed"**: the refining agents returned
   summaries but no `tasks` array. Without it there is nothing to hand out — send
   them back with the shape spelled out.

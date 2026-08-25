@@ -67,6 +67,42 @@ missing import. So it is checked, not just asked for:
   You build nothing here. If this is yours, undo it and let 2.1 do it in its own copy.
 ```
 
+## Nothing an agent is told lives only in a context
+
+Contexts get compacted, silently, and what goes is detail — a file dropped from
+a list, a condition dropped from a decision. The agent then builds against
+something the orchestrator no longer holds, and neither can see the gap.
+
+So nothing is retyped from memory. Every brief is written to a file and the
+agent is given the path. Every refining agent writes its own report to a file,
+and the orchestrator reads that file. The context carries the pointer, never the
+payload.
+
+```
+.claude/orchestration/
+  register.json          every decision, gap and task
+  refine/<plan>.json     what each refining agent found, in its own words
+  briefs/<key>.md        exactly what each chip was told
+```
+
+Recording a report the agent did not write is refused outright:
+
+```
+error: no report at .claude/orchestration/refine/docs-plans-2.1.json and nothing on stdin.
+       The agent was told to write its report to that path. Ask it to,
+       rather than retyping what it told you — that is how files get dropped.
+```
+
+And a record corrected after its brief went out does not silently disagree with
+what the agent is holding:
+
+```
+⚠ the record changed after these briefs were written — the agent holding one is
+  working from something you have since corrected:
+    2.1  .claude/orchestration/briefs/2.1.md
+  Rewrite with `brief --all`, then tell each affected agent to re-read its brief.
+```
+
 ## Act one — the grill
 
 It reads every plan in full, then runs two passes that fail in different ways.

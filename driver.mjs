@@ -510,6 +510,26 @@ function cmdRefineList() {
   console.log('\n' + todo.length + ' still to refine' + (todo.length ? ': ' + todo.map((x) => x.path).join(', ') : ''));
 }
 
+
+// Everything an agent is told lives on disk, not in the orchestrator's memory.
+// A compaction can drop a sentence from a context; it cannot drop a file.
+function orchDir(sub) {
+  const d = path.join(path.dirname(path.resolve(CWD, REG_PATH)), sub);
+  fs.mkdirSync(d, { recursive: true });
+  return d;
+}
+const slug = (x) => x.replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^-|-$/g, '');
+function briefPath(key) { return path.join(orchDir('briefs'), slug(key) + '.md'); }
+function reportPath(planPath) { return path.join(orchDir('refine'), slug(planPath.replace(/\.md$/, '')) + '.json'); }
+// What the brief is built from. Volatile fields (who checked in, what landed)
+// are excluded — they change without changing a word of the brief.
+function briefSha(t) {
+  return crypto.createHash('sha256').update(JSON.stringify({
+    key: t.key, title: t.title, plan: t.plan, needs: t.needs, owns: t.owns,
+    context: t.context, verify: t.verify, decisions: t.decisions, notes: t.notes, branch: t.branch,
+  })).digest('hex').slice(0, 12);
+}
+
 function cmdRefineBrief(needle) {
   const r = readReg(); const p = planEntry(r, needle);
   const mine = r.gaps.filter((g) => g.status === 'answered' && g.plan === p.path);
@@ -544,7 +564,14 @@ function cmdRefineBrief(needle) {
   B.push('- Do not write product code. You are finishing the plan, not building it.');
   B.push('- Do not touch any file except `' + p.path + '`.');
   B.push('');
-  B.push('**Report back exactly this shape, as JSON:**');
+  B.push('**Write your report to this exact file** — not into the chat, not as a summary. The');
+  B.push('orchestrator reads the file, so nothing you found can be lost on the way:');
+  B.push('');
+  B.push('    ' + reportPath(p.path));
+  B.push('');
+  B.push('It must be valid JSON of exactly this shape. Be complete — every file you list under');
+  B.push('`owns` is a file somebody is allowed to touch, and one you leave out is one they will');
+  B.push('have to stop and ask about:');
   B.push('');
   B.push('```json');
   B.push('{');
@@ -560,12 +587,32 @@ function cmdRefineBrief(needle) {
   B.push('`owns` matters more than it looks: two tasks running at once may never touch one file, so');
   B.push('be exact and be narrow. If two pieces of this plan must change the same file, they are one');
   B.push('task, or one waits for the other — say which.');
+  B.push('');
+  B.push('When the file is written, say only that you have written it and what is in it in one line.');
+  B.push('Do not paste the JSON back — the file is the report.');
   console.log(B.join('\n'));
 }
 
-function cmdRefineDone(needle) {
+function cmdRefineDone(needle, flags) {
   const r = readReg(); const p = planEntry(r, needle);
-  const rep = stdinJson();
+  const src = flags.from ? path.resolve(CWD, flags.from) : reportPath(p.path);
+  let rep;
+  if (fs.existsSync(src)) {
+    try { rep = JSON.parse(fs.readFileSync(src, 'utf8')); }
+    catch (e) { die('the report at ' + rel(src) + ' is not valid JSON: ' + e.message + '\n       Send it back to the agent — do not retype it yourself.'); }
+    console.log("read the agent's own report: " + rel(src));
+  } else {
+    // Older flow, and the escape hatch: JSON piped in. Still works, but the file
+    // is better — it cannot lose a line to a compaction on the way here.
+    let raw = '';
+    try { raw = fs.readFileSync(0, 'utf8'); } catch { /* no stdin */ }
+    if (!raw.trim()) die('no report at ' + rel(src) + ' and nothing on stdin.\n' +
+      '       The agent was told to write its report to that path. Ask it to,\n' +
+      '       rather than retyping what it told you — that is how files get dropped.');
+    try { rep = JSON.parse(raw); } catch (e) { die('bad JSON on stdin: ' + e.message); }
+    console.log('⚠ took the report from stdin, not from the agent\'s own file.');
+    console.log('  It passed through your context to get here, so check nothing was lost.');
+  }
   p.refined = true; p.refinedAt = now(); p.refineSummary = rep.summary || '';
   p.builtOn = rep.builtOn || [];
   let added = 0;
@@ -749,7 +796,7 @@ function cmdWhoami(flags) {
   console.log('Or pass your own session id: driver.mjs whoami --session <id>');
 }
 
-function cmdBrief(key) {
+function cmdBrief(key, flags) {
   const r = readReg(); const t = getTask(r, key);
   const held = (t.needs || []).filter((n) => getTask(r, n).status !== 'landed');
   const who = r.orchestrator ? '`' + r.orchestrator + '`' : 'the one running the show';
@@ -853,7 +900,61 @@ function cmdBrief(key) {
   B.push('**It is not finished when you say so.** The work is checked again and joined to the main line');
   B.push('by the one running the show. Stay available — if the joined-up run breaks, it comes back to');
   B.push('you, because you are the one who knows what the code meant.');
-  console.log(B.join('\n'));
+  const body = B.join('\n') + '\n';
+  if (flags && flags.stdout) { console.log(body); return; }
+  const out = briefPath(t.key);
+  fs.writeFileSync(out, body);
+  t.briefSha = briefSha(t); t.briefAt = now(); t.briefFile = out;
+  writeReg(r);
+  console.log('wrote ' + out);
+  console.log('');
+  console.log('Give the chip this, and nothing retyped from memory:');
+  console.log('');
+  console.log('---8<---');
+  console.log('Your brief is at:');
+  console.log('');
+  console.log('    ' + out);
+  console.log('');
+  console.log('**Read it in full before anything else.** It is the whole of what you were given —');
+  console.log('the plan, the decisions already settled, what to build on, the only files you may');
+  console.log('change, and what counts as proof. Nothing was left in a chat message.');
+  console.log('');
+  console.log('It lives in the main checkout, so read it by that absolute path — it will not be');
+  console.log('inside your own copy of the repository.');
+  console.log('');
+  console.log('Two things from it, up front, so you cannot miss them:');
+  console.log('');
+  console.log('1. Before anything else, send this with SendMessage to ' + (r.orchestrator || '<the orchestrator>') + ':');
+  console.log('   "' + t.key + ' checking in. I am up and I have read my brief."');
+  const held0 = (t.needs || []).filter((n) => getTask(r, n).status !== 'landed');
+  console.log(held0.length
+    ? '2. You are ON HOLD, waiting for ' + held0.join(', ') + '. Do nothing but that check-in until\n   you are told "requirements are done, you may start".'
+    : '2. You are clear to start once you have read the brief.');
+  console.log('---8<---');
+}
+
+function cmdBriefAll() {
+  const r = readReg();
+  let n = 0;
+  for (const t of tasks(r)) {
+    if (t.status === 'cancelled') continue;
+    const before = t.briefSha;
+    cmdBriefQuiet(t.key);
+    n++;
+    const now2 = getTask(readReg(), t.key).briefSha;
+    if (before && before !== now2) console.log('  changed: ' + t.key + '  → any chip already holding it is out of date');
+  }
+  console.log(n + ' brief(s) written to ' + orchDir('briefs'));
+}
+
+function cmdBriefQuiet(key) {
+  const saved = console.log; console.log = () => {};
+  try { cmdBrief(key, {}); } finally { console.log = saved; }
+}
+
+// A brief written before the record was corrected is a lie an agent is acting on.
+function staleBriefs(r) {
+  return tasks(r).filter((t) => t.briefSha && t.briefSha !== briefSha(t));
 }
 
 function cmdChip(key, flags) {
@@ -975,6 +1076,13 @@ function cmdBoard() {
     n('ready') + ' running · ' + n('held') + ' on hold · ' + n('planned') + ' not yet handed out');
   const stuck = tasks(r).filter((t) => t.status === 'held' && (t.needs || []).every((x) => { const d = tasks(r).find((y) => y.key === x); return d && d.status === 'landed'; }));
   if (stuck.length) console.log('\n⚠ held but nothing is blocking them any more — release: ' + stuck.map((t) => t.key).join(', '));
+  const stale = staleBriefs(r);
+  if (stale.length) {
+    console.log('\n⚠ the record changed after these briefs were written — the agent holding one is');
+    console.log('  working from something you have since corrected:');
+    for (const t of stale) console.log('    ' + t.key + '  ' + (t.briefFile ? rel(t.briefFile) : ''));
+    console.log('  Rewrite with `brief --all`, then tell each affected agent to re-read its brief.');
+  }
   const tres = trespass(r);
   if (tres.length) {
     console.log('\n⚠ the main checkout has changes on files that belong to a task:');
@@ -1027,7 +1135,7 @@ driving the work out, after the grill:
   iam <name>                record it, so every brief carries it.
   task add       < json     [{key,title,plan,needs,owns,context,verify,decisions}]
   graph                     the rounds, what runs side by side. Exits 1 if two tasks share a file.
-  brief <key>               the whole self-contained chip prompt. Nothing left to infer.
+  brief <key> [--stdout]    write the chip's brief to a file; print what to send. --all rewrites every one.
   chip <key> --id <task_id> [--worktree p]    record the chip, set held or ready.
   agent <key> --name <peer>  record where a chip checked in from — without it you cannot release it.
   release <key>             refuses while a requirement has not landed; prints the release message.
@@ -1058,7 +1166,7 @@ switch (cmd) {
     const sub = rest.shift();
     if (sub === 'list') cmdRefineList();
     else if (sub === 'brief') cmdRefineBrief(rest[0]);
-    else if (sub === 'done') cmdRefineDone(rest[0]);
+    else if (sub === 'done') cmdRefineDone(rest[0], flags);
     else if (sub === 'check') cmdRefineCheck();
     else die('refine list|brief <plan>|done <plan>|check');
     break;
@@ -1067,7 +1175,7 @@ switch (cmd) {
   case 'iam': { const r = readReg(); r.orchestrator = rest[0] || die('need a name'); writeReg(r); console.log('briefs will tell chips to report to ' + r.orchestrator); break; }
   case 'task': if (rest.shift() !== 'add') die('only `task add` is supported'); cmdTaskAdd(); break;
   case 'graph': cmdGraph(); break;
-  case 'brief': cmdBrief(rest[0]); break;
+  case 'brief': if (flags.all) cmdBriefAll(); else cmdBrief(rest[0], flags); break;
   case 'chip': cmdChip(rest[0], flags); break;
   case 'agent': cmdAgent(rest[0], flags); break;
   case 'release': cmdRelease(rest[0]); break;

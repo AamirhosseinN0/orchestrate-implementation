@@ -51,13 +51,31 @@ and you read that file. Your context carries the pointer, never the payload.
 ```
 .claude/orchestration/
   register.json          every decision, gap and task
+  backups/               the last 30 states of it, kept automatically on every write
   refine/<plan>.json     what each refining agent found, in its own words
+  preflight/<key>.json   what each pre-flight agent found, in its own words
   briefs/<key>.md        exactly what each chip was told
   messages.jsonl         every word that passed between you and an agent
 ```
 
+The register is usually gitignored, so git cannot reconstruct it — the backups
+are its only history (the last 30 states, kept automatically, a no-op write
+burning no slot). Restoring is copying one back over `register.json`. Every
+driver command takes a lock on the register first, so a chip reporting in from
+its own process cannot race one of your writes.
+
 Two habits follow, and they are not optional:
 
+- **Never retype data you have already extracted — pass the file.** Compaction
+  loses detail by forgetting; retyping loses it by fabrication, and the second
+  needs no compaction at all. Seven lists typed "from memory" minutes after
+  extracting them: five wrong. Whenever a command prints a ready-made line —
+  `preflight done` does, `resume` does — use it as printed.
+- **A check whose inputs you produced is not a check.** Comparing a file you
+  generated from the register against the register matches trivially, and three
+  agents saying the data is wrong outrank your own green. Before trusting a
+  check, ask what would have to be true for it to pass while being wrong; if the
+  answer is "nothing changes", it is not a check.
 - **Never summarise an agent's report into the record.** If a report is missing,
   ask the agent to write the file — do not reconstruct it from what it said in
   the chat. `refine done` refuses rather than letting you type it in.
@@ -113,9 +131,10 @@ is wrong, merges what is right, and drives the round to landed and CI-green. It
 talks to the agents by message. You are not the messenger and you are not the
 gate.
 
-**Between rounds, it comes back to you** — with the previous round merged and
-proved, and the next round's chips ready to create. That is the only handover,
-and it costs you one sitting per round.
+**Between rounds, it comes back to you** — with the previous round merged,
+CI-proved, the next round pre-flighted against the real code and its briefs
+doctored, and its chips ready to create. That is the only handover, and it costs
+you one sitting per round.
 
 It comes back to you only when it genuinely cannot proceed — a plan that
 contradicts itself, work that keeps failing its own checks, something nobody
@@ -367,10 +386,16 @@ cat <<'J' | node $DRV task add
 J
 ```
 
-**Ownership is not optional and it is the load-bearing rule: two tasks running at
-the same time may never touch one file.** `owns` is how that is enforced. Get it
-from the plans — a step that says what it owns and what it only uses has already
-told you.
+**Ownership is not optional, and a shared file is only the easy case.** Two
+tasks running at the same time may never touch one file — `owns` is how that is
+enforced. But almost every collision that reaches CI is two tasks touching
+*different* files that share one invariant: a migration chain with one head, a
+lockfile, a closed list some test asserts exact equality over, a dict entry and
+an import that must land together. `serialises` names those points, and `graph`
+refuses a round where two tasks move the same one, exactly as it refuses a
+shared file. Get both from the plans and from pre-flight — a step that says what
+it owns has already told you the files; only reading the tests tells you the
+invariants.
 
 ## 10. Show the work in the chat, and let it refuse
 
@@ -391,7 +416,34 @@ Paste the output into the chat. That is the shared picture of what can be
 launched in parallel and what each thing is waiting for. Fix the plan until it
 is green. **Do not create a single chip while `graph` exits 1.**
 
-## 11. Create one round of chips, and only one
+## 11. Pre-flight the round before opening it
+
+Refinement wrote each task's `owns` by reading. Nobody has tested it against the
+code — and an untested owns list fails in one direction only: too narrow, one
+stop-and-ask round-trip per missing file, each one your record's fault.
+
+So before a round opens, one **read-only** agent per task goes in with a single
+job: find what the record missed.
+
+```bash
+node $DRV preflight brief 2.1      # the prompt; the agent writes its report to a file
+node $DRV preflight done 2.1       # read the report; it may reshape the record
+node $DRV preflight check          # exits 1 while the round is not clean
+```
+
+The agent reports three things, each with file:line evidence: files the work
+needs that `owns` omits (marked load-bearing or not), serialisation points the
+work moves, and whether each verify command can actually run here. It fixes
+nothing — a pre-flight agent that decides something has broken the arrangement
+exactly as a refining agent would.
+
+`preflight done` prints the ready-made `task add` line for any load-bearing gap
+— **use it as printed, do not retype the paths** — and then `graph` again,
+because a widened owns can create a collision that was not there before.
+`preflight check` gates the round the way `graph` does: nothing opens while a
+task is unflown or a load-bearing gap sits outside its owns.
+
+## 12. Create one round of chips, and only one
 
 **Every chip of the current round, together — and not one chip of the next.**
 Put the round on screen in one go so the user creates it in a single sitting.
@@ -441,6 +493,21 @@ to, and the standing order to stop and ask rather than guess.
 `brief --all` rewrites every one at once and names which changed — run it after
 any correction to the record.
 
+**Then `doctor`, before any chip exists.** A brief is handed to somebody who
+will believe it, so everything it cites that can be checked mechanically, is:
+
+```bash
+node $DRV doctor
+```
+
+Every cited path must exist, every verify command's binary must resolve, no
+brief may be stale. It exits 1 otherwise. What it cannot see, you check by hand
+once: that a verify command's *target* is reachable — a database up, a service
+started. And never put a number in a brief that the run itself can change — a
+test count, a baseline, a row count. It is stale the moment the next task lands,
+and an agent hitting a real regression reads it as the expected failure. Write
+where to look it up instead.
+
 A held brief opens with `# ON HOLD — do not start yet`, names what it waits for,
 and says that nothing at all begins until it is told
 **"requirements are done, you may start"**.
@@ -463,7 +530,7 @@ Keep the board in view; it shows who has checked in and who has not:
 node $DRV board
 ```
 
-## 12. Releasing a held chip — which should never happen
+## 13. Releasing a held chip — which should never happen
 
 A round only opens once every round before it has landed, and a round never
 contains a task that waits on another task in the same round. So **every chip you
@@ -497,7 +564,7 @@ That check matters because **a chip makes its own copy of the repository the
 moment it is opened**, which for a held chip is long before its requirements
 landed. A stale copy is the most expensive way this goes wrong.
 
-## 13. Take the work back
+## 14. Take the work back
 
 A chip reports two ways — a message so you hear it now, and a written line so it
 survives the window being closed:
@@ -552,7 +619,7 @@ If the joined run fails, or the merge conflicts, it goes **back to whoever wrote
 it** — they know what the code meant. Recover with
 `git -C .claude/worktrees/joined merge --abort`; the main line is untouched.
 
-## 14. Run it to the end without being driven
+## 15. Run it to the end without being driven
 
 Once the chips exist the user is out of it. The loop is yours, and it is only
 ever these four moves:
@@ -571,6 +638,19 @@ Log both directions every time. It costs one line and it is the only thing that
 survives you being compacted mid-round — task states tell you where the work is,
 never what you promised somebody.
 
+Two situations the loop must survive without you inventing policy on the spot:
+
+- **An agent dies holding finished work.** Verify it and land it yourself — that
+  is checking, not building, and it is exactly the same `guard`/join/CI path as
+  a living agent's report. An agent that dies holding *unfinished* work is
+  different: re-chip the task with a fresh brief that says what exists in the
+  dead agent's worktree, and let the new agent decide what survives. Never
+  finish another's half-built work in your own hands.
+- **An agent's address changes.** Session names churn — an agent restarting gets
+  a new one, and it may notice before you do. When a message arrives from a new
+  name claiming a known task, re-record it (`agent <key> --name <new>`) and
+  carry on; `resume` is for *your* death, not theirs.
+
 Reports and check-ins arrive as messages and wake you, so the usual case needs
 no polling. But an agent that dies, stalls, or forgets to report will never wake
 you — so when you are waiting on work and the board is not moving, check it
@@ -585,10 +665,18 @@ owns. Those are the same holds Act one made — a question, not a guess.
 
 You are finished when every task is `landed` and `board` says so.
 
-## 15. Close the round before opening the next
+## 16. Close the round before opening the next
 
 When the last task of a round has landed, the main line has changed in ways no
-single task ever saw. Run CI on it and record what came back:
+single task ever saw. Run CI on it and record what came back.
+
+Say why, because it is not ceremony: **CI is the only check in this whole
+arrangement that varies the environment.** A different machine, a different
+checkout path, a clean database, a cold cache. Local green, staging green, and
+every agent's own suite all share one environment, and a bug that depends on it
+— a path parsed from where the repo happens to sit, a test passing on a garbage
+value it never actually checks — is structurally invisible to all of them at
+once. That class of bug is exactly what a round-closing CI run exists to catch:
 
 ```bash
 node $DRV wave                                   # what is left, and what is holding the next round
@@ -607,9 +695,24 @@ decision, not an omission:
 node $DRV ci --status skipped --why "no CI on this repo; ran the full suite by hand on main"
 ```
 
+A round also must not close *silently* over work that only a window makes
+possible. When an agent offers something outside its scope — a backfill only
+possible before a table gains data, an addition only its tree can make — record
+it the moment it is offered, because free-text notes die with contexts:
+
+```bash
+node $DRV owed add --what "backfill the two rows 1.10a offered" \
+  --why "0.14c's tree lacks the table" --window "before 1.10c merges" --load-bearing
+node $DRV owed assign o01 --to 1.10c    # and put it in that task's brief
+```
+
+`ci --status green` lists every open owed item as it closes the round — assign
+each to a task that can still do it, or mark it done. A window that closes on an
+unassigned item closes for good.
+
 Then, and only then, put up the next round.
 
-## 16. If the session running this ends, take it over
+## 17. If the session running this ends, take it over
 
 Sessions die. When one does, fifty agents are messaging an address nobody reads,
 and none of them will work that out on their own.
@@ -681,9 +784,17 @@ answer coming, and the agent is still waiting.
   there to make the plan buildable, not to fill its holes. A `newGap` coming
   back is the step working, not failing — it means the code showed you something
   the plans could not.
-- **Refinement is the only place `owns` can honestly come from.** Worked out at
-  a desk it is a guess; worked out against the real tree it is a fact. That
-  matters because the whole parallel arrangement rests on it.
+- **Refinement writes `owns`; pre-flight is what makes it honest.** Worked out at
+  a desk it is a guess, and an untested guess fails narrow — ten stop-and-ask
+  round-trips across one build, every one predictable. The whole parallel
+  arrangement rests on `owns` being true, so it gets tested before anyone
+  builds on it.
+- **The collisions that reach CI share an invariant, not a file.** Three
+  migration files, three heads, zero overlap, red. A dict entry in one file and
+  its import in another, asserted together by a test neither task owns. A
+  lockfile any new package rewrites. `graph` green on files proves nothing about
+  these — that is what `serialises` is for, and pre-flight is where the unknown
+  ones surface.
 - **A chip's copy of the repository gets a random name**, so you cannot work out
   its address in advance. The check-in message is the only reliable way to get
   it — which is why every brief demands one before the agent does anything else,
@@ -716,6 +827,15 @@ answer coming, and the agent is still waiting.
 - **`error: no register at ...`**: wrong directory. Run from the project root or
   pass `--register <path>`. A chip reporting in from its own copy needs the
   absolute path — its brief already has it.
+- **`preflight check` says "never pre-flighted"**: the round is about to open on
+  an owns list nobody tested. One read-only agent per task; their reports are
+  files, like everything else.
+- **`doctor` says "verify command's binary is not on PATH"**: the brief promises
+  a proof this machine cannot run. Fix the verify entry or the environment —
+  never hand it out as-is, because the agent will report the command "failing"
+  and somebody will debug a phantom.
+- **`task add` says "ignored: status, chip"**: working as intended — live state
+  is not writable from a bulk edit. `set`, `chip`, `done` and `landed` own those.
 - **`chip` says "is in round N, and an earlier round is not finished"**: working
   as intended. `wave` names what is missing — usually a CI result nobody
   recorded.

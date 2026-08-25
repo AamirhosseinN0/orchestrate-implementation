@@ -208,10 +208,12 @@ because the whole parallel arrangement rests on `owns` being true.
 The settled plans become tasks. Each declares what it needs, **what files it
 owns**, what it must build on, and what counts as proof.
 
-**Two tasks running at the same time may never touch one file.** That is the
-load-bearing rule, and it is checked rather than hoped for. The task graph
-prints what runs side by side — and refuses to let a broken plan out of the
-door:
+**Two tasks running at the same time may never touch one file — and a shared
+file is only the easy case.** Almost every collision that reaches CI is two
+tasks touching *different* files that share one invariant: a migration chain
+with one head, a lockfile, a closed list some test asserts exact equality over.
+Tasks name those points under `serialises`, and the graph refuses both kinds of
+clash the same way:
 
 ```
 ⚠ 2.1 and 2.5 would both change the same files: .../cards ↔ .../cards/shared.py
@@ -219,7 +221,18 @@ door:
 
 ⚠ 2.1 is told to build on `packages/tuning`, which 2.5 is rewriting in the
   same round. It would be reading somebody mid-edit. Make 2.1 wait for 2.5.
+
+⚠ 0.14b and 1.8b both move the same serialisation point: alembic-head
+  No file overlaps, and it will still land red — the point is single-file in effect.
 ```
+
+And because a refined `owns` list is still an untested one — it fails narrow,
+one stop-and-ask round-trip per missing file — each round is **pre-flighted**
+before it opens: one read-only agent per task reads the plan and the code and
+reports every file the record missed, with the file:line that proves it. A
+`doctor` pass then checks everything the briefs cite that can be checked
+mechanically: every path exists, every verify command's binary resolves, no
+brief is stale. Neither agent fixes anything; both write files, not chat.
 
 The work goes out **one round at a time**. Inside a round the orchestrator runs
 it alone: takes back finished work, checks it, sends back what is wrong, merges
@@ -295,6 +308,21 @@ question to the plain-words rules. It decides nothing.
 ```
 node driver.mjs            # every command
 ```
+
+## What a run leaves behind
+
+```
+.claude/orchestration/
+  register.json          every decision, gap and task
+  backups/               the last 30 states of it, kept on every write
+  refine/<plan>.json     what each refining agent found
+  preflight/<key>.json   what each pre-flight agent found
+  briefs/<key>.md        exactly what each chip was told
+  messages.jsonl         every word that passed between the two
+```
+
+Work that is only possible in a window between two pieces gets a first-class
+record (`owed`) — a round refuses to close silently on top of one.
 
 ## Licence
 

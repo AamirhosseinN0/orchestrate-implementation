@@ -18,16 +18,58 @@ const die = (m) => { console.error('error: ' + m); process.exit(2); };
 const now = () => new Date().toISOString();
 
 function readReg() {
+  acquireLock();
   if (!fs.existsSync(REG_PATH)) die('no register at ' + rel(REG_PATH) + ' — run `load` first');
   return JSON.parse(fs.readFileSync(REG_PATH, 'utf8'));
 }
+// The register is shared: chips report into it from their own processes while
+// the orchestrator writes releases. One directory-based lock serialises every
+// command; a holder dead longer than 15s is stolen.
+let HAS_LOCK = false;
+function lockDir() { return REG_PATH + '.lock'; }
+function acquireLock() {
+  if (HAS_LOCK) return;
+  for (let i = 0; i < 60; i++) {
+    try { fs.mkdirSync(lockDir(), { recursive: false }); HAS_LOCK = true; process.on('exit', releaseLock); return; }
+    catch {
+      try { if (Date.now() - fs.statSync(lockDir()).mtimeMs > 15000) { fs.rmdirSync(lockDir()); continue; } } catch { continue; }
+      try { execSync('sleep 0.1'); } catch { /* keep spinning */ }
+    }
+  }
+  die('another driver process has held the register lock for a while: ' + rel(lockDir()) +
+      '\n       If nothing is actually running, remove that directory.');
+}
+function releaseLock() { if (HAS_LOCK) { try { fs.rmdirSync(lockDir()); } catch { /* gone */ } HAS_LOCK = false; } }
+
 function writeReg(r) {
   fs.mkdirSync(path.dirname(REG_PATH), { recursive: true });
-  fs.writeFileSync(REG_PATH, JSON.stringify(r, null, 2) + '\n');
+  const next = JSON.stringify(r, null, 2) + '\n';
+  let prev = null;
+  try { prev = fs.readFileSync(REG_PATH, 'utf8'); } catch { /* first write */ }
+  if (prev === next) return;                    // a no-op write must not burn a backup slot
+  if (prev !== null) {
+    // The register is the run, and it is usually gitignored — these backups are
+    // its only history. Keep the old state, land the new one durably, and only
+    // then prune, so no crash can cost both copies.
+    const bdir = path.join(path.dirname(REG_PATH), 'backups');
+    fs.mkdirSync(bdir, { recursive: true });
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    let seq = 0, dest;
+    do { dest = path.join(bdir, 'register-' + stamp + '-' + String(seq++).padStart(2, '0') + '.json'); }
+    while (fs.existsSync(dest));
+    fs.writeFileSync(dest, prev);
+    fs.writeFileSync(REG_PATH + '.tmp', next);
+    fs.renameSync(REG_PATH + '.tmp', REG_PATH);
+    const olds = fs.readdirSync(bdir).filter((f) => f.startsWith('register-')).sort();
+    while (olds.length > 30) fs.unlinkSync(path.join(bdir, olds.shift()));
+  } else {
+    fs.writeFileSync(REG_PATH + '.tmp', next);
+    fs.renameSync(REG_PATH + '.tmp', REG_PATH);
+  }
 }
 const rel = (p) => path.relative(CWD, p) || p;
 function nextId(r) {
-  const n = r.gaps.reduce((m, g) => Math.max(m, parseInt(g.id.slice(1), 10)), 0);
+  const n = r.gaps.reduce((m, g) => Math.max(m, parseInt(g.id.slice(1), 10) || 0), 0);
   return 'g' + String(n + 1).padStart(2, '0');
 }
 function stdinJson() {
@@ -519,14 +561,21 @@ function orchDir(sub) {
   return d;
 }
 const slug = (x) => x.replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^-|-$/g, '');
-function briefPath(key) { return path.join(orchDir('briefs'), slug(key) + '.md'); }
+// a key the slug had to change could collide with another that slugs the same,
+// so those get a suffix derived from the real key; clean keys keep clean names
+const fileKey = (key) => slug(key) === key ? key
+  : slug(key) + '-' + crypto.createHash('sha256').update(key).digest('hex').slice(0, 6);
+function briefPath(key) { return path.join(orchDir('briefs'), fileKey(key) + '.md'); }
 function reportPath(planPath) { return path.join(orchDir('refine'), slug(planPath.replace(/\.md$/, '')) + '.json'); }
 // What the brief is built from. Volatile fields (who checked in, what landed)
 // are excluded — they change without changing a word of the brief.
-function briefSha(t) {
+function briefSha(t, r) {
+  // exactly the fields the brief's text is built from — no more (a notes-only
+  // change must not cry stale) and no less (a new orchestrator address must)
   return crypto.createHash('sha256').update(JSON.stringify({
     key: t.key, title: t.title, plan: t.plan, needs: t.needs, owns: t.owns,
-    context: t.context, verify: t.verify, decisions: t.decisions, notes: t.notes, branch: t.branch,
+    serialises: t.serialises || [], context: t.context, verify: t.verify,
+    decisions: t.decisions, branch: t.branch, orchestrator: (r && r.orchestrator) || '',
   })).digest('hex').slice(0, 12);
 }
 
@@ -579,6 +628,7 @@ function cmdRefineBrief(needle) {
   B.push('  "builtOn": [{"path": "real/path", "what": "what it is and why this work uses it"}],');
   B.push('  "tasks": [{"key": "2.1", "title": "plain title", "needs": ["0.14"],');
   B.push('             "owns": ["paths this work creates or changes"],');
+  B.push('             "serialises": ["alembic-head"],');
   B.push('             "verify": ["the exact commands that prove it"]}],');
   B.push('  "newGaps": [{"title": "the thing nobody has decided", "why": "why it blocks", "quote": "the sentence"}]');
   B.push('}');
@@ -587,6 +637,12 @@ function cmdRefineBrief(needle) {
   B.push('`owns` matters more than it looks: two tasks running at once may never touch one file, so');
   B.push('be exact and be narrow. If two pieces of this plan must change the same file, they are one');
   B.push('task, or one waits for the other — say which.');
+  B.push('');
+  B.push('`serialises` names the things that collide without sharing a file: this work adds a');
+  B.push('migration (name the chain: "alembic-head"), changes a lockfile ("pnpm-lock"), or extends a');
+  B.push('closed list or registry that a test asserts exact equality over (name it, e.g. "EventKind").');
+  B.push('Two tasks moving one of these in the same round land red in CI with zero file overlap, so');
+  B.push('missing one here costs a round.');
   B.push('');
   B.push('When the file is written, say only that you have written it and what is in it in one line.');
   B.push('Do not paste the JSON back — the file is the report.');
@@ -628,10 +684,21 @@ function cmdRefineDone(needle, flags) {
   for (const t of rep.tasks || []) {
     if (!t.key || !t.owns) continue;
     const ex = (r.tasks ||= []).findIndex((x) => x.key === t.key);
-    const rec = { key: t.key, title: t.title || t.key, plan: p.path, needs: t.needs || [],
-      owns: t.owns, context: p.builtOn, verify: t.verify || [], decisions: [], notes: '',
-      branch: 'step/' + t.key, worktree: '', chip: '', status: 'planned', reports: [] };
-    if (ex >= 0) r.tasks[ex] = { ...r.tasks[ex], ...rec }; else r.tasks.push(rec);
+    if (ex >= 0) {
+      // re-refining a plan mid-run must not reset a live task's state
+      const cur = r.tasks[ex];
+      cur.title = t.title || cur.title; cur.plan = p.path; cur.needs = t.needs || cur.needs;
+      // widen, never narrow: pre-flight may have extended these since the last refine
+      cur.owns = [...new Set([...(cur.owns || []), ...t.owns])];
+      cur.serialises = [...new Set([...(cur.serialises || []), ...(t.serialises || [])])];
+      cur.context = (p.builtOn || []).length ? p.builtOn : cur.context;
+      cur.verify = t.verify || cur.verify;
+    } else {
+      r.tasks.push({ key: t.key, title: t.title || t.key, plan: p.path, needs: t.needs || [],
+        owns: t.owns, serialises: t.serialises || [], context: p.builtOn, verify: t.verify || [],
+        decisions: [], notes: '', branch: 'step/' + t.key, worktree: '', chip: '',
+        status: 'planned', reports: [] });
+    }
   }
   writeReg(r);
   console.log(p.path + ' refined.');
@@ -684,7 +751,13 @@ function getTask(r, k) {
 }
 
 // Two tasks may not touch one file. Ownership is declared, and checked.
-function norm(p) { return p.replace(/\/+$/, '').replace(/\/\*+$/, ''); }
+function norm(p) {
+  let x = String(p).replace(/\/+$/, '').replace(/\/\*+$/, '');
+  while (x.startsWith('./')) x = x.slice(2);
+  return x;
+}
+// one-directional: does the owned entry `own` cover the path `p`?
+function coveredBy(own, p) { const o = norm(own), x = norm(p); return x === o || x.startsWith(o + '/'); }
 function collides(a, b) {
   const x = norm(a), y = norm(b);
   return x === y || x.startsWith(y + '/') || y.startsWith(x + '/');
@@ -699,34 +772,86 @@ function waves(r) {
   const ts = tasks(r).filter((t) => t.status !== 'cancelled');
   const placed = new Map(); const out = [];
   let left = ts.slice(), guard = 0;
-  while (left.length && guard++ < 100) {
+  while (left.length) {
+    if (guard++ >= 1000) break;   // backstop only; leftovers still surface below
     const ready = left.filter((t) => (t.needs || []).every((n) => placed.has(n)));
-    if (!ready.length) { out.push({ wave: -1, tasks: left.slice() }); break; }
+    if (!ready.length) break;
     out.push({ wave: out.length, tasks: ready });
     ready.forEach((t) => placed.set(t.key, out.length - 1));
     left = left.filter((t) => !ready.includes(t));
   }
+  // whatever could not be placed is a problem to show, never a thing to drop
+  if (left.length) out.push({ wave: -1, tasks: left.slice() });
   return out;
+}
+
+const TASK_FIELDS = ['title', 'plan', 'needs', 'owns', 'serialises', 'context', 'verify', 'decisions', 'notes', 'branch'];
+
+// One malformed record poisons every command that reads it later, so the gate
+// is strict in both directions: create and update enforce the same shape.
+function taskProblems(it, isNew) {
+  if (it === null || typeof it !== 'object' || Array.isArray(it)) return ['is not a task object'];
+  if (typeof it.key !== 'string' || !it.key.trim()) return ['needs a key'];
+  const probs = [];
+  for (const k of ['owns', 'needs', 'serialises', 'verify', 'decisions']) {
+    if (it[k] === undefined) continue;
+    if (!Array.isArray(it[k]) || it[k].some((x) => typeof x !== 'string' || !x.trim()))
+      probs.push(k + ' must be a list of non-empty strings');
+  }
+  if (Array.isArray(it.owns) && it.owns.length === 0)
+    probs.push('owns cannot be empty — ownership is the load-bearing rule, and an empty list disarms it');
+  if (isNew && it.owns === undefined)
+    probs.push('declares no files it owns — two tasks may not touch one file, so ownership is not optional');
+  if (isNew && (typeof it.title !== 'string' || !it.title.trim())) probs.push('needs a title');
+  if (!isNew && it.title !== undefined && (typeof it.title !== 'string' || !it.title.trim()))
+    probs.push('title cannot be blanked');
+  if (it.context !== undefined && (!Array.isArray(it.context) ||
+      it.context.some((c) => !c || typeof c !== 'object' || typeof c.path !== 'string' || !c.path.trim())))
+    probs.push('context must be a list of {path, what} objects');
+  for (const k of ['plan', 'notes', 'branch'])
+    if (it[k] !== undefined && typeof it[k] !== 'string') probs.push(k + ' must be a string');
+  return probs;
 }
 
 function cmdTaskAdd() {
   const r = readReg(); const inp = stdinJson();
   const items = Array.isArray(inp) ? inp : [inp];
-  for (const it of items) {
-    if (!it.key || !it.title) die('each task needs a key and a title');
-    if (!it.owns || !it.owns.length) die('task "' + it.key + '" declares no files it owns — two tasks may not touch one file, so ownership is not optional');
-    const t = {
-      key: it.key, title: it.title, plan: it.plan || '', needs: it.needs || [],
-      owns: it.owns, context: it.context || [], verify: it.verify || [],
-      decisions: it.decisions || [], notes: it.notes || '',
-      branch: it.branch || ('step/' + it.key), worktree: '', chip: '',
-      status: 'planned', reports: [],
-    };
-    const at = tasks(r).findIndex((x) => x.key === t.key);
-    if (at >= 0) tasks(r)[at] = { ...tasks(r)[at], ...t }; else tasks(r).push(t);
+  // Validate every item before touching anything: a batch that fails partway
+  // must fail whole, and must not have claimed success for any part of itself.
+  const plans = [];
+  const errs = [];
+  for (let i = 0; i < items.length; i++) {
+    const it = items[i];
+    const at = (it && typeof it === 'object' && !Array.isArray(it)) ? tasks(r).findIndex((x) => x.key === it.key) : -1;
+    const probs = taskProblems(it, at < 0);
+    const label = 'item ' + (i + 1) + (it && it.key ? ' ("' + it.key + '")' : '');
+    if (probs.length) { for (const x of probs) errs.push(label + ' ' + x); continue; }
+    plans.push({ it, at });
+  }
+  if (errs.length) die('nothing was saved:\n       ' + errs.join('\n       '));
+  const said = [];
+  for (const { it, at } of plans) {
+    const ignored = Object.keys(it).filter((k) => k !== 'key' && !TASK_FIELDS.includes(k));
+    const tail = ignored.length ? '   ignored: ' + ignored.join(', ') + ' (not settable here)' : '';
+    if (at >= 0) {
+      const t = tasks(r)[at];
+      const touched = [];
+      for (const k of TASK_FIELDS) if (it[k] !== undefined) { t[k] = it[k]; touched.push(k); }
+      said.push('updated ' + it.key + ': ' + (touched.join(', ') || '(nothing — no known field was sent)') + tail);
+    } else {
+      tasks(r).push({
+        key: it.key, title: it.title, plan: it.plan || '', needs: it.needs || [],
+        owns: it.owns, serialises: it.serialises || [], context: it.context || [],
+        verify: it.verify || [], decisions: it.decisions || [], notes: it.notes || '',
+        branch: it.branch || ('step/' + it.key), worktree: '', chip: '',
+        status: 'planned', reports: [],
+      });
+      said.push('created ' + it.key + tail);
+    }
   }
   writeReg(r);
-  console.log(tasks(r).length + ' task(s) recorded. Run `graph` to check nothing clashes.');
+  for (const line of said) console.log(line);
+  console.log(tasks(r).length + ' task(s) on record. Run `graph` to check nothing clashes.');
 }
 
 function cmdGraph() {
@@ -739,8 +864,16 @@ function cmdGraph() {
   for (const w of ws) {
     if (w.wave === -1) {
       bad++;
-      lines.push('### ⚠ Cannot be ordered — these wait on each other in a circle');
-      for (const t of w.tasks) lines.push('- **' + t.key + '** ' + t.title + ' — waits on ' + (t.needs || []).join(', '));
+      lines.push('### ⚠ Cannot be ordered');
+      for (const t of w.tasks) {
+        const missing = (t.needs || []).filter((n) => !tasks(r).some((x) => x.key === n));
+        const cancelled = (t.needs || []).filter((n) => tasks(r).some((x) => x.key === n && x.status === 'cancelled'));
+        let why;
+        if (missing.length) why = 'waits on ' + missing.join(', ') + ', which ' + (missing.length > 1 ? 'are' : 'is') + ' not on record — a typo, or a task never added';
+        else if (cancelled.length) why = 'waits on ' + cancelled.join(', ') + ', which was cancelled — reassign or cancel this too';
+        else why = 'waits on ' + (t.needs || []).join(', ') + ' in a circle';
+        lines.push('- **' + t.key + '** ' + t.title + ' — ' + why);
+      }
       continue;
     }
     const par = w.tasks.length > 1 ? w.tasks.length + ' in parallel' : 'on its own';
@@ -753,18 +886,31 @@ function cmdGraph() {
       if (t.plan) lines.push('  - from: ' + t.plan);
     }
     lines.push('');
-    // no two tasks in one round may touch one file
+    // no two tasks in one round may touch one file — and a task that has landed
+    // is merged work, not a contender, so it collides with nobody
     for (let i = 0; i < w.tasks.length; i++) for (let j = i + 1; j < w.tasks.length; j++) {
-      const o = overlap(w.tasks[i], w.tasks[j]);
+      const a = w.tasks[i], b = w.tasks[j];
+      if (a.status === 'landed' || b.status === 'landed') continue;
+      const o = overlap(a, b);
       if (o.length) {
         bad++;
-        lines.push('  ⚠ **' + w.tasks[i].key + '** and **' + w.tasks[j].key + '** would both change the same files: ' + o.join('; '));
+        lines.push('  ⚠ **' + a.key + '** and **' + b.key + '** would both change the same files: ' + o.join('; '));
         lines.push('    Split the work, or make one wait for the other. They cannot run together.');
+      }
+      // A shared file is the easy case. A shared invariant — a migration chain
+      // head, a lockfile, a closed list some test asserts exact equality over —
+      // collides in CI with zero file overlap.
+      const shared = (a.serialises || []).filter((x) => (b.serialises || []).includes(x));
+      if (shared.length) {
+        bad++;
+        lines.push('  ⚠ **' + a.key + '** and **' + b.key + '** both move the same serialisation point: ' + shared.join(', '));
+        lines.push('    No file overlaps, and it will still land red — the point is single-file in effect.');
+        lines.push('    Make one wait for the other.');
       }
     }
     // nor may one read what another is in the middle of changing
     for (const a of w.tasks) for (const b of w.tasks) {
-      if (a === b) continue;
+      if (a === b || a.status === 'landed' || b.status === 'landed') continue;
       for (const c of a.context || []) for (const ow of b.owns || []) {
         if (!collides(c.path, ow)) continue;
         bad++;
@@ -773,14 +919,18 @@ function cmdGraph() {
         lines.push('    It would be reading somebody mid-edit. Make ' + a.key + ' wait for ' + b.key + '.');
       }
     }
-    // a task told to build on something it may not touch
-    for (const a of w.tasks) for (const c of a.context || []) {
-      const ownedHere = (a.owns || []).some((ow) => collides(c.path, ow));
-      const ownedLater = tasks(r).some((t) => t !== a && (t.owns || []).some((ow) => collides(c.path, ow)));
-      if (!ownedHere && !ownedLater) continue;
-      if (ownedHere) continue;
-      lines.push('  · **' + a.key + '** builds on `' + c.path + '` but may not change it — read-only. ' +
-                 'If it needs to write there, say so now.');
+    // a task told to build on something it may not touch — but once the owner
+    // has landed, that path is just code, and repeating the note every run is
+    // how a gate stops being read
+    for (const a of w.tasks) {
+      if (a.status === 'landed') continue;
+      for (const c of a.context || []) {
+        if ((a.owns || []).some((ow) => collides(c.path, ow))) continue;
+        const owner = tasks(r).find((t) => t !== a && t.status !== 'landed' && (t.owns || []).some((ow) => collides(c.path, ow)));
+        if (!owner) continue;
+        lines.push('  · **' + a.key + '** builds on `' + c.path + '` but may not change it — read-only. ' +
+                   'If it needs to write there, say so now.');
+      }
     }
   }
   console.log(lines.join('\n'));
@@ -807,9 +957,14 @@ function cmdWhoami(flags) {
   console.log('Or pass your own session id: driver.mjs whoami --session <id>');
 }
 
+function depOf(r, key) { return tasks(r).find((x) => x.key === key) || null; }
+function heldNeeds(r, t) {
+  return (t.needs || []).filter((n) => { const d = depOf(r, n); return !d || d.status !== 'landed'; });
+}
+
 function cmdBrief(key, flags) {
   const r = readReg(); const t = getTask(r, key);
-  const held = (t.needs || []).filter((n) => getTask(r, n).status !== 'landed');
+  const held = heldNeeds(r, t);
   const who = r.orchestrator ? '`' + r.orchestrator + '`' : 'the one running the show';
   const B = [];
   B.push('# Before anything else: check in');
@@ -858,7 +1013,7 @@ function cmdBrief(key, flags) {
     B.push('and this brief are read from over there.');
     B.push('');
   }
-  if (t.decisions.length) {
+  if ((t.decisions || []).length) {
     B.push('**Already settled with the author. Do not reopen, do not improve on:**');
     B.push('');
     for (const d of t.decisions) B.push('- ' + d);
@@ -867,7 +1022,7 @@ function cmdBrief(key, flags) {
   B.push('**Build on what is already there. These exist — read them before you write anything that');
   B.push('overlaps, and use them rather than writing your own:**');
   B.push('');
-  if (t.context.length) for (const c of t.context) {
+  if ((t.context || []).length) for (const c of t.context) {
     const mine = (t.owns || []).some((ow) => collides(c.path, ow));
     B.push('- `' + c.path + '` — ' + (c.what || '') + (mine ? '' : '  **(read it, do not change it — it is not yours)**'));
   }
@@ -875,20 +1030,29 @@ function cmdBrief(key, flags) {
   B.push('');
   B.push('**The only files you may change:**');
   B.push('');
-  for (const o of t.owns) B.push('- `' + o + '`');
+  for (const o of t.owns || []) B.push('- `' + o + '`');
   B.push('');
   B.push('Another task is working in the same repository right now. If your work needs a file outside');
   B.push('that list, **stop and ask** — do not edit it. Two of you changing one file is the one thing');
   B.push('this arrangement cannot survive.');
+  if ((t.serialises || []).length) {
+    B.push('');
+    B.push('**Single-file-in-effect things this work moves:** ' + t.serialises.join(', ') + '.');
+    B.push('Nobody else in your round is allowed to touch these. If you find your work moving one not named here');
+    B.push('— a migration chain, a lockfile, a closed list a test checks exactly — stop and say so');
+    B.push('before you commit, because two moves of one of these land red together.');
+  }
   B.push('');
-  B.push('**Where you work.** Your own copy of the repository, already made for you:');
+  B.push('**Where you work.** The harness has already put you in your own copy of the repository.');
+  B.push('Stay in it, and never touch the main checkout. But it starts you on an auto-generated');
+  B.push('branch with a random name — **do not work there.** Your first act after checking in:');
   B.push('');
+  B.push('```bash');
+  B.push('git checkout -b ' + t.branch + ' || git checkout ' + t.branch);
   B.push('```');
-  B.push('cd ' + (t.worktree || '<created when you are released>'));
-  B.push('```');
   B.push('');
-  B.push('It is on the branch `' + t.branch + '`, taken from the main line as it stood once everything');
-  B.push('you depend on had landed. Stay in it. Do not touch the main checkout.');
+  B.push('Everything you do lands on `' + t.branch + '`. The checks that take your work back look for');
+  B.push('that exact name; work left on the auto-generated branch is invisible to them.');
   B.push('');
   B.push('**No guessing.** If the plan does not say, or what it says is not there in the code, stop and');
   B.push('ask the one running the show. Do not narrow the requirement so the wait ends sooner, do not');
@@ -898,7 +1062,7 @@ function cmdBrief(key, flags) {
   B.push('**Before you say you are done, all of these must pass, and you must paste the output:**');
   B.push('');
   B.push('```bash');
-  if (t.verify.length) for (const v of t.verify) B.push(v);
+  if ((t.verify || []).length) for (const v of t.verify) B.push(v);
   else B.push('# ⚠ nothing recorded. Ask what counts as proof before you start.');
   B.push('```');
   B.push('');
@@ -907,8 +1071,8 @@ function cmdBrief(key, flags) {
   B.push('**Then report, both ways — the message is how it hears, the list is what survives:**');
   B.push('');
   B.push('```bash');
-  B.push('node ~/.claude/skills/orchestrate-implementation/driver.mjs --register ' +
-         path.resolve(CWD, REG_PATH) + ' done ' + t.key + ' <<\'J\'');
+  B.push('node ~/.claude/skills/orchestrate-implementation/driver.mjs --register \'' +
+         path.resolve(CWD, REG_PATH) + '\' done \'' + t.key + '\' <<\'J\'');
   B.push('{"commit": "<sha>", "verified": "<what you ran and what it said>", "notes": "<anything the next one needs>"}');
   B.push('J');
   B.push('```');
@@ -925,7 +1089,7 @@ function cmdBrief(key, flags) {
   if (flags && flags.stdout) { console.log(body); return; }
   const out = briefPath(t.key);
   fs.writeFileSync(out, body);
-  t.briefSha = briefSha(t); t.briefAt = now(); t.briefFile = out;
+  t.briefSha = briefSha(t, r); t.briefAt = now(); t.briefFile = out;
   writeReg(r);
   console.log('wrote ' + out);
   console.log('');
@@ -958,7 +1122,7 @@ function cmdBriefAll() {
   const r = readReg();
   let n = 0;
   for (const t of tasks(r)) {
-    if (t.status === 'cancelled') continue;
+    if (['cancelled', 'landed'].includes(t.status)) continue;
     const before = t.briefSha;
     cmdBriefQuiet(t.key);
     n++;
@@ -975,9 +1139,208 @@ function cmdBriefQuiet(key) {
 
 // A brief written before the record was corrected is a lie an agent is acting on.
 function staleBriefs(r) {
-  return tasks(r).filter((t) => t.briefSha && t.briefSha !== briefSha(t));
+  // a landed task's brief is history, not guidance — flagging it is noise
+  return tasks(r).filter((t) => !['landed', 'cancelled'].includes(t.status) &&
+    t.briefSha && t.briefSha !== briefSha(t, r));
 }
 
+
+
+// ------------------------------------------------------- act one and three quarters
+// Refinement writes `owns` from reading; nobody has tested it against the code.
+// Pre-flight does: one read-only agent per task, before its chip exists, whose
+// whole job is to find what the record missed.
+
+function preflightReportPath(key) { return path.join(orchDir('preflight'), fileKey(key) + '.json'); }
+
+function cmdPreflightBrief(key) {
+  const r = readReg(); const t = getTask(r, key);
+  const B = [];
+  B.push('Pre-flight one task before anyone builds it. You are **read-only**: you change nothing,');
+  B.push('anywhere, and the one file you write is your report.');
+  B.push('');
+  B.push('**The task:** ' + t.key + ' — ' + t.title);
+  if (t.plan) B.push('**Its plan, read it in full:** ' + path.resolve(CWD, t.plan));
+  B.push('**What the record says it may change:** ' + (t.owns || []).join(', '));
+  B.push('**What the record says it builds on:** ' + ((t.context || []).map((c) => c.path).join(', ') || '(nothing)'));
+  B.push('**How it says it will be proved:** ' + ((t.verify || []).join('  ·  ') || '(nothing)'));
+  B.push('');
+  B.push('Find out, by reading the plan and then the codebase:');
+  B.push('');
+  B.push('1. **Every file the work would have to create or change that the list above misses.**');
+  B.push('   For each: the path, why, and the file:line that proves it — an assertion that must be');
+  B.push('   extended, a registry that must gain an entry, a closed list a test checks exactly, a');
+  B.push('   dict and an import that must land together. The proof matters: a hunch is not a gap.');
+  B.push('2. **Every serialisation point the work moves** — a migration chain head, a lockfile, a');
+  B.push('   closed enum or registry some test asserts exact equality over. Name each one.');
+  B.push('3. **Whether each verify command can actually run here** — is its binary present, does it');
+  B.push('   need something started first, does it point at the right place.');
+  B.push('');
+  B.push('Write your report to this exact file — not into the chat:');
+  B.push('');
+  B.push('    ' + preflightReportPath(t.key));
+  B.push('');
+  B.push('```json');
+  B.push('{"missing": [{"path": "...", "why": "...", "evidence": "file.py:123", "loadBearing": true}],');
+  B.push(' "serialises": ["alembic-head"],');
+  B.push(' "verify": [{"command": "...", "runnable": true, "why": ""}],');
+  B.push(' "notes": ""}');
+  B.push('```');
+  B.push('');
+  B.push('`loadBearing` means: without this the work cannot land green. When unsure, true.');
+  B.push('**Report, do not fix.** Not the record, not the plan, not the code. When the file is');
+  B.push('written, say so in one line and stop.');
+  console.log(B.join('\n'));
+}
+
+function cmdPreflightDone(key) {
+  const r = readReg(); const t = getTask(r, key);
+  const src = preflightReportPath(key);
+  if (!fs.existsSync(src)) die('no report at ' + rel(src) + ' — the agent was told to write it there. Ask it to.');
+  let rep;
+  try { rep = JSON.parse(fs.readFileSync(src, 'utf8')); }
+  catch (e) { die('the report at ' + rel(src) + ' is not valid JSON: ' + e.message + ' — send it back to the agent.'); }
+  // a garbage report must not mark the task pre-flighted — check goes green on it
+  const bad = [];
+  if (rep === null || typeof rep !== 'object' || Array.isArray(rep)) bad.push('the report is not an object');
+  else {
+    if (rep.missing !== undefined && (!Array.isArray(rep.missing) ||
+        rep.missing.some((m) => !m || typeof m !== 'object' || typeof m.path !== 'string' || !m.path.trim())))
+      bad.push('missing must be a list of {path, why, evidence, loadBearing} with a real path each');
+    if (rep.serialises !== undefined && (!Array.isArray(rep.serialises) ||
+        rep.serialises.some((x) => typeof x !== 'string' || !x.trim())))
+      bad.push('serialises must be a list of names');
+    if (rep.verify !== undefined && (!Array.isArray(rep.verify) ||
+        rep.verify.some((v) => !v || typeof v !== 'object')))
+      bad.push('verify must be a list of {command, runnable, why}');
+  }
+  if (bad.length) die('the report at ' + rel(src) + ' is not usable — send it back rather than fixing it here:\n       ' + bad.join('\n       '));
+  t.preflight = { at: now(), missing: rep.missing || [], verify: rep.verify || [], notes: rep.notes || '' };
+  for (const x of rep.serialises || []) { (t.serialises ||= []); if (!t.serialises.includes(x)) t.serialises.push(x); }
+  writeReg(r);
+  console.log(key + ' pre-flighted: ' + t.preflight.missing.length + ' gap(s), ' +
+    (rep.serialises || []).length + ' serialisation point(s), ' +
+    t.preflight.verify.filter((v) => v.runnable === false).length + ' verify problem(s)');
+  const load = t.preflight.missing.filter((m) => m.loadBearing);
+  if (load.length) {
+    console.log('\nLoad-bearing gaps — the record is wrong, not the agent:');
+    for (const m of load) console.log('  ' + m.path + '  (' + (m.evidence || 'no evidence given') + ')\n      ' + (m.why || ''));
+    const merged = [...new Set([...(t.owns || []), ...load.map((m) => m.path)])];
+    console.log('\nExtend the record with the agent\'s own list — do not retype it:');
+    console.log("  echo '" + JSON.stringify([{ key: t.key, owns: merged }]) + "' | node " +
+      (process.argv[1] || 'driver.mjs') + " --register '" + path.resolve(CWD, REG_PATH) + "' task add");
+    console.log('Then `graph` again — a widened owns can create a collision that was not there before.');
+  }
+  for (const v of t.preflight.verify.filter((x) => x.runnable === false))
+    console.log('\n⚠ verify cannot run as written: ' + v.command + '\n    ' + (v.why || ''));
+}
+
+function cmdPreflightCheck(flags) {
+  const r = readReg();
+  let n = waveArg(flags);
+  if (n === undefined) {
+    // the round you are about to open: first one holding a task with no chip yet
+    const ws = waves(r).filter((w) => w.wave >= 0);
+    const cand = ws.find((w) => w.tasks.some((t) => !t.chip && !['landed', 'cancelled'].includes(t.status)));
+    n = cand ? cand.wave : currentWave(r);
+  }
+  const st = waveState(r, n);
+  if (!st) die('there is no round ' + (n + 1));
+  let fail = false;
+  for (const t of st.tasks) {
+    if (['landed', 'cancelled'].includes(t.status)) continue;
+    if (!t.preflight) { console.error('✗ ' + t.key + '  never pre-flighted'); fail = true; continue; }
+    const open = (t.preflight.missing || []).filter((m) => m.loadBearing &&
+      !(t.owns || []).some((o) => coveredBy(o, m.path)));
+    if (open.length) {
+      fail = true;
+      console.error('✗ ' + t.key + '  load-bearing gap(s) still outside its owns:');
+      for (const m of open) console.error('    ' + m.path + '  (' + (m.evidence || '?') + ')');
+    } else console.log('✓ ' + t.key);
+  }
+  if (fail) { console.error('\nRound ' + (n + 1) + ' is not ready. Ten stop-and-ask round-trips is what opening it anyway costs.'); process.exit(1); }
+  console.log('\nRound ' + (n + 1) + ' pre-flighted clean.');
+}
+
+// ------------------------------------------------------------------- doctor
+// A brief is handed to somebody who will believe it. Everything a brief cites
+// that can be checked mechanically, is — before any chip exists.
+function cmdDoctor() {
+  const r = readReg();
+  const binCache = {};
+  const binOk = (b) => {
+    if (!(b in binCache)) {
+      try { execSync('command -v -- ' + JSON.stringify(b), { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], shell: '/bin/bash' }); binCache[b] = true; }
+      catch { binCache[b] = false; }
+    }
+    return binCache[b];
+  };
+  let bad = 0, checked = 0;
+  for (const t of tasks(r)) {
+    if (['landed', 'cancelled'].includes(t.status)) continue;
+    checked++;
+    const probs = [];
+    if (t.plan && !fs.existsSync(path.resolve(CWD, t.plan))) probs.push('its plan does not exist: ' + t.plan);
+    for (const c of t.context || []) {
+      if (!c || typeof c !== 'object' || typeof c.path !== 'string') { probs.push('a context entry is not {path, what} — fix the record'); continue; }
+      if (!fs.existsSync(path.resolve(CWD, c.path))) probs.push('told to build on a path that does not exist: ' + c.path);
+    }
+    const vlist = Array.isArray(t.verify) ? t.verify : (t.verify ? [String(t.verify)] : []);
+    for (const v of vlist) {
+      // skip leading VAR=value assignments — `CI=1 pnpm test` tests pnpm, not CI=1
+      const toks = String(v).trim().split(/\s+/).filter(Boolean);
+      const bin = (toks.find((x) => !/^[A-Za-z_][A-Za-z0-9_]*=/.test(x)) || '').replace(/^[(]+/, '');
+      if (bin && !binOk(bin)) probs.push('verify command\'s binary is not on PATH: `' + bin + '`  (' + v + ')');
+    }
+    if (t.briefSha && t.briefSha !== briefSha(t, r)) probs.push('brief is stale — the record changed after it was written');
+    if (!probs.length) continue;
+    bad++;
+    console.log('✗ ' + t.key);
+    for (const x of probs) console.log('    ' + x);
+  }
+  if (!bad) console.log('✓ ' + checked + ' task(s): every cited path exists, every verify binary resolves, no brief is stale.');
+  console.log('\nWhat this cannot see: a verify target that is unreachable (a database down, a service');
+  console.log('not started), and any number quoted in a note. Run each verify once by hand before a');
+  console.log('brief asserts it, and never put a number in a brief that the run itself can change —');
+  console.log('write where to read it instead.');
+  if (bad) { console.error('\n' + bad + ' task(s) failed. Fix the record, `brief --all`, run doctor again.'); process.exit(1); }
+}
+
+// --------------------------------------------------------------------- owed
+// Work that is only possible in a window between two pieces, recorded so the
+// window closing is a decision somebody made rather than a thing nobody saw.
+function owedList(r) { return (r.owed ||= []); }
+
+function cmdOwed(sub, rest, flags) {
+  const r = readReg();
+  if (sub === 'add') {
+    if (typeof flags.what !== 'string' || typeof flags.why !== 'string')
+      die('owed add --what "..." --why "..." [--window "..."] [--to <key>] [--load-bearing] — what and why both need text');
+    if (flags.window !== undefined && typeof flags.window !== 'string') die('--window needs text');
+    if (flags.to !== undefined) { if (typeof flags.to !== 'string') die('--to needs a task key'); getTask(r, flags.to); }
+    const id = 'o' + String(owedList(r).reduce((m, o) => Math.max(m, parseInt(o.id.slice(1), 10) || 0), 0) + 1).padStart(2, '0');
+    owedList(r).push({ id, what: flags.what, why: flags.why, window: flags.window || '',
+      to: flags.to || '', loadBearing: !!flags['load-bearing'], status: 'open', at: now() });
+    writeReg(r);
+    console.log(id + ' recorded' + (flags.to ? ', assigned to ' + flags.to : ' — UNASSIGNED. An owed item nobody owns is one the window closes on.'));
+  } else if (sub === 'assign') {
+    const o = owedList(r).find((x) => x.id === rest[0]); if (!o) die('no owed item ' + rest[0]);
+    if (!flags.to) die('need --to <task key>');
+    getTask(r, flags.to); o.to = flags.to; writeReg(r);
+    console.log(o.id + ' → ' + flags.to + '. Put it in that task\'s brief — an assignment the agent never sees is not one.');
+  } else if (sub === 'done') {
+    const o = owedList(r).find((x) => x.id === rest[0]); if (!o) die('no owed item ' + rest[0]);
+    o.status = 'done'; o.doneAt = now(); writeReg(r); console.log(o.id + ' settled.');
+  } else if (sub === 'list' || sub === undefined) {
+    const os = owedList(r);
+    if (!os.length) return console.log('nothing is owed.');
+    for (const o of os) {
+      console.log(o.id + '  ' + o.status.padEnd(6) + (o.loadBearing ? 'LOAD-BEARING  ' : '              ') +
+        (o.to ? '→ ' + o.to : 'UNASSIGNED').padEnd(14) + o.what);
+      if (o.status === 'open') console.log('      why: ' + o.why + (o.window ? '   window: ' + o.window : ''));
+    }
+  } else die('owed add|assign <id> --to <key>|done <id>|list');
+}
 
 // -------------------------------------------------------------- wave gating
 // A wave is finished when every task in it has landed AND the main line has
@@ -1007,24 +1370,41 @@ function blocking(r, n) {
   return out;
 }
 
+function waveArg(flags) {
+  if (flags.wave === undefined) return undefined;
+  // a bare --wave parses as boolean true, and Number(true) is 1 — reject it
+  if (!/^[0-9]+$/.test(String(flags.wave)) || Number(flags.wave) < 1)
+    die('--wave needs a round number counting from 1, got: ' + (flags.wave === true ? '(nothing)' : flags.wave));
+  return Number(flags.wave) - 1;
+}
+
 function cmdCi(flags) {
   const r = readReg();
-  const n = flags.wave !== undefined ? Number(flags.wave) - 1 : currentWave(r);
+  const wa = waveArg(flags);
+  const n = wa !== undefined ? wa : currentWave(r);
   const st = waveState(r, n);
   if (!st) die('there is no round ' + (n + 1));
   const status = flags.status;
   if (!['green', 'red', 'skipped'].includes(status)) die('--status must be green, red or skipped');
   if (status === 'skipped' && !flags.why) die('--status skipped needs --why "..." — a missing CI run is a decision, not an omission');
-  if (!st.allLanded && status === 'green')
-    die('round ' + (n + 1) + ' has not all landed yet, so a green run does not cover it:\n       ' +
+  if (!st.allLanded && status !== 'red')
+    die('round ' + (n + 1) + ' has not all landed yet, so this cannot close it:\n       ' +
         st.tasks.filter((t) => t.status !== 'landed').map((t) => t.key).join(' '));
   (r.ci ||= {})[String(n)] = { status, ref: flags.ref || '', why: flags.why || '', at: now() };
   writeReg(r);
   console.log('round ' + (n + 1) + ' CI: ' + status + (flags.ref ? '  ' + flags.ref : ''));
-  if (status === 'green') {
+  if (status === 'green' || status === 'skipped') {
     const nxt = waveState(r, n + 1);
     console.log(nxt ? 'Round ' + (n + 2) + ' may now be opened: ' + nxt.tasks.map((t) => t.key).join(' ')
                     : 'That was the last round.');
+    const owedOpen = (r.owed || []).filter((o) => o.status === 'open');
+    if (owedOpen.length) {
+      console.log('\n⚠ the round closed with ' + owedOpen.length + ' owed item(s) still open:');
+      for (const o of owedOpen) console.log('    ' + o.id + '  ' + (o.to ? '→ ' + o.to : 'UNASSIGNED') +
+        (o.loadBearing ? '  LOAD-BEARING' : '') + '  ' + o.what);
+      console.log('  A window that closes on an unassigned item closes for good. Assign each or');
+      console.log('  mark it done — do not let the next round bury them.');
+    }
   } else if (status === 'red') console.log('Nothing of the next round is created. Send the break back to whoever owns those files.');
 }
 
@@ -1043,7 +1423,8 @@ function currentWave(r) {
 
 function cmdWave(flags) {
   const r = readReg();
-  const n = flags.wave !== undefined ? Number(flags.wave) - 1 : currentWave(r);
+  const wa = waveArg(flags);
+  const n = wa !== undefined ? wa : currentWave(r);
   const st = waveState(r, n);
   if (!st) die('there is no round ' + (n + 1));
   console.log('Round ' + (n + 1) + ' of ' + waves(r).filter((w) => w.wave >= 0).length +
@@ -1063,6 +1444,8 @@ function cmdWave(flags) {
 
 function cmdChip(key, flags) {
   const r = readReg(); const t = getTask(r, key);
+  if (['landed', 'reported', 'cancelled'].includes(t.status))
+    die(key + ' is ' + t.status + ' — a chip cannot rewind it. If this is really meant to run again, that is a new task.');
   const n = waveOf(r, key);
   const stop = blocking(r, n);
   if (stop.length && !t.chip) {
@@ -1077,7 +1460,7 @@ function cmdChip(key, flags) {
   }
   if (flags.id) t.chip = flags.id;
   if (flags.worktree) t.worktree = flags.worktree;
-  const held = (t.needs || []).filter((n) => getTask(r, n).status !== 'landed');
+  const held = heldNeeds(r, t);
   t.status = held.length ? 'held' : 'ready';
   writeReg(r);
   console.log(t.key + '  ' + t.status + (held.length ? '  waiting for ' + held.join(', ') : '  can start now'));
@@ -1103,7 +1486,9 @@ function cmdAgent(key, flags) {
 
 function cmdRelease(key) {
   const r = readReg(); const t = getTask(r, key);
-  const held = (t.needs || []).filter((n) => getTask(r, n).status !== 'landed');
+  if (['landed', 'reported', 'cancelled'].includes(t.status))
+    die(key + ' is ' + t.status + ' — releasing it would rewind finished work.');
+  const held = heldNeeds(r, t);
   if (held.length) { console.error('✗ cannot release ' + key + ' — still waiting for ' + held.join(', ') + ' (not landed)'); process.exit(1); }
   t.status = 'ready';
   writeReg(r);
@@ -1121,7 +1506,8 @@ function cmdRelease(key) {
   console.log('```bash');
   console.log('git fetch --all -q 2>/dev/null; git log --oneline -1');
   for (const n of t.needs || []) {
-    const d = getTask(r, n);
+    const d = depOf(r, n);
+    if (!d) { console.log('# ' + n + ' is not on record — fix the needs list before releasing'); continue; }
     console.log(d.landedSha
       ? 'git merge-base --is-ancestor ' + d.landedSha + ' HEAD && echo "' + n + ' is in" || echo "' + n + ' is MISSING"'
       : '# ' + n + ' landed with no commit recorded — ask before trusting your copy');
@@ -1138,7 +1524,7 @@ function cmdRelease(key) {
 function cmdDone(key) {
   const r = readReg(); const t = getTask(r, key);
   const rep = stdinJson();
-  t.reports.push({ ...rep, at: now() });
+  (t.reports ||= []).push({ ...rep, at: now() });
   t.status = 'reported';
   writeReg(r);
   console.log(key + ' recorded as finished by its own account. Not landed until it is checked again.');
@@ -1151,7 +1537,7 @@ function worktreeFor(t) {
     let cur = null;
     for (const line of out.split('\n')) {
       if (line.startsWith('worktree ')) cur = line.slice(9).trim();
-      if (line.startsWith('branch ') && line.endsWith('/' + t.branch)) return cur;
+      if (line.startsWith('branch ') && line.slice(7).trim() === 'refs/heads/' + t.branch) return cur;
     }
   } catch { /* no git */ }
   return null;
@@ -1189,10 +1575,15 @@ function cmdLanded(key, flags) {
   if (t.status !== 'reported') die(key + ' is "' + t.status + '" — it cannot land before it reports finished');
   t.status = 'landed'; t.landedAt = now();
   t.landedSha = flags.sha || '';
+  const wv = waveOf(r, key);
+  if (wv >= 0 && (r.ci || {})[String(wv)]) {
+    delete r.ci[String(wv)];
+    console.log('round ' + (wv + 1) + ' had a CI result on record — invalidated, because this landing changed the main line after that run.');
+  }
   if (!t.landedSha) console.log('(no --sha given: a released chip cannot then prove its copy carries this work)');
   writeReg(r);
   const freed = tasks(r).filter((x) => x.status === 'held' && (x.needs || []).includes(key) &&
-    (x.needs || []).every((n) => getTask(r, n).status === 'landed'));
+    heldNeeds(r, x).length === 0);
   console.log(key + ' landed.');
   if (freed.length) { console.log('\nThese were waiting only on it and can be released now:'); for (const f of freed) console.log('  driver.mjs release ' + f.key); }
   else console.log('Nothing was freed by it.');
@@ -1271,7 +1662,7 @@ function cmdOutstanding() {
         detail: lastAsk.text.slice(0, 90), since: lastAsk.at });
     }
     if (t.status === 'reported') rows.push({ key: t.key, why: 'says it is finished and is waiting on your check',
-      detail: (t.reports.slice(-1)[0] || {}).verified || '', since: (t.reports.slice(-1)[0] || {}).at || '' });
+      detail: ((t.reports || []).slice(-1)[0] || {}).verified || '', since: ((t.reports || []).slice(-1)[0] || {}).at || '' });
     if (t.status === 'held' && (t.needs || []).every((n) => { const d = tasks(r).find((x) => x.key === n); return d && d.status === 'landed'; }))
       rows.push({ key: t.key, why: 'is free to start and has not been released', detail: 'waited for ' + (t.needs || []).join(', '), since: '' });
     if (t.status === 'planned' && t.agent)
@@ -1329,6 +1720,9 @@ function cmdBoard() {
     n('ready') + ' running · ' + n('held') + ' on hold · ' + n('planned') + ' not yet handed out');
   const stuck = tasks(r).filter((t) => t.status === 'held' && (t.needs || []).every((x) => { const d = tasks(r).find((y) => y.key === x); return d && d.status === 'landed'; }));
   if (stuck.length) console.log('\n⚠ held but nothing is blocking them any more — release: ' + stuck.map((t) => t.key).join(', '));
+  const owedOpen = (r.owed || []).filter((o) => o.status === 'open');
+  if (owedOpen.length) console.log('\nowed: ' + owedOpen.length + ' open (' +
+    owedOpen.filter((o) => !o.to).length + ' unassigned) — `owed list`');
   const cw = currentWave(r);
   const cst = waveState(r, cw);
   if (cst) {
@@ -1359,9 +1753,12 @@ function cmdBoard() {
 
 const argv = process.argv.slice(2);
 const flags = {}; const rest = [];
+const BOOL_FLAGS = new Set(['stdout', 'all', 'load-bearing']);
 for (let i = 0; i < argv.length; i++) {
-  if (argv[i].startsWith('--')) { const k = argv[i].slice(2); flags[k] = (argv[i + 1] && !argv[i + 1].startsWith('--')) ? argv[++i] : true; }
-  else rest.push(argv[i]);
+  if (argv[i].startsWith('--')) {
+    const k = argv[i].slice(2);
+    flags[k] = (!BOOL_FLAGS.has(k) && argv[i + 1] && !argv[i + 1].startsWith('--')) ? argv[++i] : true;
+  } else rest.push(argv[i]);
 }
 if (flags.register) REG_PATH = path.resolve(CWD, flags.register);
 
@@ -1396,7 +1793,16 @@ driving the work out, after the grill:
   whoami [--session id]     your own peer name, so chips can message you back.
   iam <name>                record it, so every brief carries it.
   task add       < json     [{key,title,plan,needs,owns,context,verify,decisions}]
-  graph                     the rounds, what runs side by side. Exits 1 if two tasks share a file.
+  graph                     the rounds, what runs side by side. Exits 1 when two tasks in one
+                            round share a file OR a serialisation point (migration head, lockfile,
+                            closed list a test checks exactly).
+  preflight brief <key>     prompt for a read-only agent: test the task's owns against the code.
+  preflight done <key>      read its report; load-bearing gaps must land back in owns.
+  preflight check [--wave n]  exits 1 while the round about to open has unflown or unresolved tasks.
+  doctor                    check everything a brief cites that can be checked: paths exist,
+                            verify binaries resolve, no brief is stale. Exits 1 on a failure.
+  owed add|assign|done|list work only possible in a window between two pieces — record it, assign
+                            it, and close no round on top of it silently.
   brief <key> [--stdout]    write the chip's brief to a file; print what to send. --all rewrites every one.
   chip <key> --id <task_id> [--worktree p]    record the chip, set held or ready.
   agent <key> --name <peer>  record where a chip checked in from — without it you cannot release it.
@@ -1452,6 +1858,16 @@ switch (cmd) {
   case 'landed': cmdLanded(rest[0], flags); break;
   case 'board': cmdBoard(); break;
   case 'wave': cmdWave(flags); break;
+  case 'preflight': {
+    const sub = rest.shift();
+    if (sub === 'brief') cmdPreflightBrief(rest[0]);
+    else if (sub === 'done') cmdPreflightDone(rest[0]);
+    else if (sub === 'check') cmdPreflightCheck(flags);
+    else die('preflight brief <key>|done <key>|check [--wave n]');
+    break;
+  }
+  case 'doctor': cmdDoctor(); break;
+  case 'owed': cmdOwed(rest.shift(), rest, flags); break;
   case 'ci': cmdCi(flags); break;
   case 'say': cmdSay(rest[0], flags); break;
   case 'heard': cmdHeard(rest[0], flags); break;

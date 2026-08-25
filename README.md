@@ -16,6 +16,13 @@ independent.
 
 ---
 
+## Prerequisites
+
+- **Claude Code** — the skill runs inside it.
+- **Node 18+** and **git**. The driver has no dependencies.
+- On Windows, use **WSL** or **Git Bash**: the paths and `~` expansion in this
+  README are POSIX-style.
+
 ## Install
 
 ```bash
@@ -23,11 +30,21 @@ git clone https://github.com/AamirhosseinN0/orchestrate-implementation.git \
   ~/.claude/skills/orchestrate-implementation
 ```
 
-That is it — Claude Code discovers it, and `git pull` in that directory updates
-it. To install by hand instead, copy `SKILL.md`, `driver.mjs` and `reference/`
-into `~/.claude/skills/orchestrate-implementation/`.
+That is it — Claude Code discovers it. Check the install:
 
-Needs **Node 18+** and **git**. The driver has no dependencies.
+```bash
+node ~/.claude/skills/orchestrate-implementation/driver.mjs   # prints the command list
+```
+
+To update an existing install, pull — the clone command above only works once
+per machine, because the directory is already there:
+
+```bash
+git -C ~/.claude/skills/orchestrate-implementation pull
+```
+
+To install by hand instead, copy `SKILL.md`, `driver.mjs` and `reference/` into
+`~/.claude/skills/orchestrate-implementation/`.
 
 ## Use
 
@@ -36,7 +53,8 @@ Needs **Node 18+** and **git**. The driver has no dependencies.
 ```
 
 Point it at one plan file, several, a directory, or a glob. If you give it
-nothing it asks.
+nothing it asks. The plans are *your* project's plan files, wherever you point
+it — not files that ship with the skill.
 
 ---
 

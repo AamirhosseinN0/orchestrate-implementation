@@ -1042,14 +1042,44 @@ function cmdDone(key) {
   console.log(key + ' recorded as finished by its own account. Not landed until it is checked again.');
 }
 
-function cmdGuard(key) {
+function worktreeFor(t) {
+  if (t.worktree && fs.existsSync(t.worktree)) return t.worktree;
+  try {
+    const out = execSync('git worktree list --porcelain', { cwd: CWD, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+    let cur = null;
+    for (const line of out.split('\n')) {
+      if (line.startsWith('worktree ')) cur = line.slice(9).trim();
+      if (line.startsWith('branch ') && line.endsWith('/' + t.branch)) return cur;
+    }
+  } catch { /* no git */ }
+  return null;
+}
+
+function cmdGuard(key, flags) {
   const r = readReg(); const t = getTask(r, key);
-  if (!t.worktree) die('no worktree recorded for ' + key);
-  console.log('Run this, then compare against what ' + key + ' was allowed to touch:\n');
-  console.log('  git -C ' + t.worktree + ' diff --name-only main...' + t.branch);
-  console.log('\nAllowed:');
-  for (const o of t.owns) console.log('  ' + o);
-  console.log('\nAnything outside that list is a violation — send it back, do not fix it yourself.');
+  const wt = worktreeFor(t);
+  if (!wt) die('cannot find a copy of the repository on branch ' + t.branch +
+    '\n       Record it: driver.mjs chip ' + key + ' --worktree <path>');
+  const base = flags.base || 'main';
+  let changed;
+  try {
+    changed = execSync('git diff --name-only ' + base + '...' + t.branch, { cwd: wt, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })
+      .split('\n').map((x) => x.trim()).filter(Boolean);
+  } catch (e) { die('could not diff ' + base + '...' + t.branch + ' in ' + wt); }
+  if (!changed.length) { console.log('⚠ ' + key + ' changed nothing at all against ' + base + '. That is not finished work.'); process.exit(1); }
+  const allowed = t.owns || [];
+  const bad = changed.filter((f) => !allowed.some((o) => collides(f, o)));
+  console.log(key + ' changed ' + changed.length + ' file(s) on ' + t.branch + ':');
+  for (const f of changed) console.log('  ' + (bad.includes(f) ? '✗' : '✓') + ' ' + f);
+  if (bad.length) {
+    console.log('\n✗ ' + bad.length + ' file(s) outside what it was allowed to touch:');
+    for (const f of bad) console.log('    ' + f);
+    console.log('\n  Allowed: ' + allowed.join(', '));
+    console.log('  Send it back. Do not fix it here — you would be writing code, and you would be');
+    console.log('  writing it in the one place that has to stay able to judge it.');
+    process.exit(1);
+  }
+  console.log('\n✓ everything it changed was its to change. Safe to join up.');
 }
 
 function cmdLanded(key, flags) {
@@ -1079,6 +1109,106 @@ function trespass(r) {
     }
   } catch { /* not a git repo, or git unavailable — skip */ }
   return out;
+}
+
+
+// ---------------------------------------------------------------- the ledger
+// A context forgets what it promised. This does not. Every word that passes
+// between the orchestrator and an agent is appended here, and `outstanding`
+// reads it back as "who is waiting on you".
+function ledgerPath() {
+  return path.join(path.dirname(path.resolve(CWD, REG_PATH)), 'messages.jsonl');
+}
+function append(entry) {
+  const f = ledgerPath();
+  fs.mkdirSync(path.dirname(f), { recursive: true });
+  fs.appendFileSync(f, JSON.stringify({ at: now(), ...entry }) + '\n');
+}
+function ledger() {
+  const f = ledgerPath();
+  if (!fs.existsSync(f)) return [];
+  return fs.readFileSync(f, 'utf8').split('\n').filter(Boolean).map((l) => {
+    try { return JSON.parse(l); } catch { return null; }
+  }).filter(Boolean);
+}
+
+const OUT_KINDS = ['release', 'reply', 'sendback', 'note', 'hold', 'announce'];
+const IN_KINDS = ['checkin', 'report', 'question', 'blocked', 'note'];
+
+function cmdSay(key, flags) {
+  const r = readReg(); const t = getTask(r, key);
+  const kind = flags.kind || 'note';
+  if (!OUT_KINDS.includes(kind)) die('kind must be one of: ' + OUT_KINDS.join(', '));
+  if (!flags.text) die('need --text "what you actually sent"');
+  append({ dir: 'out', key, kind, agent: t.agent || '', text: flags.text });
+  console.log('logged: → ' + key + ' [' + kind + ']');
+}
+
+function cmdHeard(key, flags) {
+  const r = readReg(); const t = getTask(r, key);
+  const kind = flags.kind || 'note';
+  if (!IN_KINDS.includes(kind)) die('kind must be one of: ' + IN_KINDS.join(', '));
+  if (!flags.text) die('need --text "what they actually said"');
+  append({ dir: 'in', key, kind, agent: t.agent || '', text: flags.text });
+  t.lastHeard = now();
+  writeReg(r);
+  console.log('logged: ← ' + key + ' [' + kind + ']');
+  if (kind === 'question' || kind === 'blocked')
+    console.log('  It is now waiting on you. `outstanding` will keep saying so until you log a reply.');
+}
+
+function cmdOutstanding() {
+  const r = readReg(); const log = ledger();
+  const rows = [];
+  for (const t of tasks(r)) {
+    const mine = log.filter((e) => e.key === t.key);
+    const lastAsk = [...mine].reverse().find((e) => e.dir === 'in' && ['question', 'blocked'].includes(e.kind));
+    if (lastAsk) {
+      const replied = mine.some((e) => e.dir === 'out' && e.at > lastAsk.at);
+      if (!replied) rows.push({ key: t.key, why: 'asked you something and has had no answer',
+        detail: lastAsk.text.slice(0, 90), since: lastAsk.at });
+    }
+    if (t.status === 'reported') rows.push({ key: t.key, why: 'says it is finished and is waiting on your check',
+      detail: (t.reports.slice(-1)[0] || {}).verified || '', since: (t.reports.slice(-1)[0] || {}).at || '' });
+    if (t.status === 'held' && (t.needs || []).every((n) => { const d = tasks(r).find((x) => x.key === n); return d && d.status === 'landed'; }))
+      rows.push({ key: t.key, why: 'is free to start and has not been released', detail: 'waited for ' + (t.needs || []).join(', '), since: '' });
+    if (t.status === 'planned' && t.agent)
+      rows.push({ key: t.key, why: 'checked in but was never told where it stands', detail: '', since: '' });
+  }
+  if (!rows.length) return console.log('Nothing is waiting on you.');
+  console.log('These are waiting on you. Deal with each one — none of them will ask twice.\n');
+  for (const x of rows) {
+    console.log('  ' + x.key.padEnd(10) + x.why);
+    if (x.detail) console.log('             “' + x.detail + '”');
+    if (x.since) console.log('             since ' + x.since.slice(0, 19).replace('T', ' '));
+  }
+  console.log('\n' + rows.length + ' outstanding.');
+}
+
+// ------------------------------------------------------------------- resume
+// A session dies and fifty agents keep messaging an address nobody reads.
+function cmdResume(flags) {
+  const r = readReg();
+  if (!flags.name) die('need --name <your new peer name> — get it from `whoami`');
+  const was = r.orchestrator || '(none recorded)';
+  r.orchestrator = flags.name;
+  writeReg(r);
+  console.log('The run is now yours. It was ' + was + '; it is ' + flags.name + '.\n');
+  console.log('Every brief names the old address, so they are all wrong. Rewriting them:');
+  console.log('  node driver.mjs brief --all\n');
+  const live = tasks(r).filter((t) => t.agent && !['landed', 'cancelled'].includes(t.status));
+  if (live.length) {
+    console.log('Then send this to each of these ' + live.length + ' agent(s):\n');
+    console.log('  ---8<---');
+    console.log('  The session running this changed. I am ' + flags.name + ' — reply to me from now on,');
+    console.log('  not to ' + was + '. Nothing about your work has changed. Your brief was rewritten with');
+    console.log('  the new address; re-read it before you go on. If you asked something and never got an');
+    console.log('  answer, ask me again — I may not have it.');
+    console.log('  ---8<---\n');
+    for (const t of live) console.log('  ' + t.key.padEnd(10) + t.agent.padEnd(18) + t.status);
+  } else console.log('No agent has checked in yet, so there is nobody to re-announce to.');
+  console.log('\nThen work through what was left mid-air:');
+  console.log('  node driver.mjs outstanding');
 }
 
 function cmdBoard() {
@@ -1161,7 +1291,11 @@ driving the work out, after the grill:
   agent <key> --name <peer>  record where a chip checked in from — without it you cannot release it.
   release <key>             refuses while a requirement has not landed; prints the release message.
   done <key>     < json     {commit, verified, notes} — a chip's own report.
-  guard <key>               check what it changed against what it was allowed to change.
+  guard <key> [--base b]    diff its branch and name any file it was not allowed to touch. Exits 1.
+  say <key> --kind k --text t     log what you sent (release|reply|sendback|note|hold|announce).
+  heard <key> --kind k --text t   log what arrived (checkin|report|question|blocked|note).
+  outstanding               who is waiting on you, and since when.
+  resume --name <peer>      take over a run after the session running it ended.
   landed <key>              record the merge, and name who that frees.
   board                     every task, its state, and what it waits for.
 
@@ -1201,8 +1335,12 @@ switch (cmd) {
   case 'agent': cmdAgent(rest[0], flags); break;
   case 'release': cmdRelease(rest[0]); break;
   case 'done': cmdDone(rest[0]); break;
-  case 'guard': cmdGuard(rest[0]); break;
+  case 'guard': cmdGuard(rest[0], flags); break;
   case 'landed': cmdLanded(rest[0], flags); break;
   case 'board': cmdBoard(); break;
+  case 'say': cmdSay(rest[0], flags); break;
+  case 'heard': cmdHeard(rest[0], flags); break;
+  case 'outstanding': cmdOutstanding(); break;
+  case 'resume': cmdResume(flags); break;
   default: console.log(HELP); process.exit(cmd ? 2 : 0);
 }

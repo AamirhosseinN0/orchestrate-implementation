@@ -83,7 +83,28 @@ payload.
   register.json          every decision, gap and task
   refine/<plan>.json     what each refining agent found, in its own words
   briefs/<key>.md        exactly what each chip was told
+  messages.jsonl         every word that passed between the two
 ```
+
+Task states say where the work is. They never say what was promised — that the
+board shows a task running tells you nothing about the question its agent asked
+an hour ago and is still waiting on. So both directions are logged, and one
+command reads it back:
+
+```
+These are waiting on you. Deal with each one — none of them will ask twice.
+
+  2.1       asked you something and has had no answer
+             “the settings file is not in my list but the plan says I must add a key to it”
+             since 2026-08-25 08:35:39
+```
+
+An agent asks once. It was told to stop and ask rather than guess, so it stops
+and waits — quietly, looking exactly like an agent that is working.
+
+And when the session running everything ends, the run is recoverable rather than
+lost: a new one takes it over, rewrites every brief with its own address, and is
+handed the re-announcement to send to each agent still working.
 
 Recording a report the agent did not write is refused outright:
 
@@ -217,9 +238,17 @@ Each brief is self-contained: the plan to read, the decisions already settled,
 the code it must build on (read-only ones marked), the only files it may change,
 its branch, the proof it must run, and who to report to.
 
-Nothing lands on an agent's own word. Work is checked against what it was
-allowed to touch, joined in a staging copy, run in full, and only then does the
-main line move.
+Nothing lands on an agent's own word. The branch is diffed and every file marked
+against what that task was allowed to touch — checked, not eyeballed:
+
+```
+2.1 changed 2 file(s) on step/2.1:
+  ✓ src/cards/a.py
+  ✗ src/other/b.py
+✗ 1 file(s) outside what it was allowed to touch
+```
+
+Only then is it joined in a staging copy, run in full, and merged.
 
 ### Two traps this handles
 

@@ -53,6 +53,7 @@ and you read that file. Your context carries the pointer, never the payload.
   register.json          every decision, gap and task
   refine/<plan>.json     what each refining agent found, in its own words
   briefs/<key>.md        exactly what each chip was told
+  messages.jsonl         every word that passed between you and an agent
 ```
 
 Two habits follow, and they are not optional:
@@ -60,6 +61,16 @@ Two habits follow, and they are not optional:
 - **Never summarise an agent's report into the record.** If a report is missing,
   ask the agent to write the file — do not reconstruct it from what it said in
   the chat. `refine done` refuses rather than letting you type it in.
+- **Log every message, both directions, as it happens.** One line each. It is
+  what tells you, after a compaction or a dead session, that an agent asked
+  something three hours ago and is still sitting there.
+
+```bash
+node $DRV heard 2.1 --kind question --text "the settings file is not in my list"
+node $DRV say   2.1 --kind reply    --text "my error, brief rewritten, re-read it"
+node $DRV outstanding    # who is waiting on you, and since when
+```
+
 - **When you correct a record, the briefs are now wrong.** `board` tells you
   which; `brief --all` rewrites them and names what changed, so you know which
   agents to send back to their brief.
@@ -465,11 +476,29 @@ J
 Then **you check it again. Its own word is not enough.**
 
 ```bash
-node $DRV guard 2.1     # prints what to run and what it was allowed to touch
+node $DRV guard 2.1
 ```
 
-Compare the changed files against what it owned. Anything outside the list is a
-violation — send it back, do not fix it yourself.
+It diffs the branch itself and marks every file — you are not comparing lists by
+eye, which is where attention goes at task forty of fifty:
+
+```
+2.1 changed 2 file(s) on step/2.1:
+  ✓ src/cards/a.py
+  ✗ src/other/b.py
+
+✗ 1 file(s) outside what it was allowed to touch:
+    src/other/b.py
+  Send it back. Do not fix it here — you would be writing code, and you would be
+  writing it in the one place that has to stay able to judge it.
+```
+
+It exits 1 on a trespass, and also on a branch that changed nothing at all —
+which is not finished work either. Log the send-back:
+
+```bash
+node $DRV say 2.1 --kind sendback --text "src/other/b.py is not yours — back out that change"
+```
 
 Then join it up and run **everything**, in a staging copy, so the main line is
 never broken:
@@ -493,15 +522,19 @@ it** — they know what the code meant. Recover with
 Once the chips exist the user is out of it. The loop is yours, and it is only
 ever these four moves:
 
-1. **A check-in arrives** → record the address. If it is held, reply that it
-   waits and name what it waits for.
-2. **A report arrives** → guard it, join it, run everything, land it. If it is
-   wrong, send it back to that agent with what failed — never fix it yourself.
-3. **Something lands** → `landed` names who that frees. Release each of them and
-   send the message.
-4. **Nothing is happening** → look at the board. Anything `reported` is waiting
-   on you. Anything `held` whose requirements have all landed should have been
-   released already.
+1. **A check-in arrives** → record the address with `agent`, log it with
+   `heard`. If it is held, reply that it waits and name what it waits for.
+2. **A report arrives** → `heard` it, then `guard`, join, run everything, `landed`.
+   If it is wrong, send it back to that agent with what failed and `say` what you
+   sent — never fix it yourself.
+3. **Something lands** → `landed` names who that frees. Release each of them,
+   send the message, and `say` that you sent it.
+4. **Nothing is happening** → `outstanding` first, then `board`. The first says
+   who is waiting on *you*; the second says where the work is.
+
+Log both directions every time. It costs one line and it is the only thing that
+survives you being compacted mid-round — task states tell you where the work is,
+never what you promised somebody.
 
 Reports and check-ins arrive as messages and wake you, so the usual case needs
 no polling. But an agent that dies, stalls, or forgets to report will never wake
@@ -517,6 +550,23 @@ owns. Those are the same holds Act one made — a question, not a guess.
 
 You are finished when every task is `landed` and `board` says so.
 
+## 15. If the session running this ends, take it over
+
+Sessions die. When one does, fifty agents are messaging an address nobody reads,
+and none of them will work that out on their own.
+
+```bash
+node $DRV whoami                  # your new name
+node $DRV resume --name proj-z9
+node $DRV brief --all             # every brief names the old address
+node $DRV outstanding             # what was left mid-air
+```
+
+`resume` prints the re-announcement to send to every agent still working, and
+lists them. Send it to each — they cannot discover this themselves. Then work
+`outstanding` down: a question asked of a session that no longer exists has no
+answer coming, and the agent is still waiting.
+
 ---
 
 ## Gotchas
@@ -524,6 +574,12 @@ You are finished when every task is `landed` and `board` says so.
 - **A chip makes its own copy when it is opened, not when it is released.** A
   held chip opened on day one and released on day three is three days stale.
   This is why every release message carries a base check.
+- **Task states say where the work is; they never say what you promised.** That
+  the board shows `2.1 ready` tells you nothing about the question its agent
+  asked you an hour ago. Only the ledger does, and only if you wrote to it.
+- **An agent asks once.** It is following a brief that told it to stop and ask
+  rather than guess, so it stops and waits — indefinitely, quietly, looking
+  exactly like an agent that is working. `outstanding` is how you find it.
 - **A chip reads the plan from the main checkout, not from its own copy.** Its
   copy was taken before refinement rewrote the plan, so the version sitting in
   its worktree is the old one. The brief gives an absolute path for exactly this
@@ -594,6 +650,11 @@ You are finished when every task is `landed` and `board` says so.
 - **`error: no register at ...`**: wrong directory. Run from the project root or
   pass `--register <path>`. A chip reporting in from its own copy needs the
   absolute path — its brief already has it.
+- **`guard` says "changed nothing at all against main"**: the agent reported
+  finished but its branch is empty. Either it committed to the wrong branch or it
+  never committed. Ask which — do not go looking in its worktree yourself.
+- **`guard` says "cannot find a copy of the repository on branch X"**: the
+  worktree was never recorded. `chip <key> --worktree <path>` fixes it.
 - **`refine done` says "no report at … and nothing on stdin"**: the agent has not
   written its file yet, or wrote it elsewhere. Ask it to write it to the path in
   its brief. Do not paste the JSON in from the chat.

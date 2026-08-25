@@ -524,6 +524,11 @@ You are finished when every task is `landed` and `board` says so.
 - **A chip makes its own copy when it is opened, not when it is released.** A
   held chip opened on day one and released on day three is three days stale.
   This is why every release message carries a base check.
+- **A chip reads the plan from the main checkout, not from its own copy.** Its
+  copy was taken before refinement rewrote the plan, so the version sitting in
+  its worktree is the old one. The brief gives an absolute path for exactly this
+  reason. Commit refined plans anyway — a plan and the code built from it belong
+  in one history.
 - **Compaction takes detail, not headlines.** You will not notice it. What goes
   is a file dropped from a list or a condition dropped from a decision — and the
   agent then builds against something you no longer hold. This is not

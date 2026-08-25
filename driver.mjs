@@ -657,6 +657,17 @@ function cmdRefineCheck() {
   }
   const noTasks = (r.tasks || []).length === 0;
   if (noTasks) { console.error('✗ no tasks proposed — refinement produced nothing to hand out'); fail = true; }
+  try {
+    const dirty = execSync('git status --porcelain', { cwd: CWD, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })
+      .split('\n').map((l) => l.slice(3).trim()).filter(Boolean);
+    const uncommitted = r.plans.filter((pl) => dirty.some((f) => f === pl.path || f.endsWith('/' + pl.path)));
+    if (uncommitted.length) {
+      console.log('· ' + uncommitted.length + ' refined plan(s) are not committed: ' +
+        uncommitted.map((x) => x.path).join(', '));
+      console.log('  Briefs point at the main checkout so agents will still read the new text, but');
+      console.log('  commit them anyway — a plan and the code built from it belong in one history.');
+    }
+  } catch { /* not a git repo */ }
   if (fail) { console.error('\nnot ready to hand anything out.'); process.exit(1); }
   console.log('✓ every plan refined, nothing left undecided, ' + r.tasks.length + ' task(s) ready. Run `graph`.');
 }
@@ -836,7 +847,17 @@ function cmdBrief(key, flags) {
   }
   B.push('# ' + t.key + ' — ' + t.title);
   B.push('');
-  if (t.plan) { B.push('**The plan.** Read it in full before writing anything: `' + t.plan + '`'); B.push(''); }
+  if (t.plan) {
+    B.push('**The plan.** Read it in full before writing anything:');
+    B.push('');
+    B.push('    ' + path.resolve(CWD, t.plan));
+    B.push('');
+    B.push('That is the **main checkout**, not your copy. It has to be, because the plan was rewritten');
+    B.push('against the real code after you were queued — the copy in your own tree may be the older');
+    B.push('one. Every other path in this brief is relative and belongs to your copy; only the plan');
+    B.push('and this brief are read from over there.');
+    B.push('');
+  }
   if (t.decisions.length) {
     B.push('**Already settled with the author. Do not reopen, do not improve on:**');
     B.push('');

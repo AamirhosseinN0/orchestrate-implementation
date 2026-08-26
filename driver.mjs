@@ -1391,11 +1391,40 @@ function cmdBundle(sub, rest, flags) {
   host.decisions = uniq(members.flatMap((m) => m.decisions || []));
   host.context = uniq(members.flatMap((m) => (m.context || []).map((c) => JSON.stringify(c)))).map((x) => JSON.parse(x));
   host.needs = uniq(members.flatMap((m) => m.needs || []).filter((n) => !keys.includes(n)));
-  host.bundled = uniq([...(host.bundled || []), ...members.map((m) => ({ key: m.key, title: m.title }))
-    .filter((x) => x.key !== into).map((x) => JSON.stringify(x))]).map((x) => JSON.parse(x));
+  // Bundling twice into the same host used to throw SyntaxError out of the
+  // driver: the entries already on `host.bundled` are objects, and they were fed
+  // to JSON.parse alongside the freshly stringified new ones.
+  host.bundled = uniq([...(host.bundled || []), ...others.map((m) => ({ key: m.key, title: m.title }))]
+    .map((x) => JSON.stringify(x))).map((x) => JSON.parse(x));
   host.title = host.title + ' (+ ' + others.map((m) => m.key).join(', ') + ')';
   // the absorbed tasks are cancelled, not deleted — the record keeps them
   for (const m of others) { m.status = 'cancelled'; m.bundledInto = into; }
+  // A member's key still appears in OTHER tasks' `needs`, and nothing used to
+  // repoint them. `waves` drops a cancelled task, so a dependent was never
+  // placed and `graph` exited 1 for ever; `heldNeeds` reads a cancelled dep as
+  // not-landed, so its chip could never open. The work did not disappear — it
+  // moved to the host — so the dependency moves with it.
+  const absorbed = new Set(others.map((m) => m.key));
+  const repointed = [];
+  for (const t of tasks(r)) {
+    if (absorbed.has(t.key) || !(t.needs || []).some((n) => absorbed.has(n))) continue;
+    t.needs = uniq(t.needs.map((n) => (absorbed.has(n) ? into : n))).filter((n) => n !== t.key);
+    repointed.push(t.key);
+  }
+  // A pre-flight gap belongs to the files, not to the key that happened to own
+  // them. Left behind on a cancelled member it stops being read, and `preflight
+  // check` — which skips cancelled tasks — flipped from red to green because
+  // the work was renamed rather than done.
+  const pfs = members.map((m) => m.preflight).filter(Boolean);
+  const neverFlown = members.filter((m) => !m.preflight).map((m) => m.key);
+  if (pfs.length) {
+    host.preflight = {
+      at: now(),
+      missing: uniq(pfs.flatMap((p) => p.missing || []).map((x) => JSON.stringify(x))).map((x) => JSON.parse(x)),
+      verify: uniq(pfs.flatMap((p) => p.verify || []).map((x) => JSON.stringify(x))).map((x) => JSON.parse(x)),
+      notes: pfs.map((p) => p.notes).filter(Boolean).join('\n'),
+    };
+  }
   // Everything else about a member moved to the host; its open problems and its
   // owed items have to move too, or they stay filed against a key nobody is
   // building. The brief is written from the host's record, so an unmoved defect
@@ -1415,6 +1444,14 @@ function cmdBundle(sub, rest, flags) {
   console.log('  ' + others.length + ' task(s) marked cancelled and recorded as absorbed — nothing was deleted.');
   if (moved.defects.length) console.log('  moved to ' + into + ': open defect(s) ' + moved.defects.join(' ') + ' — they are that agent\'s to fix now.');
   if (moved.owed.length) console.log('  moved to ' + into + ': owed item(s) ' + moved.owed.join(' ') + ' — put them in the brief.');
+  if (repointed.length) console.log('  repointed at ' + into + ': ' + repointed.join(', ') +
+    ' waited on an absorbed key. Without this they wait for ever on a cancelled task.');
+  const openGaps = (host.preflight?.missing || []).filter((m) => m.loadBearing &&
+    !(host.owns || []).some((o) => coveredBy(o, m.path)));
+  if (pfs.length) console.log('  carried across: ' + (host.preflight.missing || []).length +
+    ' pre-flight gap(s)' + (openGaps.length ? ', ' + openGaps.length + ' of them load-bearing and still outside `owns`' : ''));
+  if (neverFlown.length) console.log('  ⚠ never pre-flighted: ' + neverFlown.join(', ') +
+    ' — the host now owns their files on nobody\'s word. Run `preflight brief ' + into + '`.');
   console.log('\nRe-run `graph` and `preflight brief ' + into + '` — the brief now covers all of it.');
 }
 

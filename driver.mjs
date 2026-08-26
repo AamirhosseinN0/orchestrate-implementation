@@ -20,6 +20,10 @@ const die = (m) => { console.error('error: ' + m); process.exit(2); };
 const now = () => new Date().toISOString();
 
 function readReg() {          // for read-modify-write: holds the lock until exit
+  // Ask whether there is anything to read BEFORE taking the lock. Locking first
+  // means a project with no register at all reports a lock conflict, which is
+  // both wrong and the least useful thing it could say.
+  if (!fs.existsSync(REG_PATH)) die('no register at ' + rel(REG_PATH) + ' — run `load` first');
   acquireLock();
   return readRegRO();
 }
@@ -37,6 +41,11 @@ let HAS_LOCK = false;
 function lockDir() { return REG_PATH + '.lock'; }
 function acquireLock() {
   if (HAS_LOCK) return;
+  // The lock lives beside the register, so on the very first write its parent
+  // does not exist yet. Without this the mkdir below fails with ENOENT, which
+  // read as contention and spun for six seconds before blaming a process that
+  // was never there.
+  try { fs.mkdirSync(path.dirname(lockDir()), { recursive: true }); } catch { /* reported below */ }
   for (let i = 0; i < 60; i++) {
     try {
       fs.mkdirSync(lockDir(), { recursive: false });
@@ -45,7 +54,11 @@ function acquireLock() {
       try { fs.writeFileSync(path.join(lockDir(), 'holder.json'),
         JSON.stringify({ pid: process.pid, host: os.hostname(), since: now() })); } catch { /* best effort */ }
       HAS_LOCK = true; process.on('exit', releaseLock); return;
-    } catch {
+    } catch (e) {
+      // Only EEXIST means somebody else holds it. A permission error, a full
+      // disk or a missing parent are not contention and waiting will not help.
+      if (e && e.code && e.code !== 'EEXIST')
+        die('cannot create the register lock at ' + rel(lockDir()) + ': ' + e.code + ' — ' + e.message);
       if (lockIsDead()) { try { fs.rmSync(lockDir(), { recursive: true, force: true }); } catch { /* raced */ } continue; }
       try { execSync('sleep 0.1'); } catch { /* keep spinning */ }
     }

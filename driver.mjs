@@ -206,7 +206,20 @@ function applyOps(state, ops) {
 function readEvents({ tolerateTail = true } = {}) {
   const f = eventsPath();
   if (!fs.existsSync(f)) return { events: [], problems: [], bytesGood: 0 };
-  const raw = fs.readFileSync(f, 'utf8');
+  // A record that is a directory, or that this user cannot read, is bad input like
+  // any other bad input. It used to come out as a raw Node stack trace from every
+  // single command, which tells the person nothing about what to do next.
+  let raw;
+  try {
+    const st = fs.statSync(f);
+    if (!st.isFile())
+      die('the record at ' + rel(f) + ' is a ' + (st.isDirectory() ? 'directory' : 'special file') +
+          ', not a file — one JSON event per line is what belongs there.');
+    raw = fs.readFileSync(f, 'utf8');
+  } catch (e) {
+    die('cannot read the record at ' + rel(f) + ': ' + ((e && e.code) || 'unreadable') + '.\n' +
+        '       Fix its permissions, or recover it from .claude/orchestration/backups/.');
+  }
   const lines = raw.split('\n');
   const events = [], problems = [];
   let bytesGood = 0;

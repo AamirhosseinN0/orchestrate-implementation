@@ -37,16 +37,35 @@ function lockDir() { return REG_PATH + '.lock'; }
 function acquireLock() {
   if (HAS_LOCK) return;
   for (let i = 0; i < 60; i++) {
-    try { fs.mkdirSync(lockDir(), { recursive: false }); HAS_LOCK = true; process.on('exit', releaseLock); return; }
-    catch {
-      try { if (Date.now() - fs.statSync(lockDir()).mtimeMs > 15000) { fs.rmdirSync(lockDir()); continue; } } catch { continue; }
+    try {
+      fs.mkdirSync(lockDir(), { recursive: false });
+      // Say who holds it, so a stale lock can be told from a slow one by asking
+      // the operating system rather than by guessing from a timestamp.
+      try { fs.writeFileSync(path.join(lockDir(), 'holder.json'),
+        JSON.stringify({ pid: process.pid, host: os.hostname(), since: now() })); } catch { /* best effort */ }
+      HAS_LOCK = true; process.on('exit', releaseLock); return;
+    } catch {
+      if (lockIsDead()) { try { fs.rmSync(lockDir(), { recursive: true, force: true }); } catch { /* raced */ } continue; }
       try { execSync('sleep 0.1'); } catch { /* keep spinning */ }
     }
   }
   die('another driver process has held the register lock for a while: ' + rel(lockDir()) +
       '\n       If nothing is actually running, remove that directory.');
 }
-function releaseLock() { if (HAS_LOCK) { try { fs.rmdirSync(lockDir()); } catch { /* gone */ } HAS_LOCK = false; } }
+function releaseLock() { if (HAS_LOCK) { try { fs.rmSync(lockDir(), { recursive: true, force: true }); } catch { /* gone */ } HAS_LOCK = false; } }
+
+// A holder whose process is gone is dead however recently it started. A holder
+// that is alive is not stale however long it has run — a command that legitimately
+// takes a minute must not have its lock stolen out from under it.
+function lockIsDead() {
+  let h = null;
+  try { h = JSON.parse(fs.readFileSync(path.join(lockDir(), 'holder.json'), 'utf8')); } catch { /* none */ }
+  if (!h || !h.pid) {
+    try { return Date.now() - fs.statSync(lockDir()).mtimeMs > 15000; } catch { return false; }
+  }
+  if (h.host && h.host !== os.hostname()) return Date.now() - Date.parse(h.since || 0) > 15 * 60000;
+  try { process.kill(h.pid, 0); return false; } catch (e) { return e.code === 'ESRCH'; }
+}
 
 function writeReg(r) {
   fs.mkdirSync(path.dirname(REG_PATH), { recursive: true });
@@ -1180,10 +1199,19 @@ function cmdBrief(key, flags) {
   const body = B.join('\n') + '\n';
   if (flags && flags.stdout) { console.log(body); return; }
   const out = briefPath(t.key);
-  fs.writeFileSync(out, body);
-  t.briefSha = briefSha(t, r); t.briefAt = now(); t.briefFile = out;
-  writeReg(r);
-  console.log('wrote ' + out);
+  const sha = briefSha(t, r);
+  // `brief --all` is the command `resume` tells you to run after a dead session,
+  // and it used to stamp briefAt on every task every time — so twenty tasks
+  // burned twenty of the thirty backup slots, and two runs wiped the ring that
+  // is the register's only history. An unchanged brief now writes nothing.
+  let unchanged = t.briefSha === sha && t.briefFile === out;
+  if (unchanged) { try { unchanged = fs.readFileSync(out, 'utf8') === body; } catch { unchanged = false; } }
+  if (!unchanged) {
+    fs.writeFileSync(out, body);
+    t.briefSha = sha; t.briefAt = now(); t.briefFile = out;
+    writeReg(r);
+  }
+  console.log((unchanged ? 'unchanged ' : 'wrote ') + out);
   console.log('');
   console.log('Give the chip this, and nothing retyped from memory:');
   console.log('');
@@ -1213,15 +1241,17 @@ function cmdBrief(key, flags) {
 function cmdBriefAll() {
   const r = readReg();
   let n = 0;
+  let same = 0;
   for (const t of tasks(r)) {
     if (['cancelled', 'landed'].includes(t.status)) continue;
     const before = t.briefSha;
     cmdBriefQuiet(t.key);
     n++;
+    if (getTask(readReg(), t.key).briefSha === before) same++;
     const now2 = getTask(readReg(), t.key).briefSha;
     if (before && before !== now2) console.log('  changed: ' + t.key + '  → any chip already holding it is out of date');
   }
-  console.log(n + ' brief(s) written to ' + orchDir('briefs'));
+  console.log(n + ' brief(s) checked in ' + orchDir('briefs') + '; ' + (n - same) + ' rewritten, ' + same + ' already current.');
 }
 
 function cmdBriefQuiet(key) {
@@ -1403,6 +1433,72 @@ function cmdDoctor() {
 // window closing is a decision somebody made rather than a thing nobody saw.
 function owedList(r) { return (r.owed ||= []); }
 
+
+// ------------------------------------------------------------------ defects
+// A failure used to survive only as prose in the ledger — and worse, sending
+// work back cleared the agent's unanswered question, so rejecting work made it
+// invisible. A defect is a record: it has an id, it names the task, and nothing
+// closes over it silently.
+const DEFECT_KINDS = ['sendback', 'guard', 'ci', 'blocked', 'bug'];
+function defectList(r) { return (r.defects ||= []); }
+function nextDefectId(r) {
+  const n = defectList(r).reduce((m, d) => Math.max(m, parseInt(String(d.id).slice(1), 10) || 0), 0);
+  return 'd' + String(n + 1).padStart(2, '0');
+}
+// Returns the record. Callers must writeReg themselves — several of these fire
+// inside commands that are otherwise read-only.
+function recordDefect(r, { task, kind, what, evidence, blocking }) {
+  const d = {
+    id: nextDefectId(r), task: task || '', kind,
+    what: String(what || '').slice(0, 500), evidence: String(evidence || '').slice(0, 2000),
+    blocking: blocking !== false, status: 'open', at: now(), resolvedAt: '',
+  };
+  defectList(r).push(d);
+  return d;
+}
+function openDefects(r, key) {
+  return defectList(r).filter((d) => d.status === 'open' && (!key || d.task === key));
+}
+
+function cmdDefect(sub, rest, flags) {
+  const r = readReg();
+  if (sub === 'add') {
+    if (typeof flags.what !== 'string' || !flags.what.trim()) die('defect add --task <key> --kind <' + DEFECT_KINDS.join('|') + '> --what "..." [--evidence "..."] [--not-blocking]');
+    const kind = flags.kind || 'bug';
+    if (!DEFECT_KINDS.includes(kind)) die('--kind must be one of: ' + DEFECT_KINDS.join(', '));
+    if (flags.task !== undefined) { if (typeof flags.task !== 'string') die('--task needs a key'); getTask(r, flags.task); }
+    const d = recordDefect(r, { task: flags.task || '', kind, what: flags.what,
+                                evidence: typeof flags.evidence === 'string' ? flags.evidence : '',
+                                blocking: !flags['not-blocking'] });
+    writeReg(r);
+    console.log(d.id + '  ' + d.kind + (d.task ? '  ' + d.task : '') + (d.blocking ? '  (blocking)' : ''));
+    console.log('It stays on `outstanding` until you run: defect fixed ' + d.id);
+    return;
+  }
+  if (sub === 'fixed') {
+    const d = defectList(r).find((x) => x.id === rest[0]);
+    if (!d) die('no defect ' + rest[0] + ' (have: ' + defectList(r).map((x) => x.id).join(', ') + ')');
+    if (d.status === 'fixed') return console.log(d.id + ' was already marked fixed at ' + d.resolvedAt);
+    d.status = 'fixed'; d.resolvedAt = now();
+    writeReg(r);
+    console.log(d.id + ' marked fixed.');
+    return;
+  }
+  if (sub === 'list') {
+    const all = defectList(r);
+    const show = flags.all ? all : all.filter((d) => d.status === 'open');
+    if (!show.length) return console.log(flags.all ? 'no defects recorded.' : 'no open defects.');
+    for (const d of show) {
+      console.log((d.status === 'open' ? '✗' : '·') + ' ' + d.id + '  ' + d.kind.padEnd(9) +
+        (d.task || '-').padEnd(10) + (d.blocking && d.status === 'open' ? '[blocking] ' : '') + d.what.slice(0, 60));
+      if (d.evidence) console.log('     ' + d.evidence.split('\n')[0].slice(0, 76));
+    }
+    console.log('\n' + show.length + (flags.all ? ' total.' : ' open. `defect list --all` for the rest.'));
+    return;
+  }
+  die('defect add|fixed <id>|list [--all]');
+}
+
 function cmdOwed(sub, rest, flags) {
   const r = readReg();
   if (sub === 'add') {
@@ -1580,7 +1676,8 @@ function cmdCi(flags) {
   if (!st) die('there is no round ' + (n + 1));
   const status = flags.status;
   if (!['green', 'red', 'skipped'].includes(status)) die('--status must be green, red or skipped');
-  if (status === 'skipped' && !flags.why) die('--status skipped needs --why "..." — a missing CI run is a decision, not an omission');
+  if (status === 'skipped' && typeof flags.why !== 'string') die('--status skipped needs --why "..." — a missing CI run is a decision, not an omission');
+  if (status === 'red' && typeof flags.why !== 'string') die('--status red needs --why "..." — what broke is the whole point of recording it');
   if (!st.allLanded && status !== 'red')
     die('round ' + (n + 1) + ' has not all landed yet, so this cannot close it:\n       ' +
         st.tasks.filter((t) => t.status !== 'landed').map((t) => t.key).join(' '));
@@ -1599,7 +1696,15 @@ function cmdCi(flags) {
       console.log('  A window that closes on an unassigned item closes for good. Assign each or');
       console.log('  mark it done — do not let the next round bury them.');
     }
-  } else if (status === 'red') console.log('Nothing of the next round is created. Send the break back to whoever owns those files.');
+  } else if (status === 'red') {
+    const covered = st.tasks.filter((t) => t.status === 'landed').map((t) => t.key);
+    const d = recordDefect(r, { task: '', kind: 'ci',
+      what: 'CI red on round ' + (n + 1) + (flags.ref ? ' (' + flags.ref + ')' : ''),
+      evidence: 'why: ' + flags.why + '\ncovers: ' + (covered.join(' ') || '(nothing landed)'), blocking: true });
+    writeReg(r);
+    console.log('recorded ' + d.id + ' naming the ' + covered.length + ' landed task(s) it covers.');
+    console.log('Nothing of the next round is created. Send the break back to whoever owns those files.');
+  }
 }
 
 // The round that needs attention. A round that has fully landed but has no CI
@@ -1723,13 +1828,28 @@ function cmdRelease(key) {
   console.log('report both ways when the checks pass.');
 }
 
+const OUTCOMES = ['passed', 'partial', 'failed'];
 function cmdDone(key) {
   const r = readReg(); const t = getTask(r, key);
   const rep = stdinJson();
-  (t.reports ||= []).push({ ...rep, at: now() });
+  // This one is run by the chip's own process, so it takes untrusted input.
+  if (rep === null || typeof rep !== 'object' || Array.isArray(rep))
+    die('the report must be an object: {"commit": "...", "verified": "...", "outcome": "passed|partial|failed", "notes": "..."}');
+  const outcome = rep.outcome === undefined ? 'passed' : rep.outcome;
+  if (!OUTCOMES.includes(outcome)) die('outcome must be one of: ' + OUTCOMES.join(', '));
+  for (const k of ['commit', 'verified', 'notes'])
+    if (rep[k] !== undefined && typeof rep[k] !== 'string') die(k + ' must be a string');
+  if (typeof rep.verified !== 'string' || !rep.verified.trim())
+    die('"verified" is required — say what you ran and what it said. A report with no proof is not a report.');
+  (t.reports ||= []).push({ commit: String(rep.commit || ''), verified: rep.verified,
+                            outcome, notes: String(rep.notes || ''), at: now() });
   t.status = 'reported';
+  let d = null;
+  if (outcome !== 'passed') d = recordDefect(r, { task: key, kind: 'bug',
+    what: key + ' reported itself as ' + outcome, evidence: rep.verified.slice(0, 500), blocking: outcome === 'failed' });
   writeReg(r);
-  console.log(key + ' recorded as finished by its own account. Not landed until it is checked again.');
+  console.log(key + ' recorded as ' + outcome + ' by its own account. Not landed until it is checked again.');
+  if (d) console.log('  recorded ' + d.id + ' — it said so itself, so it will not be lost.');
 }
 
 function worktreeFor(t) {
@@ -1756,7 +1876,15 @@ function cmdGuard(key, flags) {
     changed = execSync('git diff --name-only ' + base + '...' + t.branch, { cwd: wt, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })
       .split('\n').map((x) => x.trim()).filter(Boolean);
   } catch (e) { die('could not diff ' + base + '...' + t.branch + ' in ' + wt); }
-  if (!changed.length) { console.log('⚠ ' + key + ' changed nothing at all against ' + base + '. That is not finished work.'); process.exit(1); }
+  if (!changed.length) {
+    const d = recordDefect(r, { task: key, kind: 'guard',
+      what: key + ' reported finished but its branch changed nothing against ' + base,
+      evidence: 'git diff --name-only ' + base + '...' + t.branch + ' → empty', blocking: true });
+    writeReg(r);
+    console.log('⚠ ' + key + ' changed nothing at all against ' + base + '. That is not finished work.');
+    console.log('  recorded ' + d.id + '. Ask which branch it committed to — do not go looking yourself.');
+    process.exit(1);
+  }
   const allowed = t.owns || [];
   const bad = changed.filter((f) => !allowed.some((o) => collides(f, o)));
   console.log(key + ' changed ' + changed.length + ' file(s) on ' + t.branch + ':');
@@ -1765,6 +1893,11 @@ function cmdGuard(key, flags) {
     console.log('\n✗ ' + bad.length + ' file(s) outside what it was allowed to touch:');
     for (const f of bad) console.log('    ' + f);
     console.log('\n  Allowed: ' + allowed.join(', '));
+    const d = recordDefect(r, { task: key, kind: 'guard',
+      what: bad.length + ' file(s) changed outside what ' + key + ' owns',
+      evidence: bad.join('\n'), blocking: true });
+    writeReg(r);
+    console.log('  recorded ' + d.id + ' with the file list — it will not be forgotten when this scrolls away.');
     console.log('  Send it back. Do not fix it here — you would be writing code, and you would be');
     console.log('  writing it in the one place that has to stay able to judge it.');
     process.exit(1);
@@ -2038,7 +2171,10 @@ function harvest(dir, keys) {
 }
 
 function cmdIngest(flags) {
-  const r = readReg();
+  // Reads only — and it walks every transcript on disk, which can take far
+  // longer than the lock's staleness window. Holding the write lock here is how
+  // two processes end up believing they hold it.
+  const r = readRegRO();
   const dir = flags.from ? path.resolve(CWD, flags.from) : transcriptDir();
   if (!dir) die('cannot find the transcript directory for this project under ~/.claude/projects.\n' +
                 '       Pass it: ingest --from <dir>');
@@ -2082,9 +2218,15 @@ function cmdSay(key, flags) {
   const r = readReg(); const t = getTask(r, key);
   const kind = flags.kind || 'note';
   if (!OUT_KINDS.includes(kind)) die('kind must be one of: ' + OUT_KINDS.join(', '));
-  if (!flags.text) die('need --text "what you actually sent"');
+  if (typeof flags.text !== 'string' || !flags.text.trim()) die('need --text "what you actually sent"');
   append({ dir: 'out', key, kind, agent: t.agent || '', text: flags.text });
   console.log('logged: → ' + key + ' [' + kind + ']');
+  if (kind === 'sendback') {
+    const d = recordDefect(r, { task: key, kind: 'sendback', what: flags.text, evidence: '', blocking: true });
+    writeReg(r);
+    console.log('  recorded ' + d.id + ' — ' + key + ' stays on `outstanding` until you run: defect fixed ' + d.id);
+    console.log('  (sending work back is not answering it; both are now tracked separately)');
+  }
 }
 
 function cmdHeard(key, flags) {
@@ -2094,10 +2236,13 @@ function cmdHeard(key, flags) {
   if (!flags.text) die('need --text "what they actually said"');
   append({ dir: 'in', key, kind, agent: t.agent || '', text: flags.text });
   t.lastHeard = now();
+  let d = null;
+  if (kind === 'blocked') d = recordDefect(r, { task: key, kind: 'blocked', what: flags.text, evidence: '', blocking: true });
   writeReg(r);
   console.log('logged: ← ' + key + ' [' + kind + ']');
-  if (kind === 'question' || kind === 'blocked')
-    console.log('  It is now waiting on you. `outstanding` will keep saying so until you log a reply.');
+  if (d) console.log('  recorded ' + d.id + ' — it stays open until you run: defect fixed ' + d.id);
+  if (kind === 'question')
+    console.log('  It is now waiting on you. `outstanding` says so until you log a reply (only a reply clears it).');
 }
 
 
@@ -2132,9 +2277,13 @@ function cmdDigest() {
   for (const t of T) {
     const mine = log.filter((e) => e.key === t.key);
     const ask = [...mine].reverse().find((e) => e.dir === 'in' && ['question', 'blocked'].includes(e.kind));
-    if (ask && !mine.some((e) => e.dir === 'out' && e.at > ask.at)) waits.push(t.key + ' asked something and has had no answer');
+    if (ask && !mine.some((e) => e.dir === 'out' && ['reply', 'release'].includes(e.kind) && e.at > ask.at))
+      waits.push(t.key + ' asked something and has had no answer');
     if (t.status === 'reported') waits.push(t.key + ' says it is finished and needs your check');
   }
+  const defs = openDefects(r, null);
+  if (defs.length) for (const d of defs)
+    waits.push((d.task ? d.task + ' ' : '') + '— open ' + d.kind + ' (' + d.id + '): ' + d.what.slice(0, 70));
   if (waits.length) { L.push(''); L.push('**Waiting on you:**'); for (const w of waits) L.push('- ' + w); }
   const owed = owedList(r).filter((o) => o.status !== 'done');
   if (owed.length) {
@@ -2180,10 +2329,16 @@ function cmdOutstanding() {
     const mine = log.filter((e) => e.key === t.key);
     const lastAsk = [...mine].reverse().find((e) => e.dir === 'in' && ['question', 'blocked'].includes(e.kind));
     if (lastAsk) {
-      const replied = mine.some((e) => e.dir === 'out' && e.at > lastAsk.at);
+      // Only an actual reply answers a question. Sending the work back is a
+      // rejection, not an answer — counting it as one is how an agent ends up
+      // waiting for ever on a list that says nothing is waiting.
+      const replied = mine.some((e) => e.dir === 'out' && ['reply', 'release'].includes(e.kind) && e.at > lastAsk.at);
       if (!replied) rows.push({ key: t.key, why: 'asked you something and has had no answer',
         detail: lastAsk.text.slice(0, 90), since: lastAsk.at });
     }
+    for (const d of openDefects(r, t.key))
+      rows.push({ key: t.key, why: (d.blocking ? 'is blocked by ' : 'has an open ') + d.kind + ' (' + d.id + ') — `defect fixed ' + d.id + '` when it is dealt with',
+        detail: d.what.slice(0, 90), since: d.at });
     if (t.status === 'reported') rows.push({ key: t.key, why: 'says it is finished and is waiting on your check',
       detail: ((t.reports || []).slice(-1)[0] || {}).verified || '', since: ((t.reports || []).slice(-1)[0] || {}).at || '' });
     if (t.status === 'held' && (t.needs || []).every((n) => { const d = tasks(r).find((x) => x.key === n); return d && d.status === 'landed'; }))
@@ -2191,6 +2346,8 @@ function cmdOutstanding() {
     if (t.status === 'planned' && t.agent)
       rows.push({ key: t.key, why: 'checked in but was never told where it stands', detail: '', since: '' });
   }
+  for (const d of openDefects(r, null).filter((x) => !x.task))
+    rows.push({ key: '(no task)', why: 'open ' + d.kind + ' (' + d.id + ')', detail: d.what.slice(0, 90), since: d.at });
   if (!rows.length) return console.log('Nothing is waiting on you.');
   console.log('These are waiting on you. Deal with each one — none of them will ask twice.\n');
   for (const x of rows) {
@@ -2326,6 +2483,9 @@ driving the work out, after the grill:
   preflight check [--wave n]  exits 1 while the round about to open has unflown or unresolved tasks.
   doctor                    check everything a brief cites that can be checked: paths exist,
                             verify binaries resolve, no brief is stale. Exits 1 on a failure.
+  defect add|fixed|list     a failure that must not be forgotten: a sendback, a trespass, a red run,
+                            a blocker, a bug found between sessions. Recorded automatically where
+                            those happen; --all includes the fixed ones.
   owed add|assign|done|list work only possible in a window between two pieces — record it, assign
                             it, and close no round on top of it silently.
   brief <key> [--stdout]    write the chip's brief to a file; print what to send. --all rewrites every one.
@@ -2401,6 +2561,7 @@ switch (cmd) {
   }
   case 'doctor': cmdDoctor(); break;
   case 'owed': cmdOwed(rest.shift(), rest, flags); break;
+  case 'defect': cmdDefect(rest.shift(), rest, flags); break;
   case 'slot': cmdSlot(rest.shift(), rest, flags, raw); break;
   case 'frontier': cmdFrontier(); break;
   case 'ci': cmdCi(flags); break;

@@ -1,0 +1,139 @@
+# Durability: keeping the orchestration run across compactions and dead sessions
+
+A design note. Problem: the orchestrator gets context-compacted a lot and loses
+the thread of the run — the tasks, the errors and bugs reported between
+sessions, and the full brief that configures each chip. This note lays out what
+the codebase already does, how other projects solve the same problem, and where
+the real gaps are.
+
+## What is already in place
+
+`driver.mjs` already implements most of the conventional answer. Map of the
+current mechanism:
+
+| Concern | What `driver.mjs` does | Where |
+|---|---|---|
+| Context gets compacted | `hook-install` injects `digest` on `compact\|resume\|startup` via a Claude Code SessionStart hook | `cmdHookInstall` (2155), `cmdDigest` (2110) |
+| Full chip brief must not be lost | Every brief is written to a **file** (`briefs/<key>.md`), never held in context | `cmdBrief` → `fs.writeFileSync(briefPath(key))` |
+| Tasks / status / decisions | `register.json` is the single source of truth; 30 atomic backups kept on every write | `writeReg` (51) |
+| Messages between orchestrator and chips | Append-only `messages.jsonl` ledger; `ingest` rebuilds it from Claude's on-disk transcripts | `ledgerPath`/`cmdIngest` (1815, 2040) |
+| Session dies mid-run | `resume` re-announces to live chips and rewrites briefs with a new address | `cmdResume` (2206) |
+| Concurrent writers | Directory lock, 15s stale takeover, atomic rename (`tmp` → `REG_PATH`) | `acquireLock`/`writeReg` (37, 51) |
+
+So the design intent — durable artifacts (briefs are files), durable message
+log (`messages.jsonl`), state snapshot with backups (`register.json` +
+`backups/`), recovery after death (`resume`), compaction rehydration (`digest`
+hook) — is already the right skeleton. This note is about the one structural
+weakness in that skeleton and how to close it.
+
+## What other projects do
+
+Surveyed patterns, grouped by mechanism:
+
+### 1. State snapshots + backups (what we do now)
+- **LangGraph checkpointers**: current graph state snapshotted, keyed by
+  `thread_id`, restored on resume. Two storage abstractions — a `checkpoints`
+  table (one row per step) and a `writes` table (per-node deltas) — so even a
+  node that finished *inside* an un-committed step is already durable. Production
+  uses Postgres/SQLite; in-memory dies on restart.
+  https://docs.langchain.com/oss/python/langgraph/checkpointers
+- **Akka PersistentActor / actor-ts DurableStateActor**: persist only state
+  *changes* to an append-only journal; recover by replay. Optional **snapshots**
+  avoid replaying the whole life — load latest snapshot, then replay events after it.
+  https://getakka.net/articles/persistence/architecture.html
+
+### 2. Append-only event log + replay (the biggest gap here)
+- **Event sourcing (Fowler)**: the log is the *truth*; current state is a
+  **derived projection**. Replay re-derives everything. Corrections are
+  *appended* as new events, never rewriting history.
+- **"The Log Is the Truth" (agentpatterns.ai)**: for agents specifically —
+  agents **emit JSON intentions, never write files**; a deterministic
+  orchestrator validates and applies them. Replaying the log must reproduce the
+  filesystem — that is how correctness is *verified*. A **materialized view**
+  rebuilt from the log is fed to agents *instead of growing conversation
+  history* — directly attacking context degradation.
+  https://learn.agentpatterns.ai/observability/the-log-is-the-truth/
+- **Proven at scale**: LMAX (millions of ops/s, replay from snapshot), Akka
+  Persistence, Vercel Workflows (every step/input/output/error in a log that is
+  the SOT; replays to restore state).
+  https://vercel.com/i/event-sourcing
+
+### 3. Durable task + outbox / mailbox for orchestrator ↔ worker
+- **Google a2a protocol**: the primitive is a **stateful Task**
+  (submitted → working → input-required → completed/failed) with a distinct ID,
+  an **immutable terminal state** — follow-ups are *new* tasks under the same
+  `contextId` — and **durable Artifacts**: reports/files are the output, not chat
+  text. A client can re-attach to an in-flight task (`SubscribeToTask`), and
+  dedupes on a deterministic `messageId`.
+  https://agent2agent.info/docs/topics/life-of-a-task/
+- **Transactional Outbox**: write the state row *and* the integration event in
+  the same transaction so they cannot diverge (the dual-write trap).
+  https://microservices.io/patterns/data/transactional-outbox.html
+- **Akka AtLeastOnceDeliveryActor**: point-to-point at-least-once delivery that
+  survives sender *and* receiver crashes.
+
+### 4. Durable execution engines (the heavyweight version of what we do by hand)
+- Conductor's a2a integration does our exact job with a crash-safe `FORK_JOIN`
+  multi-agent orchestration where each in-flight agent call resumes from
+  persisted state. Temporal/Cadence/Conductor are the productized form of the
+  register+resume mechanism `driver.mjs` builds by hand.
+
+## The core gap and the fix
+
+**Gap:** `register.json` is one mutable row with backups as its only history. It
+is also usually gitignored (per the README), so the 30-backup ring is the entire
+safety net. If the register is corrupted or the ring is swept, the run's task
+state is gone. `messages.jsonl` is already append-only and durable; task-state
+mutations are not.
+
+**Fix (the proven, highest-leverage one):** split "current state" from "the
+record."
+
+- Make an **append-only event log** the source of truth. Every mutation appends
+  an event: `task-status-changed`, `decision-made`, `brief-written@sha`,
+  `gap-found`, `owed`, `landed` … one line per fact, never rewritten.
+- Make `register.json` a **derived projection** rebuilt by replaying the log.
+  After a compaction or a dead session, a fresh session reconstructs the true
+  register from disk regardless of what was in context.
+- Use the existing `backups/` ring (or an explicit snapshot file) as **snapshots**
+  to bound replay cost — load latest snapshot, replay only the tail (Akka's
+  exact shape). A no-op write need not create a snapshot (already the behavior).
+
+This converts durability from *reactive* (re-inject the digest; depends on the
+hook) into *structural* (the full true run is rebuildable from disk, no hook and
+no context needed).
+
+## Other small gaps worth closing
+
+- **Brief-change detection by the chip.** `board`/`staleBriefs` already tell the
+  orchestrator a brief is stale, but the chip has to be *told*. Put the brief's
+  write-sha into the chip's mandatory check-in so a changed brief is detected by
+  the chip itself, not hoped-for (a2a's resubscribe loop).
+- **At-least-once with dedupe.** `ingest` already dedupes on `uuid`. Extend the
+  same idempotency to an event log (a2a: deterministic `messageId`, effectively-
+  once delivery).
+- **Terminal tasks are immutable.** Your `owed`/hotfix model already treats a
+  defect as a new task, never a rewrite of history — keep that; it matches a2a
+  and event-sourcing.
+
+## Proven-at-scale ranking
+
+1. **Event sourcing + snapshot/replay-tail** (LMAX, Akka.Persistence, Vercel
+   Workflows, Netflix) — the most battle-tested answer to "state must survive a
+   crash and be reconstructable."
+2. **Durable execution engines** (Conductor / Temporal / Cadence) — the product
+   category for "workflow survives process death"; heavy, but they validate the
+   register+resume design.
+3. **a2a** — the standardized articulation of "durable artifacts + stateful
+   tasks + durable message threads"; validates the artifact-file and message-log
+   choices already in the codebase.
+4. **Transactional outbox** — the small correctness firewall for the state +
+   message dual-write.
+
+## Bottom line
+
+The mechanism is not missing — the compact-resilience design is sound and the
+a2a/event-sourcing literature independently confirms the artifact-file and
+message-log choices. The single most valuable upgrade is the split: append-only
+**event log** as truth, `register.json` as a replay-derived **projection**, and
+the existing backup ring as **snapshots** to cap replay cost.

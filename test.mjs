@@ -74,7 +74,7 @@ say('a run goes all the way through');
   ok('t3 waits, t1 and t2 can open', has(drv(d, ['frontier']).out, 't3'));
   ok('a brief is written to a file', drv(d, ['brief', 't1']).code === 0 &&
      fs.existsSync(path.join(d, '.claude/orchestration/briefs/t1.md')));
-  drv(d, ['chip', 't1', '--branch', 'step/t1']);
+  drv(d, ['chip', 't1', '--id', 'chip-t1', '--branch', 'step/t1']);
   drv(d, ['agent', 't1', '--name', 'peer-a']);
   const bad = drv(d, ['done', 't1'], { stdin: '{"commit":"abc"}' });
   ok('a report with no proof is refused', bad.code !== 0 && has(bad.out, 'verified'));
@@ -90,6 +90,7 @@ say('a run goes all the way through');
 say('a half-failure is not a pass');
 {
   const d = box('partial');
+  drv(d, ['chip', 't2', '--id', 'chip-t2']);   // a report can only come from a chip that exists
   drv(d, ['done', 't2'], { stdin: '{"verified":"two of three suites","outcome":"partial"}' });
   const r = reg(d);
   ok('a partial report opens a defect', (r.defects || []).some((x) => x.kind === 'bug' && x.task === 't2'));
@@ -157,6 +158,7 @@ say('ingest keeps the message and drops the wrapper');
 say('an owed item outliving its task is not lost quietly');
 {
   const d = box('owed');
+  drv(d, ['chip', 't1', '--id', 'chip-t1']);   // a report can only come from a chip that exists
   drv(d, ['owed', 'add', '--to', 't1', '--load-bearing', '--what', 'drop the shim', '--why', 'only while t1 is open']);
   drv(d, ['done', 't1'], { stdin: '{"verified":"ran true","outcome":"passed"}' });
   const landed = drv(d, ['landed', 't1', '--sha', 'abc']).out;
@@ -241,6 +243,7 @@ say('legacy CI results become readable history and prove nothing');
 say('archiving shrinks the register without breaking the record');
 {
   const d = box('archive');
+  drv(d, ['chip', 't1', '--id', 'chip-t1']);   // a report can only come from a chip that exists
   drv(d, ['done', 't1'], { stdin: '{"verified":"ran true","outcome":"passed","notes":"' + 'x'.repeat(3000) + '"}' });
   drv(d, ['landed', 't1', '--sha', 'abc']);
   // Captured AFTER the landing: t3's brief legitimately changes when the work it

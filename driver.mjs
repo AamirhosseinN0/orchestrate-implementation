@@ -3063,8 +3063,14 @@ function cmdDigest() {
   if (waits.length) {
     L.push('');
     L.push('**Waiting on you:**');
-    for (const w of waits.slice(0, 8))
-      L.push('- ' + w.key + ' ' + w.why + (w.detail ? ': ' + w.detail.slice(0, 70) : ''));
+    // The same clipping `outstanding` does, and for a stronger reason: this is
+    // what a SessionStart hook feeds a freshly compacted context, so one agent
+    // report printed raw — newlines, headings, code fences and all — buried
+    // every other line here at exactly the moment they were needed most.
+    for (const w of waits.slice(0, 8)) {
+      const d = String(w.detail || '').replace(/\s+/g, ' ').trim();
+      L.push('- ' + w.key + ' ' + w.why + (d ? ': ' + d.slice(0, 70) + (d.length > 70 ? '…' : '') : ''));
+    }
     if (waits.length > 8)
       L.push('- …and ' + (waits.length - 8) + ' more. Run `outstanding` — this list is cut, not complete.');
   }

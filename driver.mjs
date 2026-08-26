@@ -1784,6 +1784,70 @@ function cmdPreflightCheck(flags) {
 // ------------------------------------------------------------------- doctor
 // A brief is handed to somebody who will believe it. Everything a brief cites
 // that can be checked mechanically, is — before any chip exists.
+// The register is the working state; the record is the history. Detail from
+// finished work is neither, and on a long run it is most of the file — reports,
+// pre-flights, context notes and decision references on tasks that are landed
+// or cancelled. It moves out to a file beside the run.
+//
+// This is safe because of how the record works, and it was checked before it
+// was written: `commit` diffs the register and appends the resulting ops, and a
+// removed field becomes a delete op (diffOps, `{p, d: 1}`), so replaying the
+// record reproduces the SLIM register rather than fighting it — `verify` stays
+// clean. The values are not lost either: the events that originally set them
+// are untouched, so `rebuild --to <seq>` from before the archive brings
+// everything back. Two independent copies, the archive file and the record.
+//
+// Gaps stay. Answered ones are read by `refine brief` as what was already
+// settled with the author, so archiving them would change a brief that has not
+// been written yet.
+const ARCHIVE_FIELDS = ['reports', 'preflight', 'context', 'decisions'];
+function archiveDir() { return path.join(path.dirname(path.resolve(CWD, REG_PATH)), 'archive'); }
+
+function cmdArchive(flags) {
+  const r = readReg();
+  const closed = tasks(r).filter((t) => DEAD_STATUS.includes(t.status));
+  const rows = [];
+  for (const t of closed) {
+    const keep = {};
+    for (const f of ARCHIVE_FIELDS) {
+      const v = t[f];
+      if (v === undefined || (Array.isArray(v) && !v.length)) continue;
+      keep[f] = v;
+    }
+    if (Object.keys(keep).length) rows.push({ key: t.key, status: t.status, ...keep });
+  }
+  if (!rows.length) return console.log('nothing to archive — no closed task is still carrying its detail.');
+  const before = JSON.stringify(r).length;
+  const saved = JSON.stringify(rows).length;
+  if (flags['dry-run']) {
+    console.log(rows.length + ' closed task(s) are still carrying ' + Math.round(saved / 1024) + ' KB of finished detail');
+    console.log('(the register is ' + Math.round(before / 1024) + ' KB):\n');
+    for (const x of rows)
+      console.log('  ' + x.key.padEnd(12) + x.status.padEnd(11) + Object.keys(x).filter((k) => !['key', 'status'].includes(k)).join(', '));
+    console.log('\nNothing was written. Run `archive` without --dry-run to move it.');
+    return;
+  }
+  // The file lands before the register loses anything, so no crash can cost
+  // both copies at once — the same order `writeReg` keeps for its backups.
+  fs.mkdirSync(archiveDir(), { recursive: true });
+  let n = 0;
+  for (const f of fs.readdirSync(archiveDir())) {
+    const m = /^tasks-([0-9]+)\.json$/.exec(f);
+    if (m) n = Math.max(n, Number(m[1]));
+  }
+  const file = path.join(archiveDir(), 'tasks-' + String(n + 1).padStart(2, '0') + '.json');
+  fs.writeFileSync(file, JSON.stringify({ at: now(), register: rel(REG_PATH), tasks: rows }, null, 2) + '\n');
+  for (const t of closed) for (const f of ARCHIVE_FIELDS) delete t[f];
+  commit(r);
+  const after = JSON.stringify(r).length;
+  console.log('archived ' + rows.length + ' closed task(s) to ' + rel(file));
+  console.log('  register ' + Math.round(before / 1024) + ' KB → ' + Math.round(after / 1024) + ' KB (' +
+              Math.round((before - after) / before * 100) + '% smaller). The 30 backups turn over at the new size.');
+  console.log('\nNothing is lost. That file has it, and so does the record — `events --task <key>` shows');
+  console.log('which entries carry it, and `rebuild --to <seq>` from before now reproduces the register');
+  console.log('exactly as it was. `verify` still passes, because a removal is recorded like any other change.');
+}
+
 function cmdDoctor() {
   const r = readReg();
   const binCache = {};
@@ -3090,6 +3154,8 @@ driving the work out, after the grill:
   preflight check [--wave n]  exits 1 while the round about to open has unflown or unresolved tasks.
   doctor                    check everything a brief cites that can be checked: paths exist,
                             verify binaries resolve, no brief is stale. Exits 1 on a failure.
+  archive [--dry-run]       move finished detail off landed and cancelled tasks into archive/.
+                            The record still holds it, and verify stays clean.
   defect add|fixed|list     a failure that must not be forgotten: a sendback, a trespass, a red run,
                             a blocker, a bug found between sessions. Recorded automatically where
                             those happen; --all includes the fixed ones.
@@ -3179,6 +3245,7 @@ switch (cmd) {
     break;
   }
   case 'doctor': cmdDoctor(); break;
+  case 'archive': cmdArchive(flags); break;
   case 'owed': cmdOwed(rest.shift(), rest, flags); break;
   case 'defect': cmdDefect(rest.shift(), rest, flags); break;
   case 'slot': cmdSlot(rest.shift(), rest, flags, raw); break;

@@ -281,9 +281,15 @@ function commit(r, why) {
   const f = eventsPath();
   let before = {};
   try { before = JSON.parse(fs.readFileSync(path.resolve(CWD, REG_PATH), 'utf8')); } catch { /* first write */ }
-  const ops = diffOps(before, r);
-  if (!ops.length) return writeReg(r);          // no-op: burns no backup, records nothing
   const { events, problems, bytesGood } = readEvents();
+  // A register with content sitting on top of an empty log is a hole in the
+  // history, and appending only the delta to it is the worst of both worlds: the
+  // one line that results claims to be the whole record, so the next `rebuild`
+  // replays it over the register and everything the register still held is gone.
+  // Seed the whole state instead, exactly as `log reseed` does, and say why.
+  const lost = !events.length && before && typeof before === 'object' && Object.keys(before).length > 0;
+  const ops = lost ? [{ p: [], v: r }] : diffOps(before, r);
+  if (!ops.length) return writeReg(r);          // no-op: burns no backup, records nothing
   const fatal = problems.find((x) => x.fatal);
   if (fatal) die('the record at ' + rel(f) + ' is damaged at line ' + fatal.line + '.\n' +
     '       Refusing to append to a log with a hole in it — a partial record is worse than none.\n' +
@@ -296,7 +302,16 @@ function commit(r, why) {
   const seq = (events.length ? Math.max(...events.map((e) => e.seq || 0)) : 0) + 1;
   fs.mkdirSync(path.dirname(f), { recursive: true });
   sealLastLine(f);
-  fs.appendFileSync(f, JSON.stringify({ seq, at: now(), cmd: why || CMDLINE, ops }) + '\n');
+  const rec = { seq, at: now(), cmd: why || CMDLINE, ops };
+  if (lost) {
+    rec.reseed = true;
+    rec.why = 'the record at ' + rel(f) + ' was missing or empty while the register still held ' +
+      Object.keys(before).length + ' top-level field(s); seeded from the register as it stood, ' +
+      'so everything before this point is lost history.';
+    console.error('· the record at ' + rel(f) + ' was missing or empty, and the register was not.');
+    console.error('  Seeded a fresh record from the register as it stands, marked as a hole in the history.');
+  }
+  fs.appendFileSync(f, JSON.stringify(rec) + '\n');
   return writeReg(r);
 }
 

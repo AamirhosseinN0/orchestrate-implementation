@@ -570,6 +570,9 @@ function cmdScan() {
       added++;
     }
   }
+  // So `check` can tell "everything was judged" from "nothing was ever looked
+  // at". An empty gap list means both, and only this says which.
+  reg.scannedAt = now();
   commit(reg);
   const byPlan = {};
   for (const g of reg.gaps.filter((x) => x.status === 'candidate')) (byPlan[g.plan] ||= []).push(g);
@@ -816,17 +819,40 @@ function cmdStatus() {
   } else console.log('\nnothing in scope is unanswered.');
 }
 
+// The gate before the record gets written. It used to read status strings and
+// nothing else, which made it a formality: an empty gap list satisfied every
+// condition, and `set <id> status=answered` walked straight past it without an
+// answer ever being recorded — after which `render` died with a raw TypeError
+// on the very register `check` had just blessed. It now asks whether the work
+// was actually done, not whether a word says so.
 function cmdCheck() {
   const reg = readReg();
   const cand = reg.gaps.filter((g) => g.status === 'candidate');
   const unset = reg.gaps.filter((g) => g.scope === 'unset' && !['dropped', 'candidate'].includes(g.status));
   const open = reg.gaps.filter((g) => g.scope === 'in' && !['answered', 'dropped'].includes(g.status));
+  // "answered" with nothing recorded under it is the state `render` cannot
+  // read. A status is a claim; the answer is the evidence for it.
+  const hollow = reg.gaps.filter((g) => g.status === 'answered' &&
+    !(g.answer && typeof g.answer.choice === 'string' && g.answer.choice.trim()));
   let fail = false;
+  if (!reg.plans.length) { console.error('✗ no plans loaded — nothing has been read, so nothing can be finished. Run `load`.'); fail = true; }
+  else if (!reg.scannedAt) {
+    console.error('✗ no scan has been run against these plans, so there is nothing to have judged.');
+    console.error('  Read every plan in full, then run `scan` (and `silence`).');
+    fail = true;
+  }
   if (cand.length) { console.error('✗ ' + cand.length + ' candidate(s) never judged — keep or drop each one'); fail = true; }
   if (unset.length) { console.error('✗ ' + unset.length + ' gap(s) with no scope — in or out?'); fail = true; }
   if (open.length) { console.error('✗ ' + open.length + ' in-scope gap(s) unanswered:'); for (const g of open) console.error('    ' + g.id + '  ' + (g.title || g.quote.slice(0, 60))); fail = true; }
+  if (hollow.length) {
+    console.error('✗ ' + hollow.length + ' gap(s) marked answered with no answer recorded — a status is not a decision:');
+    for (const g of hollow) console.error('    ' + g.id + '  ' + (g.title || g.quote.slice(0, 60)) + '   — run `answer ' + g.id + '`');
+    fail = true;
+  }
   if (fail) { console.error('\nnot finished. Do not report this session as done.'); process.exit(1); }
-  console.log('✓ every candidate judged, every in-scope gap answered. Safe to write the record.');
+  const answered = reg.gaps.filter((g) => g.status === 'answered').length;
+  console.log('✓ every candidate judged, every in-scope gap answered, ' + answered +
+              ' answer(s) on record. Safe to write the record.');
 }
 
 // ------------------------------------------------------------------- render
@@ -835,6 +861,12 @@ function cmdRender(flags) {
   const reg = readReg();
   const done = reg.gaps.filter((g) => g.status === 'answered');
   if (!done.length) die('nothing answered yet');
+  // Belt as well as braces: `check` refuses these now, but `render` can be run
+  // without it, and a raw TypeError deep in the writer says nothing useful.
+  const hollow = done.filter((g) => !(g.answer && typeof g.answer.choice === 'string' && g.answer.choice.trim()));
+  if (hollow.length)
+    die(hollow.length + ' gap(s) are marked answered with no answer recorded: ' +
+        hollow.map((g) => g.id).join(', ') + '\n       Record each with `answer <id>`, or set it back to gap.');
   if (flags.plan) {
     const gs = done.filter((g) => g.plan.includes(flags.plan));
     if (!gs.length) { console.log('(nothing was decided for ' + flags.plan + ' — leave that plan alone)'); return; }

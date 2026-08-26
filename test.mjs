@@ -1122,11 +1122,14 @@ say('whoami --session reads a name from the local session registry');
   const old = process.env.HOME;
   process.env.HOME = path.join(d, 'home');
   const res = drv(d, ['whoami', '--session', 'abc']);
-  process.env.HOME = old;
-  ok('whoami --session names the session', res.code === 0 && has(res.out, 'the-boss'));
-  process.env.HOME = old;
+  // HOME stays pointed at the sandbox for BOTH calls. Restoring it in between
+  // sent the second one at the developer's own ~/.claude/sessions, where the id
+  // is merely absent — so this passed on a machine that had that directory and
+  // took a different error path on one that did not. CI is the machine that
+  // does not.
   const missing = drv(d, ['whoami', '--session', 'nope']);
   process.env.HOME = old;
+  ok('whoami --session names the session', res.code === 0 && has(res.out, 'the-boss'));
   ok('an unknown session id is a clean error', missing.code !== 0 && has(missing.out, 'no live session'));
 }
 

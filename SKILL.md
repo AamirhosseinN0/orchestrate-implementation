@@ -75,6 +75,7 @@ so the state is rebuildable from disk alone:
 ```bash
 node $DRV verify     # replay the record, prove it still equals the register
 node $DRV rebuild    # total recovery: rewrite the register from the record
+node $DRV rebuild --to 460      # wind both back to that point in the record
 node $DRV events --task 2.1     # what happened to this task, and what did it
 ```
 
@@ -83,10 +84,24 @@ and nothing can tell them apart for you: `rebuild` if the register was edited or
 damaged, `log reseed --why "..."` if the record lost its tail. Run `verify` when
 you come back to a run; the digest reports drift too.
 
+`rebuild --to <seq>` cuts the record to that point as well, so the two stay in
+step and `verify` is green straight after. What it cut is kept whole beside it as
+`events.jsonl.before-rewind-<stamp>` — the events past that point exist only
+there, so do not sweep that file until you are sure you meant the rewind.
+
 The record refuses to be silently wrong. A crash mid-write leaves a torn last
 line, which is dropped and reported, and trimmed before the next append. A bad
 line *anywhere else* is corruption and `rebuild` refuses rather than replaying a
-log with a hole in it.
+log with a hole in it. A missing `events.jsonl` is not treated as an empty one
+either: `rebuild` will not empty a full register on the strength of a record
+that is not there.
+
+`events --task <key>` is worth trusting now. Every event records the subcommand
+that made it — `chip 0.12.C`, `preflight done 0.12.C`, `owed assign o23` — so
+the filter finds the ones that touched a task, and each line says which command
+did it. It did not before: most events carried no command at all, and this line
+promised something the record could not answer. `--grep`, `--since` and `--n`
+narrow it the same way.
 
 The backups are a second net — thirty states, a no-op write burning no slot.
 They are the *only* net if the register is not in the project's history, and
@@ -933,8 +948,15 @@ once.
 
 ```bash
 node $DRV wave                                   # the dependency layer in flight
-node $DRV ci --status green --ref gh-run-4471    # or red, or skipped --why "..."
+node $DRV ci --status green --ref gh-run-4471
+node $DRV ci --status red --why "two migration heads on the joined tree"
+node $DRV ci --status skipped --why "the runner is down until Monday"
+node $DRV ci list                                # every checkpoint, oldest first
 ```
+
+`red` and `skipped` both need `--why` and hard-fail without it. What broke is
+the whole point of recording a red, and a missing run is a decision rather than
+an omission.
 
 `ci` records against a fully-landed layer (it refuses to certify one still in
 flight), a landing invalidates any CI result that predates it, and `red` means
@@ -991,7 +1013,11 @@ answer coming, and the agent is still waiting.
   exiting, so a crashed suite still releases it. The failure mode left is a
   human or an agent "helpfully" emptying a live claim — which starts the second
   suite mid-first-suite and causes the crash everyone was queueing to avoid.
-  `slot free` refusing without `--force` is load-bearing.
+  `slot free` refusing without `--force` is load-bearing, and it is that narrow
+  case it is load-bearing for: a `slot run` claim with a command inside it. A
+  claim taken by hand is freed plainly, because there is no run under it to
+  crash — reaching for `--force` out of habit is how you learn to reach for it
+  when it matters.
 - **An agent waiting on the slot looks exactly like an agent working.** The
   wrapper says so on stderr and `slot status` names the holder and the wait —
   check it before diagnosing a "stuck" chip.
@@ -1105,9 +1131,23 @@ answer coming, and the agent is still waiting.
 - **`chip` says "would interfere with work that is open right now"**: working as
   intended — `frontier` says when it opens. Do not shrink the task's owns to
   dodge the refusal; the overlap is real.
-- **`slot run` says "still held after 90 min"**: the holder is wedged but its
-  process is alive, so it cannot be auto-stolen. `slot status` names it; talk to
-  that agent, and only then `slot free ci --force`.
+- **`slot run` says "still held after 90 min"**: the holder's process is alive,
+  so the slot is never taken from it — that is deliberate, not a bug, and it is
+  what stops a second suite starting beside a slow one. `slot status` names the
+  holder; talk to that agent, and only once you know its run is gone,
+  `slot free ci --force`.
+- **`chip` says "--id <task_id>"**: it is the first chip for that task and the
+  id is required. Every interference check runs on that call, so passing it is
+  what arms them — `chip <key>` alone is not a smaller version of the same
+  command, it is nothing happening.
+- **`task add` says "claims <path>, which is already owned"**: nothing was
+  saved, including the other items in the batch. Two live tasks may not own one
+  path. Narrow one, or make one wait and split the file — do not widen the other.
+- **`done` says "it has never been handed out"**: the task has no chip, so there
+  is no work behind the report. Create the chip first, with `--id`.
+- **`error: unknown flag --xyz`**: a misspelled flag is refused now rather than
+  ignored, which is what let a whole command run on quietly without it. If the
+  value itself starts with `--`, write it as `--text="--like this"`.
 - **`ci --status green` says "has not all landed yet"**: the run you are pointing
   at predates a merge still to come, so it does not cover the round. Land the
   rest, then run CI again.
@@ -1118,7 +1158,9 @@ answer coming, and the agent is still waiting.
   worktree was never recorded. `chip <key> --worktree <path>` fixes it.
 - **`refine done` says "no report at … and nothing on stdin"**: the agent has not
   written its file yet, or wrote it elsewhere. Ask it to write it to the path in
-  its brief. Do not paste the JSON in from the chat.
+  its brief. Do not paste the JSON in from the chat — it will take it, and print
+  `⚠ took the report from stdin`. That warning is the report having come through
+  the one thing that gets compacted.
 - **`board` warns "the record changed after these briefs were written"**: run
   `brief --all`, then message each named agent to re-read its brief.
 - **`refine check` says "no tasks proposed"**: the refining agents returned

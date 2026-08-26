@@ -1429,8 +1429,15 @@ function ensureSlotWrapper() {
 // behind each other for no reason.
 const HEAVY = /\b(pytest|jest|vitest|mocha|test|e2e|playwright|cypress|migrate|alembic|docker|compose|build|bundle|webpack|vite build|tsc --build|gradle|mvn|cargo (test|build)|make)\b/i;
 const LIGHT = /\b(ruff|eslint|prettier|black|isort|flake8|mypy|pyright|tsc --noEmit|typecheck|fmt|lint|shellcheck|actionlint)\b/i;
+// Installing dependencies is as heavy as anything here — it saturates the network,
+// rewrites a shared store and can churn gigabytes of disk — and none of the words
+// above appear in it, so `pnpm install` used to read as LIGHT and every agent was
+// told to run one bare and in parallel. That is precisely the stampede the slot
+// exists to stop, so installs are named outright and they outrank LIGHT.
+const INSTALL = /\b(?:pnpm|npm|yarn|bun)\s+(?:ci|install|add|i)\b|\bpip3?\s+install\b|\bpoetry\s+(?:install|lock|sync)\b|\buv\s+(?:sync|lock|pip\s+install)\b|\bbundle\s+install\b|\bcargo\s+(?:fetch|vendor)\b|\bgo\s+mod\s+download\b|\bcomposer\s+install\b/i;
 function needsSlot(cmd) {
   const c = String(cmd);
+  if (INSTALL.test(c)) return true;
   if (LIGHT.test(c) && !HEAVY.test(c)) return false;
   return HEAVY.test(c) || /\bpnpm (run )?(test|build)\b|\bnpm (run )?(test|build)\b/.test(c);
 }
@@ -1438,13 +1445,40 @@ function needsSlot(cmd) {
 // plainly takes paths, narrow it to what this task actually owns — the same idea
 // as a path filter on a CI job.
 const PATHABLE = /\b(ruff|eslint|prettier|black|isort|flake8|mypy|shellcheck)\b/;
+// ...but only the files that tool can actually read. A task's `owns` list is
+// whatever it touches — README.md, .env.example, package.json, a lockfile, a .sh —
+// and handing those to ruff makes it parse them as Python and fail on line 1.
+const TOOL_EXTS = [
+  [/\b(?:ruff|black|isort|flake8|mypy)\b/, /\.pyi?$/],
+  [/\beslint\b/,     /\.[cm]?[jt]sx?$/],
+  [/\bshellcheck\b/, /\.(?:sh|bash|ksh|zsh)$/],
+  [/\bprettier\b/,   /\.(?:[cm]?[jt]sx?|json|ya?ml|md|css|s[ac]ss|html)$/],
+];
+// And the tool's cwd is not always the repo root. `uv --directory apps/api run ruff
+// check .` puts ruff in apps/api, while `owns` is repo-relative — so the paths have
+// to be re-based onto that directory, and anything outside it dropped, or the tool
+// is handed names that do not exist and reports a clean run over nothing.
+const CWD_PREFIX = [/--directory[= ]([^\s]+)/, /--prefix[= ]([^\s]+)/, /\bcd\s+([^\s;&|]+)\s*&&/, /\s-C\s+([^\s]+)/];
+const shPathArg = (p) => /^[\w@./+-]+$/.test(p) ? p : "'" + p.replace(/'/g, "'\\''") + "'";
 function scopeToOwned(cmd, owns) {
   const c = String(cmd).trim();
   if (!PATHABLE.test(c)) return c;                     // not a tool that takes paths
   if (!/\s\.\s*$/.test(c)) return c;                    // only rewrite an explicit whole-tree "."
-  const paths = (owns || []).filter((o) => o && !o.includes('*'));
+  let paths = (owns || []).filter((o) => o && !o.includes('*'));
+  const ext = (TOOL_EXTS.find(([tool]) => tool.test(c)) || [])[1];
+  if (ext) paths = paths.filter((p) => ext.test(p));
+  for (const re of CWD_PREFIX) {
+    const m = re.exec(c);
+    if (!m) continue;
+    const base = m[1].replace(/^\.\//, '').replace(/\/+$/, '') + '/';
+    if (base === '/' || base === './') break;
+    paths = paths.filter((p) => p.startsWith(base)).map((p) => p.slice(base.length));
+    break;
+  }
+  // Nothing of ours that this tool can read: leave the whole-tree check alone
+  // rather than narrow it down to an empty argument list that passes vacuously.
   if (!paths.length) return c;
-  return c.replace(/\s\.\s*$/, ' ' + paths.join(' '));
+  return c.replace(/\s\.\s*$/, ' ' + paths.map(shPathArg).join(' '));
 }
 
 function depOf(r, key) { return tasks(r).find((x) => x.key === key) || null; }

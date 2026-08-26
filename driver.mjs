@@ -1191,6 +1191,106 @@ function openTasks(r, except) {
   return tasks(r).filter((x) => x.key !== except && x.chip && !['landed', 'cancelled'].includes(x.status));
 }
 
+
+// ------------------------------------------------------------------ bundling
+// One chip per step is the wrong grain. A chip pays a large fixed cost before it
+// writes a line — its brief, and the whole plan behind it — and six sibling
+// steps from one plan each pay it for the same plan. Measured on a real run:
+// 33k tokens of reading per chip, of which a full megabyte across the run was
+// siblings re-reading text a sibling had already read.
+//
+// Steps that share a plan and do not interfere with anything else can be one
+// chip that works through them in order. A dependency BETWEEN them is not an
+// obstacle — inside a single agent it is just the order to do them in, and it
+// removes a merge, a CI run and a handover.
+function bundleCandidates(r) {
+  const byPlan = {};
+  for (const t of tasks(r)) {
+    if (t.status !== 'planned' || t.chip) continue;
+    (byPlan[t.plan || '(none)'] ||= []).push(t);
+  }
+  const groups = [];
+  for (const [plan, list] of Object.entries(byPlan)) {
+    if (list.length < 2) continue;
+    const keys = new Set(list.map((t) => t.key));
+    // a group must be closed: nothing outside it may sit in the middle of its
+    // dependency chain, or bundling would jump a queue that exists for a reason
+    const closed = list.filter((t) => (t.needs || []).every((n) => {
+      const d = depOf(r, n);
+      return !d || d.status === 'landed' || keys.has(n);
+    }));
+    if (closed.length < 2) continue;
+    // and it must not collide with work that is open right now
+    const open = openTasks(r, null);
+    const safe = closed.filter((t) => !open.some((o) => interference(t, o)));
+    if (safe.length < 2) continue;
+    // nor may two members claim the same serialisation point as each other and
+    // still be split — that is another reason they belong together
+    groups.push({ plan, members: safe });
+  }
+  return groups;
+}
+
+function cmdBundle(sub, rest, flags) {
+  const r = readReg();
+  // `bundle a b c --into a` — the first key is not a subcommand
+  if (sub && !['suggest', 'do'].includes(sub)) { rest = [sub, ...rest]; sub = 'do'; }
+  if (!sub || sub === 'suggest') {
+    const groups = bundleCandidates(r);
+    if (!groups.length) return console.log('nothing worth bundling — no plan has two or more unstarted, non-interfering steps.');
+    let saved = 0;
+    console.log('Steps that could be one chip instead of several. Each group shares a plan, so');
+    console.log('one agent reads it once instead of every member reading it again.\n');
+    for (const g of groups) {
+      const keys = g.members.map((t) => t.key);
+      const owns = new Set(g.members.flatMap((t) => t.owns || []));
+      let planBytes = 0;
+      try { planBytes = fs.statSync(path.resolve(CWD, g.plan)).size; } catch { /* gone */ }
+      saved += planBytes * (g.members.length - 1);
+      console.log('  ' + g.plan.replace(/^docs\/plans\//, ''));
+      console.log('    ' + keys.join(' ') + '   → one chip, ' + owns.size + ' file(s)');
+      console.log('    saves ' + (g.members.length - 1) + ' re-read(s) of a ' + Math.round(planBytes / 1024) + ' KB plan, ' +
+                  (g.members.length - 1) + ' fewer merge(s) and CI run(s)');
+      console.log('    bundle ' + keys.join(' ') + ' --into ' + keys[0]);
+      console.log('');
+    }
+    console.log('Bundling all of the above: ' + (groups.reduce((n, g) => n + g.members.length - 1, 0)) +
+                ' fewer chips, roughly ' + Math.round(saved / 4 / 1000) + 'k tokens of re-reading saved.');
+    console.log('\nBundle what genuinely belongs together. Two steps that share a plan but nothing');
+    console.log('else are still two jobs — the saving is not worth handing one agent an incoherent brief.');
+    return;
+  }
+  if (!flags.into) die('bundle suggest | bundle <key> <key>... --into <key>');
+  const keys = rest.filter(Boolean);
+  if (keys.length < 2) die('name at least two tasks to bundle');
+  const into = flags.into;
+  if (!keys.includes(into)) die('--into must name one of the tasks being bundled');
+  const members = keys.map((k) => getTask(r, k));
+  for (const m of members) {
+    if (m.status !== 'planned') die(m.key + ' is ' + m.status + ' — only unstarted work can be bundled');
+    if (m.chip) die(m.key + ' already has a chip');
+  }
+  const host = getTask(r, into);
+  const others = members.filter((m) => m.key !== into);
+  const uniq = (xs) => [...new Set(xs)];
+  host.owns = uniq(members.flatMap((m) => m.owns || []));
+  host.serialises = uniq(members.flatMap((m) => m.serialises || []));
+  host.verify = uniq(members.flatMap((m) => m.verify || []));
+  host.decisions = uniq(members.flatMap((m) => m.decisions || []));
+  host.context = uniq(members.flatMap((m) => (m.context || []).map((c) => JSON.stringify(c)))).map((x) => JSON.parse(x));
+  host.needs = uniq(members.flatMap((m) => m.needs || []).filter((n) => !keys.includes(n)));
+  host.bundled = uniq([...(host.bundled || []), ...members.map((m) => ({ key: m.key, title: m.title }))
+    .filter((x) => x.key !== into).map((x) => JSON.stringify(x))]).map((x) => JSON.parse(x));
+  host.title = host.title + ' (+ ' + others.map((m) => m.key).join(', ') + ')';
+  // the absorbed tasks are cancelled, not deleted — the record keeps them
+  for (const m of others) { m.status = 'cancelled'; m.bundledInto = into; }
+  commit(r);
+  console.log('bundled ' + keys.join(' + ') + ' into ' + into);
+  console.log('  owns ' + host.owns.length + ' file(s), ' + host.verify.length + ' check(s), waits for ' + (host.needs.join(', ') || 'nothing'));
+  console.log('  ' + others.length + ' task(s) marked cancelled and recorded as absorbed — nothing was deleted.');
+  console.log('\nRe-run `graph` and `preflight brief ' + into + '` — the brief now covers all of it.');
+}
+
 function cmdFrontier() {
   const r = readReg();
   const open = openTasks(r, null);
@@ -1270,6 +1370,32 @@ function ensureSlotWrapper() {
   return f;
 }
 
+
+// A check only needs the shared machine if running two of it at once would
+// actually hurt. A linter reading files does not; a suite that takes a database,
+// a build that eats the disk, or anything that binds a port does. Measured on a
+// real run: 131 queued checks, 38 of them the same whole-repo lint, all waiting
+// behind each other for no reason.
+const HEAVY = /\b(pytest|jest|vitest|mocha|test|e2e|playwright|cypress|migrate|alembic|docker|compose|build|bundle|webpack|vite build|tsc --build|gradle|mvn|cargo (test|build)|make)\b/i;
+const LIGHT = /\b(ruff|eslint|prettier|black|isort|flake8|mypy|pyright|tsc --noEmit|typecheck|fmt|lint|shellcheck|actionlint)\b/i;
+function needsSlot(cmd) {
+  const c = String(cmd);
+  if (LIGHT.test(c) && !HEAVY.test(c)) return false;
+  return HEAVY.test(c) || /\bpnpm (run )?(test|build)\b|\bnpm (run )?(test|build)\b/.test(c);
+}
+// A whole-repo check run once per task is the same work N times. Where a command
+// plainly takes paths, narrow it to what this task actually owns — the same idea
+// as a path filter on a CI job.
+const PATHABLE = /\b(ruff|eslint|prettier|black|isort|flake8|mypy|shellcheck)\b/;
+function scopeToOwned(cmd, owns) {
+  const c = String(cmd).trim();
+  if (!PATHABLE.test(c)) return c;                     // not a tool that takes paths
+  if (!/\s\.\s*$/.test(c)) return c;                    // only rewrite an explicit whole-tree "."
+  const paths = (owns || []).filter((o) => o && !o.includes('*'));
+  if (!paths.length) return c;
+  return c.replace(/\s\.\s*$/, ' ' + paths.join(' '));
+}
+
 function depOf(r, key) { return tasks(r).find((x) => x.key === key) || null; }
 function heldNeeds(r, t) {
   return (t.needs || []).filter((n) => { const d = depOf(r, n); return !d || d.status !== 'landed'; });
@@ -1315,6 +1441,15 @@ function cmdBrief(key, flags) {
   }
   B.push('# ' + t.key + ' — ' + t.title);
   B.push('');
+  if ((t.bundled || []).length) {
+    B.push('**This is several steps of one plan, given to you together** so the plan is read once');
+    B.push('rather than once per step. Do them in this order, and say which you finished if you');
+    B.push('cannot finish them all:');
+    B.push('');
+    B.push('- ' + t.key + ' — ' + String(t.title).replace(/ \(\+ [^)]*\)$/, ''));
+    for (const b of t.bundled) B.push('- ' + b.key + ' — ' + b.title);
+    B.push('');
+  }
   if (t.plan) {
     B.push('**The plan.** Read it in full before writing anything:');
     B.push('');
@@ -1376,16 +1511,29 @@ function cmdBrief(key, flags) {
   const wrapper = ensureSlotWrapper();
   B.push('**Before you say you are done, all of these must pass, and you must paste the output.**');
   B.push('');
-  B.push('The machine is shared: several copies running the full suite at once crashes it. So every');
-  B.push('check runs through the slot wrapper below — it waits its turn (checking every ~10 seconds),');
-  B.push('runs your command, and frees the slot by itself even if the run fails or you crash. Never');
-  B.push('run a heavy check bare, and never empty the slot by hand — another agent\'s run may be');
-  B.push('inside it, and freeing under it causes the exact crash the slot exists to stop. If the');
+  B.push('The machine is shared, but not every check needs it. A linter reading files can run');
+  B.push('alongside anything; a suite that takes a database or a build that eats the disk cannot.');
+  B.push('So the cheap ones run straight away and the heavy ones go through the slot wrapper, which');
+  B.push('waits its turn (checking every ~10 seconds), runs your command, and frees the slot by');
+  B.push('itself even if the run fails or you crash.');
+  B.push('');
+  B.push('Never run a heavy check bare, and never empty the slot by hand — another agent\'s run may');
+  B.push('be inside it, and freeing under it causes the exact crash the slot exists to stop. If the');
   B.push('wait ever times out, say so and ask — do not run without the slot.');
   B.push('');
+  const vlist = t.verify || [];
+  const heavy = vlist.filter(needsSlot), light = vlist.filter((v) => !needsSlot(v));
   B.push('```bash');
-  if ((t.verify || []).length) for (const v of t.verify) B.push('"' + wrapper + '" ' + v);
-  else B.push('# ⚠ nothing recorded. Ask what counts as proof before you start.');
+  if (!vlist.length) B.push('# ⚠ nothing recorded. Ask what counts as proof before you start.');
+  if (light.length) {
+    B.push('# these are cheap and read-only — run them straight away, no queueing');
+    for (const v of light) B.push(scopeToOwned(v, t.owns));
+  }
+  if (heavy.length) {
+    if (light.length) B.push('');
+    B.push('# these take the machine, so they go through the slot, one at a time');
+    for (const v of heavy) B.push('"' + wrapper + '" ' + v);
+  }
   B.push('```');
   B.push('');
   B.push('**Then commit your work on your branch.** One clear message, no attribution trailers.');
@@ -1641,7 +1789,9 @@ function cmdDoctor() {
     console.log('✗ ' + t.key);
     for (const x of probs) console.log('    ' + x);
   }
-  if (!bad) console.log('✓ ' + checked + ' task(s): every cited path exists, every verify binary resolves, no brief is stale.');
+  // A tick over nothing checked is how a green report starts meaning nothing.
+  if (!bad && !checked) console.log('· nothing to check — every task is landed, cancelled, or not yet handed out.\n  Run this again when work is about to go out; it proves nothing right now.');
+  else if (!bad) console.log('✓ ' + checked + ' task(s): every cited path exists, every verify binary resolves, no brief is stale.');
   console.log('\nWhat this cannot see: a verify target that is unreachable (a database down, a service');
   console.log('not started), and any number quoted in a note. Run each verify once by hand before a');
   console.log('brief asserts it, and never put a number in a brief that the run itself can change —');
@@ -2756,6 +2906,9 @@ driving the work out, after the grill:
   resume --name <peer>      take over a run after the session running it ended.
   landed <key>              record the merge, and name who that frees.
   board                     every task, its state, and what it waits for.
+  bundle suggest            steps that should be one chip rather than several — a chip pays for its
+                            plan once, so siblings sharing one plan pay for it again and again.
+  bundle <k>... --into <k>  merge them; the absorbed ones are cancelled, never deleted.
   frontier                  every chip that can open right now without touching anything in
                             flight, and exactly why the rest cannot.
   slot run <n> -- <cmd>     wait for the shared machine slot (~10s polls), run the command,
@@ -2816,6 +2969,7 @@ switch (cmd) {
   case 'defect': cmdDefect(rest.shift(), rest, flags); break;
   case 'slot': cmdSlot(rest.shift(), rest, flags, raw); break;
   case 'frontier': cmdFrontier(); break;
+  case 'bundle': cmdBundle(rest.shift(), rest, flags); break;
   case 'ci': cmdCi(flags); break;
   case 'say': cmdSay(rest[0], flags); break;
   case 'heard': cmdHeard(rest[0], flags); break;

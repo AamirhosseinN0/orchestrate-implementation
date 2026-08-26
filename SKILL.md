@@ -520,8 +520,29 @@ opens the instant its actual dependencies land, and a task in the "current"
 round waits if its files are in flight.
 
 ```bash
+node $DRV bundle suggest     # first: is this too many chips?
 node $DRV frontier
 ```
+
+**One chip per step is usually the wrong grain.** A chip pays a large fixed cost
+before it writes a line — its own brief, and the whole plan behind it. Six
+sibling steps from one plan each pay it for the same plan. Measured on a real
+54-task run: ~33k tokens of reading per chip, and a full megabyte across the run
+was siblings re-reading text a sibling had already read.
+
+`bundle suggest` finds steps that should travel together — same plan, no
+interference with open work, and closed under their own dependencies. A
+dependency *between* two of them is not an obstacle: inside one agent it is
+simply the order to do them in, and it removes a merge, a CI run and a handover.
+
+```bash
+node $DRV bundle 0.12.C 0.12.D 0.12.G --into 0.12.C
+```
+
+The absorbed tasks are marked cancelled and recorded as absorbed — never
+deleted — and the combined brief opens by listing every step it now covers, in
+order. Bundle what genuinely belongs together; two steps sharing only a plan are
+still two jobs, and an incoherent brief costs more than the reading it saves.
 
 prints exactly that: what can open right now (most-unblocking first), what is
 buildable but held back and by whom, on which file or point, and what is still
@@ -638,7 +659,15 @@ eye, which is where attention goes at task forty of fifty:
 It exits 1 on a trespass, and also on a branch that changed nothing at all —
 which is not finished work either.
 
-**The machine is a serialisation point too.** With six or seven chips open, six
+**Not every check needs the machine.** A linter reading files can run beside
+anything; a suite that takes a database or a build that eats the disk cannot. The
+brief now splits its checks in two — the cheap ones run immediately, only the
+heavy ones queue — and narrows a whole-tree check to the paths the task actually
+owns, which is the same idea as a path filter on a CI job. On the run that
+prompted this, 38 of 131 queued checks were the same whole-repo lint, waiting
+behind database suites for no reason.
+
+**The machine is still a serialisation point for the heavy half.** With six or seven chips open, six
 or seven full suites can start at once — and that is a memory panic, not a
 speed-up. So the run's heavy checks share one slot: a claim taken atomically
 (two agents seeing "free" at the same instant cannot both win), freed by the

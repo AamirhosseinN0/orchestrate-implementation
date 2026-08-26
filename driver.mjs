@@ -2809,9 +2809,18 @@ function cmdIngest(flags) {
     console.error('  (Claude Code keeps them ~30 days by default). Nothing can be recovered from here.');
     process.exit(1);
   }
+  // Dedupe within this harvest as well as against the ledger. A session that
+  // was resumed or forked carries its earlier turns into the new transcript, so
+  // the same message is genuinely found twice in one pass, and checking only
+  // what is already stored lets both copies through.
   const have = new Set(ledger().map((e) => e.uuid).filter(Boolean));
-  const fresh = found.filter((e) => e.uuid && !have.has(e.uuid))
-                     .sort((a, b) => String(a.at).localeCompare(String(b.at)));
+  const fresh = [];
+  for (const e of found) {
+    if (!e.uuid || have.has(e.uuid)) continue;
+    have.add(e.uuid);      // …and against the rest of THIS harvest, not just the ledger
+    fresh.push(e);
+  }
+  fresh.sort((a, b) => String(a.at).localeCompare(String(b.at)));
   for (const e of fresh) append(e);
   // Entries recovered before the wrapper was being stripped still carry it, and
   // several were cut short by it. They are derived, so they can simply be

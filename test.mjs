@@ -135,13 +135,21 @@ say('ingest keeps the message and drops the wrapper');
   fs.writeFileSync(path.join(fx, 't.jsonl'), JSON.stringify({ type: 'user', cwd: d,
     timestamp: '2026-01-01T09:00:00.000Z', uuid: 'fx1', sessionId: 's1',
     message: { role: 'user', content: wrapped } }) + '\n');
+  // A resumed or forked session repeats its earlier turns into the new
+  // transcript, so the same message really is present twice in ONE harvest.
+  // Was: ingest deduped against the ledger but not within the harvest, so both
+  // copies were appended.
+  fs.copyFileSync(path.join(fx, 't.jsonl'), path.join(fx, 'forked.jsonl'));
   drv(d, ['ingest', '--from', fx]);
+  ok('the same message in two transcripts is stored once',
+     ledger(d).filter((x) => x.uuid === 'fx1').length === 1);
   const e = ledger(d).find((x) => x.uuid === 'fx1');
   ok('the message was recovered', !!e);
   ok('the wrapper line is gone', e && !/^Another Claude session/.test(e.text));
   ok('the standing instructions are gone', e && !has(e.text, 'permission laundering'));
   ok('the conclusion survived', e && has(e.text, 'THE-CONCLUSION'));
   ok('it was attributed to its task', e && e.key === 't1');
+
   boxes.push(fx);
 }
 

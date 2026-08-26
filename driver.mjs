@@ -2188,7 +2188,14 @@ function cmdOwed(sub, rest, flags) {
   } else if (sub === 'assign') {
     const o = owedList(r).find((x) => x.id === rest[0]); if (!o) die('no owed item ' + rest[0]);
     if (!flags.to) die('need --to <task key>');
-    getTask(r, flags.to); o.to = flags.to; commit(r);
+    // Assigning to work that is over is how an item is lost while looking
+    // settled: `owed list` shows it SHUT again the moment it is written, and the
+    // advice printed here — put it in that task's brief — cannot be followed.
+    const carrier = getTask(r, flags.to);
+    if (['landed', 'cancelled'].includes(carrier.status))
+      die(flags.to + ' is ' + carrier.status + ' — its window is already shut, so it cannot carry ' +
+        o.id + '.\n       Assign it to work that is still open (`frontier` says which), or settle it: owed done ' + o.id);
+    o.to = flags.to; commit(r);
     console.log(o.id + ' → ' + flags.to + '. Put it in that task\'s brief — an assignment the agent never sees is not one.');
   } else if (sub === 'done') {
     const o = owedList(r).find((x) => x.id === rest[0]); if (!o) die('no owed item ' + rest[0]);
@@ -2537,6 +2544,9 @@ function cmdChip(key, flags) {
   }
   if (flags.id) t.chip = flags.id;
   if (flags.worktree) t.worktree = flags.worktree;
+  // --branch used to be accepted and then dropped on the floor, so `guard` and
+  // `release` went looking for a branch nobody had ever created.
+  if (flags.branch) t.branch = flags.branch;
   const held = heldNeeds(r, t);
   t.status = held.length ? 'held' : 'ready';
   commit(r);
@@ -2553,10 +2563,17 @@ function cmdAgent(key, flags) {
   const r = readReg(); const t = getTask(r, key);
   if (!flags.name) die('need --name <peer name it checked in from>');
   t.agent = flags.name;
-  if (t.status === 'planned') t.status = (t.needs || []).some((n) => getTask(r, n).status !== 'landed') ? 'held' : 'ready';
+  // heldNeeds treats a requirement that is not on record as unlanded and names
+  // it. Reading it with getTask instead used to abort the whole command with
+  // "no task X (have: ...)", which reads like the task being checked in is the
+  // one that does not exist.
+  const stillHeld = heldNeeds(r, t);
+  if (t.status === 'planned') t.status = stillHeld.length ? 'held' : 'ready';
   commit(r);
   console.log(key + ' is reachable at ' + t.agent + '  (' + t.status + ')');
-  const stillHeld = (t.needs || []).filter((n) => getTask(r, n).status !== 'landed');
+  const missing = (t.needs || []).filter((n) => !depOf(r, n));
+  if (missing.length) console.log('⚠ it waits on ' + missing.join(', ') + ', which ' +
+    (missing.length > 1 ? 'are' : 'is') + ' not on record — a typo, or a task never added. Fix `needs`.');
   if (stillHeld.length) console.log('Reply to it now: you are on hold until ' + stillHeld.join(', ') + ' land. Do not start.');
 }
 
@@ -2598,8 +2615,20 @@ function cmdRelease(key) {
 }
 
 const OUTCOMES = ['passed', 'partial', 'failed'];
+// `chip`, `release` and `landed` all refuse to move a task that is not in a
+// state the move makes sense from. `done` did not, and it is the one command an
+// agent runs itself: a report on a landed task rewound it to `reported` while
+// keeping its landedAt, and a report on a task nobody had ever handed out was
+// accepted as if there were work behind it.
+const REPORTABLE = ['held', 'ready', 'reported'];
 function cmdDone(key) {
   const r = readReg(); const t = getTask(r, key);
+  if (!REPORTABLE.includes(t.status))
+    die(key + ' is "' + t.status + '" — ' + (t.status === 'planned'
+      ? 'it has never been handed out, so there is no work to report on.\n' +
+        '       Create the chip first: driver.mjs chip ' + key + ' --id <task_id>'
+      : 'a report cannot rewind finished work. If this is really meant to run\n' +
+        '       again, that is a new task.'));
   const rep = stdinJson();
   // This one is run by the chip's own process, so it takes untrusted input.
   if (rep === null || typeof rep !== 'object' || Array.isArray(rep))
@@ -2706,6 +2735,16 @@ function cmdGuard(key, flags) {
 function cmdLanded(key, flags) {
   const r = readReg(); const t = getTask(r, key);
   if (t.status !== 'reported') die(key + ' is "' + t.status + '" — it cannot land before it reports finished');
+  // Landing on top of an unlanded requirement puts work in the main line that
+  // was built without the thing it was told to build on.
+  const held = heldNeeds(r, t);
+  if (held.length) {
+    console.error('✗ ' + key + ' cannot land — it waits for ' + held.join(', ') + ', and ' +
+      (held.length > 1 ? 'those have' : 'that has') + ' not landed.');
+    console.error('  Whatever it built, it built without them. Land them first, or fix `needs` if');
+    console.error('  the requirement is not real.');
+    process.exit(1);
+  }
   t.status = 'landed'; t.landedAt = now();
   t.landedSha = flags.sha || '';
   // No checkpoint is destroyed by a landing. The new work is simply not covered
@@ -3349,7 +3388,7 @@ const flags = {}; const rest = [];
 // boolean was not on the short list. Both failures reported success.
 const BOOL_FLAGS = new Set(['stdout', 'all', 'load-bearing', 'dry-run', 'force',
   'not-blocking', 'reclean', 'check']);
-const VALUE_FLAGS = new Set(['base', 'evidence', 'from', 'grep', 'id', 'into', 'key',
+const VALUE_FLAGS = new Set(['base', 'branch', 'evidence', 'from', 'grep', 'id', 'into', 'key',
   'kind', 'n', 'name', 'note', 'out', 'plan', 'ref', 'register', 'scope', 'session',
   'sha', 'since', 'stale', 'status', 'subject', 'task', 'text', 'timeout', 'title',
   'to', 'wave', 'what', 'why', 'window', 'worktree']);
@@ -3431,11 +3470,15 @@ driving the work out, after the grill:
   owed add|assign|done|list work only possible in a window between two pieces — record it, assign
                             it, and close no round on top of it silently.
   brief <key> [--stdout]    write the chip's brief to a file; print what to send. --all rewrites every one.
-  chip <key> --id <task_id> [--worktree p]    record the chip, set held or ready.
+  chip <key> --id <task_id> [--worktree p] [--branch b]   record the chip, set held or ready.
+                            --id is required the first time: it is how the record points at the
+                            agent actually doing the work. Refuses while the task would interfere
+                            with anything still open.
   agent <key> --name <peer>  record where a chip checked in from — without it you cannot release it.
   release <key>             refuses while a requirement has not landed; prints the release message.
   done <key>     < json     {commit, verified, notes} — a chip's own report.
   guard <key> [--base b]    diff its branch and name any file it was not allowed to touch. Exits 1.
+                            The base defaults to the repo's own default branch, not to "main".
   say <key> --kind k --text t     log what you sent (release|reply|sendback|note|hold|announce).
   heard <key> --kind k --text t   log what arrived (checkin|report|question|blocked|note).
   ingest [--from dir]       rebuild the ledger from the on-disk transcripts — both directions,

@@ -78,7 +78,37 @@ Surveyed patterns, grouped by mechanism:
   persisted state. Temporal/Cadence/Conductor are the productized form of the
   register+resume mechanism `driver.mjs` builds by hand.
 
-## The core gap and the fix
+## Resolved — what was actually built
+
+The gap below was closed on 26 August 2026, and by a different route than this
+note proposed. Rather than rewriting all 23 mutation sites to emit semantic
+events (and baking each one's ambient state so replay could not re-derive it
+differently), the event is **derived from the state change itself**: `commit()`
+diffs the register before and after, and appends the resulting path-assignments.
+
+That is strictly better here for three reasons. A diff taken after the fact *is*
+the resolved outcome, so the whole class of ambient-resolution bugs — a wave
+index recomputed from the graph, a status derived from every dependency, an id
+allocated from the current maximum — cannot occur. It is one change rather than
+23, so no site can be forgotten. And the ops are assignments, so replaying an
+event twice is a no-op by construction.
+
+Measured on the real 1.1 MB register: 82–160 bytes per event, 6,000–12,000x
+smaller than the post-image alternative this note's §1 implies.
+
+Snapshots were **not** built. Replay of a few thousand events is 30–60 ms, well
+under the node startup this tool already pays; and a `_seq` field in the register
+would defeat the no-op guard in `writeReg`, burning a backup slot on every write.
+The 30-deep backup ring is kept as a second net against a bug in replay itself.
+
+Also fixed on the way, both found by adversarial review of the above:
+`brief --all` stamped every task on every run, so twenty tasks burned twenty of
+the thirty backup slots — and it is the command `resume` recommends, so the
+documented recovery destroyed the only history. And the register lock was stolen
+from any command still running after fifteen seconds; it now asks the operating
+system whether the holder is alive.
+
+## The original gap and the fix as first proposed
 
 **Gap:** `register.json` is one mutable row with backups as its only history. It
 is also usually gitignored (per the README), so the 30-backup ring is the entire

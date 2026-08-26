@@ -58,11 +58,30 @@ and you read that file. Your context carries the pointer, never the payload.
   messages.jsonl         every word that passed between you and an agent
 ```
 
-The register is usually gitignored, so git cannot reconstruct it — the backups
-are its only history (the last 30 states, kept automatically, a no-op write
-burning no slot). Restoring is copying one back over `register.json`. Every
-driver command takes a lock on the register first, so a chip reporting in from
-its own process cannot race one of your writes.
+**The record is `events.jsonl`, and the register is derived from it.** Every
+change appends one line naming what actually changed and which command did it,
+so the state is rebuildable from disk alone:
+
+```bash
+node $DRV verify     # replay the record, prove it still equals the register
+node $DRV rebuild    # total recovery: rewrite the register from the record
+node $DRV events --task 2.1     # what happened to this task, and what did it
+```
+
+`verify` exits 1 on drift and names the fields. Two causes need opposite fixes
+and nothing can tell them apart for you: `rebuild` if the register was edited or
+damaged, `log reseed --why "..."` if the record lost its tail. Run `verify` when
+you come back to a run; the digest reports drift too.
+
+The record refuses to be silently wrong. A crash mid-write leaves a torn last
+line, which is dropped and reported, and trimmed before the next append. A bad
+line *anywhere else* is corruption and `rebuild` refuses rather than replaying a
+log with a hole in it.
+
+The register itself is gitignored, so the backups remain a second net — thirty
+states, a no-op write burning no slot. Every driver command locks the register
+first, and the lock now asks the operating system whether its holder is alive,
+so a slow command is never mistaken for a dead one.
 
 Two habits follow, and they are not optional:
 
@@ -79,6 +98,20 @@ Two habits follow, and they are not optional:
 - **Never summarise an agent's report into the record.** If a report is missing,
   ask the agent to write the file — do not reconstruct it from what it said in
   the chat. `refine done` refuses rather than letting you type it in.
+- **A failure is a record, not a remark.** A sendback, a guard trespass, a red
+  run, a blocked message, a self-reported partial — each opens a defect with an
+  id, the task, and the evidence, recorded automatically where it happens. It
+  stays on `outstanding` until `defect fixed <id>`.
+
+```bash
+node $DRV defect list                       # what is open
+node $DRV defect add --task 2.1 --kind bug --what "..." --evidence "..."
+node $DRV defect fixed d01
+```
+
+  This matters because rejecting work used to make it *invisible*: only a reply
+  clears an agent's pending question now, and a sendback no longer counts as one.
+
 - **Log every message, both directions, as it happens.** One line each. It is
   what tells you, after a compaction or a dead session, that an agent asked
   something three hours ago and is still sitting there.

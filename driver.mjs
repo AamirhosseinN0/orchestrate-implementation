@@ -13,6 +13,7 @@ import { execSync, spawnSync } from 'node:child_process';
 import os from 'node:os';
 
 const CWD = process.cwd();
+const CMDLINE = process.argv.slice(2).join(' ').slice(0, 200);
 let REG_PATH = path.join(CWD, '.claude', 'orchestration', 'register.json');
 
 const die = (m) => { console.error('error: ' + m); process.exit(2); };
@@ -108,6 +109,189 @@ function getGap(r, id) {
   const g = r.gaps.find((x) => x.id === id);
   if (!g) die('no gap ' + id);
   return g;
+}
+
+
+// ------------------------------------------------------------- the event log
+// The register is a projection. events.jsonl is the record, and it is written
+// by observing what actually changed rather than by asking 23 commands to
+// describe what they were about to do. That matters more than it sounds: a diff
+// taken after the fact IS the resolved outcome, so the ambient reads scattered
+// through this file (a wave index recomputed from the whole graph, a status
+// derived from every dependency, an id allocated from the current maximum)
+// cannot resolve differently on replay. There is nothing to re-derive.
+function eventsPath() { return path.join(path.dirname(path.resolve(CWD, REG_PATH)), 'events.jsonl'); }
+
+function diffOps(a, b, at = [], out = []) {
+  if (a === b) return out;
+  const prim = (v) => v === null || typeof v !== 'object';
+  if (prim(a) || prim(b) || Array.isArray(a) !== Array.isArray(b)) {
+    if (JSON.stringify(a) !== JSON.stringify(b)) out.push({ p: at, v: b });
+    return out;
+  }
+  if (Array.isArray(a) && Array.isArray(b) && b.length < a.length) {
+    // a shortened array is one assignment, not a run of deletes
+    if (JSON.stringify(a) !== JSON.stringify(b)) out.push({ p: at, v: b });
+    return out;
+  }
+  for (const k of new Set([...Object.keys(a), ...Object.keys(b)])) {
+    if (!(k in b)) { out.push({ p: [...at, k], d: 1 }); continue; }
+    if (!(k in a)) { out.push({ p: [...at, k], v: b[k] }); continue; }
+    diffOps(a[k], b[k], [...at, k], out);
+  }
+  return out;
+}
+
+// Pure. No clock, no filesystem, no ambient reads — every value is already in
+// the op. Assignment-shaped, so applying the same event twice is a no-op.
+function applyOps(state, ops) {
+  for (const op of ops) {
+    if (!Array.isArray(op.p)) continue;
+    if (!op.p.length) { state = op.v; continue; }
+    let cur = state;
+    for (let i = 0; i < op.p.length - 1; i++) {
+      const k = op.p[i];
+      if (cur[k] === null || cur[k] === undefined || typeof cur[k] !== 'object')
+        cur[k] = /^[0-9]+$/.test(String(op.p[i + 1])) ? [] : {};
+      cur = cur[k];
+    }
+    const last = op.p[op.p.length - 1];
+    if (op.d) { if (Array.isArray(cur)) cur.splice(Number(last), 1); else delete cur[last]; }
+    else cur[last] = op.v;
+  }
+  return state;
+}
+
+// A crash mid-append leaves a partial final line. That one is droppable. A bad
+// line anywhere else is corruption and must never be quietly skipped — this is
+// the source of truth, not a message ledger.
+function readEvents({ tolerateTail = true } = {}) {
+  const f = eventsPath();
+  if (!fs.existsSync(f)) return { events: [], problems: [], bytesGood: 0 };
+  const raw = fs.readFileSync(f, 'utf8');
+  const lines = raw.split('\n');
+  const events = [], problems = [];
+  let bytesGood = 0;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (!line) { if (i < lines.length - 1) bytesGood += 1; continue; }
+    const isLast = i === lines.length - 1 || lines.slice(i + 1).every((x) => !x);
+    let e;
+    try { e = JSON.parse(line); }
+    catch {
+      if (isLast && tolerateTail) { problems.push({ line: i + 1, why: 'truncated final line — a crash mid-append; dropped' }); break; }
+      problems.push({ line: i + 1, why: 'unreadable line in the middle of the log — this is corruption', fatal: true });
+      continue;
+    }
+    if (!e || typeof e !== 'object' || !Array.isArray(e.ops)) {
+      problems.push({ line: i + 1, why: 'not an event record', fatal: true }); continue;
+    }
+    events.push(e);
+    bytesGood += Buffer.byteLength(line) + 1;
+  }
+  return { events, problems, bytesGood };
+}
+
+function replay(events) {
+  let state = {}; let last = 0; const problems = [];
+  for (const e of events) {
+    if (typeof e.seq === 'number') {
+      if (e.seq <= last) { problems.push({ seq: e.seq, why: 'repeated or out-of-order — skipped' }); continue; }
+      if (e.seq !== last + 1) problems.push({ seq: e.seq, why: 'gap in the record: expected ' + (last + 1) });
+      last = e.seq;
+    }
+    state = applyOps(state, e.ops);
+  }
+  return { state, problems, lastSeq: last };
+}
+
+// Every register write goes through here, and the event lands FIRST. A crash
+// between the two leaves an event with no projection, which a rebuild repairs
+// exactly; the other order would leave a change that the record never learned,
+// which nothing can repair.
+function commit(r, why) {
+  const f = eventsPath();
+  let before = {};
+  try { before = JSON.parse(fs.readFileSync(path.resolve(CWD, REG_PATH), 'utf8')); } catch { /* first write */ }
+  const ops = diffOps(before, r);
+  if (!ops.length) return writeReg(r);          // no-op: burns no backup, records nothing
+  const { events, problems, bytesGood } = readEvents();
+  const fatal = problems.find((x) => x.fatal);
+  if (fatal) die('the record at ' + rel(f) + ' is damaged at line ' + fatal.line + '.\n' +
+    '       Refusing to append to a log with a hole in it — a partial record is worse than none.\n' +
+    '       Recover from .claude/orchestration/backups/, or start a fresh log with: log reseed');
+  if (problems.length) {
+    // truncate the torn tail back to the last good newline, or the next append
+    // concatenates onto it and the damage becomes permanent
+    try { fs.truncateSync(f, bytesGood); } catch { /* nothing to trim */ }
+  }
+  const seq = (events.length ? Math.max(...events.map((e) => e.seq || 0)) : 0) + 1;
+  fs.mkdirSync(path.dirname(f), { recursive: true });
+  fs.appendFileSync(f, JSON.stringify({ seq, at: now(), cmd: why || CMDLINE, ops }) + '\n');
+  return writeReg(r);
+}
+
+function cmdRebuild(flags) {
+  const { events, problems } = readEvents();
+  const fatal = problems.find((x) => x.fatal);
+  if (fatal) die('the record is damaged at line ' + fatal.line + ' — ' + fatal.why + '.\n' +
+    '       Not rebuilding from a log with a hole in it.');
+  if (!events.length) die('no record at ' + rel(eventsPath()) + ' — nothing to rebuild from.');
+  const upto = flags.to !== undefined ? Number(flags.to) : Infinity;
+  const use = events.filter((e) => (e.seq || 0) <= upto);
+  const { state, problems: rp, lastSeq } = replay(use);
+  for (const x of problems) console.error('· ' + x.why);
+  for (const x of rp) console.error('· seq ' + x.seq + ': ' + x.why);
+  if (flags.check) {
+    let actual = null;
+    try { actual = JSON.parse(fs.readFileSync(path.resolve(CWD, REG_PATH), 'utf8')); } catch { /* none */ }
+    const drift = diffOps(state, actual === null ? {} : actual);
+    if (!drift.length) { console.log('✓ the record and the register agree exactly (' + use.length + ' event(s), seq ' + lastSeq + ').'); return; }
+    console.error('✗ they disagree in ' + drift.length + ' place(s):');
+    for (const o of drift.slice(0, 12)) console.error('    ' + o.p.join('.') + (o.d ? '  (only in the record)' : '  → ' + JSON.stringify(o.v).slice(0, 70)));
+    if (drift.length > 12) console.error('    …and ' + (drift.length - 12) + ' more');
+    console.error('\n  Two different causes, opposite fixes — nothing can tell them apart for you:');
+    console.error('    rebuild            the register was edited or damaged; take the record as truth');
+    console.error('    log reseed         the record lost its tail; take the register as truth');
+    process.exit(1);
+  }
+  writeReg(state);
+  console.log('rebuilt ' + rel(REG_PATH) + ' from ' + use.length + ' event(s) (seq ' + lastSeq + ').');
+  console.log('The previous file was kept in backups/ — nothing was thrown away.');
+}
+
+function cmdEvents(flags) {
+  const { events, problems } = readEvents();
+  for (const x of problems) console.error('· ' + x.why);
+  let show = events;
+  if (flags.since !== undefined) show = show.filter((e) => (e.seq || 0) > Number(flags.since));
+  if (typeof flags.task === 'string') show = show.filter((e) => JSON.stringify(e.ops).includes('"' + flags.task + '"') || String(e.cmd).includes(flags.task));
+  if (typeof flags.grep === 'string') show = show.filter((e) => JSON.stringify(e).includes(flags.grep));
+  const n = flags.n ? Number(flags.n) : 40;
+  for (const e of show.slice(-n)) {
+    console.log(String(e.seq).padStart(5) + '  ' + String(e.at).slice(0, 19).replace('T', ' ') + '  ' + String(e.cmd || '').slice(0, 46));
+    for (const o of e.ops.slice(0, 4))
+      console.log('        ' + (o.d ? '- ' : '  ') + o.p.join('.') + (o.d ? '' : ' → ' + JSON.stringify(o.v).slice(0, 60)));
+    if (e.ops.length > 4) console.log('        …' + (e.ops.length - 4) + ' more change(s)');
+  }
+  console.log('\n' + show.length + ' of ' + events.length + ' event(s)' + (show.length > n ? ', last ' + n + ' shown' : '') + '.');
+}
+
+function cmdLogReseed(flags) {
+  if (!flags.why) die('log reseed --why "..." — say what happened to the old record; this marks a hole in the history');
+  let cur = {};
+  try { cur = JSON.parse(fs.readFileSync(path.resolve(CWD, REG_PATH), 'utf8')); } catch { die('no register to reseed from'); }
+  const f = eventsPath();
+  if (fs.existsSync(f)) {
+    const keep = f + '.superseded-' + now().replace(/[:.]/g, '-');
+    fs.renameSync(f, keep);
+    console.log('the old record was kept as ' + rel(keep));
+  }
+  fs.mkdirSync(path.dirname(f), { recursive: true });
+  fs.appendFileSync(f, JSON.stringify({ seq: 1, at: now(), cmd: 'log reseed', reseed: true,
+    why: flags.why, ops: [{ p: [], v: cur }] }) + '\n');
+  console.log('started a fresh record from the register as it stands.');
+  console.log('It carries an explicit note that history before this point was lost, and why.');
 }
 
 // ---------------------------------------------------------------- resolving
@@ -209,7 +393,7 @@ function cmdLoad(args) {
     const at = reg.plans.findIndex((x) => x.path === entry.path);
     if (at >= 0) reg.plans[at] = entry; else reg.plans.push(entry);
   }
-  writeReg(reg);
+  commit(reg);
   console.log('register: ' + rel(REG_PATH));
   console.log('loaded ' + reg.plans.length + ' plan file(s):\n');
   let words = 0;
@@ -236,7 +420,7 @@ function cmdScan() {
       added++;
     }
   }
-  writeReg(reg);
+  commit(reg);
   const byPlan = {};
   for (const g of reg.gaps.filter((x) => x.status === 'candidate')) (byPlan[g.plan] ||= []).push(g);
   for (const [p, gs] of Object.entries(byPlan)) {
@@ -284,7 +468,7 @@ function cmdAdd() {
     };
     reg.gaps.push(g); ids.push(g.id);
   }
-  writeReg(reg);
+  commit(reg);
   console.log('added: ' + ids.join(', '));
 }
 
@@ -319,7 +503,7 @@ function cmdSet(id, pairs) {
     if (k === 'status' && !['candidate', 'gap', 'dropped', 'asked', 'batched', 'answered', 'deferred'].includes(v)) die('bad status');
     g[k] = k === 'line' ? Number(v) : v;
   }
-  writeReg(reg);
+  commit(reg);
   console.log(g.id + '  ' + g.status + '  ' + g.scope + '  ' + (g.title || '(untitled)'));
 }
 
@@ -327,7 +511,7 @@ function cmdResearch(id) {
   const reg = readReg(); const g = getGap(reg, id);
   const inp = stdinJson();
   g.research = Array.isArray(inp) ? inp : [inp];
-  writeReg(reg);
+  commit(reg);
   console.log(g.id + ': ' + g.research.length + ' option(s) researched');
   for (const r of g.research) console.log('  - ' + r.name + (r.url ? '  ' + r.url : ''));
 }
@@ -397,7 +581,7 @@ function cmdQuestion(id) {
   const problems = lintGap(g);
   if (problems.length) { console.error(id + ' — not asked, fix these first:'); for (const x of problems) console.error('  ✗ ' + x); process.exit(1); }
   if (g.status !== 'batched') g.status = 'asked';
-  writeReg(reg);
+  commit(reg);
   console.log(id + ' ✓ passes the plain-words rules. ' + (g.status === 'batched' ? 'Held for the batch.' : 'Ask it now.') + '\n');
   printQuestion(g);
 }
@@ -434,7 +618,7 @@ function cmdAnswer(id) {
   if (!a.choice) die('need {"choice": "...", "note": "why, in their words"}');
   g.answer = { choice: a.choice, note: a.note || '', rejected: a.rejected || [], carries: a.carries || [], reaches_back: a.reaches_back || '', at: now() };
   g.status = 'answered';
-  writeReg(reg);
+  commit(reg);
   console.log(id + ' answered: ' + a.choice);
 }
 
@@ -726,7 +910,7 @@ function cmdRefineDone(needle, flags) {
         status: 'planned', reports: [] });
     }
   }
-  writeReg(r);
+  commit(r);
   console.log(p.path + ' refined.');
   console.log('  ' + (rep.tasks || []).length + ' task(s) proposed');
   console.log('  ' + (p.builtOn || []).length + ' existing thing(s) to build on');
@@ -875,7 +1059,7 @@ function cmdTaskAdd() {
       said.push('created ' + it.key + tail);
     }
   }
-  writeReg(r);
+  commit(r);
   for (const line of said) console.log(line);
   console.log(tasks(r).length + ' task(s) on record. Run `graph` to check nothing clashes.');
 }
@@ -1014,9 +1198,7 @@ function cmdFrontier() {
   }
   if (waiting.length) console.log('\nStill waiting on work to land: ' + waiting.map((t) => t.key).join('  '));
   // CI checkpoints are no longer a hard gate, so keep the drift visible instead
-  const ciAts = Object.values(r.ci || {}).map((c) => Date.parse(c.at)).filter(Boolean);
-  const lastCi = ciAts.length ? Math.max(...ciAts) : 0;
-  const unproven = tasks(r).filter((t) => t.status === 'landed' && Date.parse(t.landedAt || 0) > lastCi).length;
+  const unproven = unprovenLanded(r).length;
   if (unproven) {
     console.log('\n' + (unproven >= 5 ? '⚠ ' : '') + unproven + ' landing(s) since the last CI checkpoint.' +
       (unproven >= 5 ? ' That is a lot of unproven main line — record one at the next pause:' : ' Record one when the frontier pauses:'));
@@ -1209,7 +1391,7 @@ function cmdBrief(key, flags) {
   if (!unchanged) {
     fs.writeFileSync(out, body);
     t.briefSha = sha; t.briefAt = now(); t.briefFile = out;
-    writeReg(r);
+    commit(r);
   }
   console.log((unchanged ? 'unchanged ' : 'wrote ') + out);
   console.log('');
@@ -1339,7 +1521,7 @@ function cmdPreflightDone(key) {
   if (bad.length) die('the report at ' + rel(src) + ' is not usable — send it back rather than fixing it here:\n       ' + bad.join('\n       '));
   t.preflight = { at: now(), missing: rep.missing || [], verify: rep.verify || [], notes: rep.notes || '' };
   for (const x of rep.serialises || []) { (t.serialises ||= []); if (!t.serialises.includes(x)) t.serialises.push(x); }
-  writeReg(r);
+  commit(r);
   console.log(key + ' pre-flighted: ' + t.preflight.missing.length + ' gap(s), ' +
     (rep.serialises || []).length + ' serialisation point(s), ' +
     t.preflight.verify.filter((v) => v.runnable === false).length + ' verify problem(s)');
@@ -1470,7 +1652,7 @@ function cmdDefect(sub, rest, flags) {
     const d = recordDefect(r, { task: flags.task || '', kind, what: flags.what,
                                 evidence: typeof flags.evidence === 'string' ? flags.evidence : '',
                                 blocking: !flags['not-blocking'] });
-    writeReg(r);
+    commit(r);
     console.log(d.id + '  ' + d.kind + (d.task ? '  ' + d.task : '') + (d.blocking ? '  (blocking)' : ''));
     console.log('It stays on `outstanding` until you run: defect fixed ' + d.id);
     return;
@@ -1480,7 +1662,7 @@ function cmdDefect(sub, rest, flags) {
     if (!d) die('no defect ' + rest[0] + ' (have: ' + defectList(r).map((x) => x.id).join(', ') + ')');
     if (d.status === 'fixed') return console.log(d.id + ' was already marked fixed at ' + d.resolvedAt);
     d.status = 'fixed'; d.resolvedAt = now();
-    writeReg(r);
+    commit(r);
     console.log(d.id + ' marked fixed.');
     return;
   }
@@ -1509,16 +1691,16 @@ function cmdOwed(sub, rest, flags) {
     const id = 'o' + String(owedList(r).reduce((m, o) => Math.max(m, parseInt(o.id.slice(1), 10) || 0), 0) + 1).padStart(2, '0');
     owedList(r).push({ id, what: flags.what, why: flags.why, window: flags.window || '',
       to: flags.to || '', loadBearing: !!flags['load-bearing'], status: 'open', at: now() });
-    writeReg(r);
+    commit(r);
     console.log(id + ' recorded' + (flags.to ? ', assigned to ' + flags.to : ' — UNASSIGNED. An owed item nobody owns is one the window closes on.'));
   } else if (sub === 'assign') {
     const o = owedList(r).find((x) => x.id === rest[0]); if (!o) die('no owed item ' + rest[0]);
     if (!flags.to) die('need --to <task key>');
-    getTask(r, flags.to); o.to = flags.to; writeReg(r);
+    getTask(r, flags.to); o.to = flags.to; commit(r);
     console.log(o.id + ' → ' + flags.to + '. Put it in that task\'s brief — an assignment the agent never sees is not one.');
   } else if (sub === 'done') {
     const o = owedList(r).find((x) => x.id === rest[0]); if (!o) die('no owed item ' + rest[0]);
-    o.status = 'done'; o.doneAt = now(); writeReg(r); console.log(o.id + ' settled.');
+    o.status = 'done'; o.doneAt = now(); commit(r); console.log(o.id + ' settled.');
   } else if (sub === 'list' || sub === undefined) {
     const os = owedList(r);
     if (!os.length) return console.log('nothing is owed.');
@@ -1635,6 +1817,29 @@ function cmdSlot(sub, rest, flags, raw) {
 // -------------------------------------------------------------- wave gating
 // A wave is finished when every task in it has landed AND the main line has
 // been through CI. Not before, and no chip of the next wave exists until then.
+
+// A run's result used to be filed under a round number. Round numbers are a
+// position in a topological sort of the whole task graph, so adding one task
+// renumbers every round after it — and the record for one round silently
+// becomes the record for another. A checkpoint instead names the task keys it
+// actually covered, which stays true no matter what is added later.
+function checkpoints(r) { return (r.checkpoints ||= []); }
+function nextCheckpointId(r) {
+  const n = checkpoints(r).reduce((m, c) => Math.max(m, parseInt(String(c.id).slice(1), 10) || 0), 0);
+  return 'c' + String(n + 1).padStart(2, '0');
+}
+// A task is proven when a green checkpoint covering it was recorded after it
+// landed. Nothing needs deleting when new work lands — it is simply not covered
+// yet, which is the truth rather than an erasure.
+function provenAt(r, t) {
+  if (!t.landedAt) return null;
+  return checkpoints(r).find((c) => ['green', 'skipped'].includes(c.status) &&
+    (c.covers || []).includes(t.key) && Date.parse(c.at) >= Date.parse(t.landedAt)) || null;
+}
+function unprovenLanded(r) {
+  return tasks(r).filter((t) => t.status === 'landed' && !provenAt(r, t));
+}
+
 function waveOf(r, key) {
   for (const w of waves(r)) if (w.tasks.some((t) => t.key === key)) return w.wave;
   return -1;
@@ -1643,9 +1848,10 @@ function waveState(r, n) {
   const w = waves(r).find((x) => x.wave === n);
   if (!w) return null;
   const landed = w.tasks.filter((t) => t.status === 'landed');
-  const ci = (r.ci || {})[String(n)] || null;
+  const ci = landed.length ? provenAt(r, landed[landed.length - 1]) : null;
+  const allCovered = landed.length > 0 && landed.every((t) => provenAt(r, t));
   return { n, tasks: w.tasks, landed, allLanded: landed.length === w.tasks.length, ci,
-           green: !!ci && ['green', 'skipped'].includes(ci.status) };
+           green: allCovered };
 }
 // Why the next wave may not be opened yet — empty means it may.
 function blocking(r, n) {
@@ -1681,9 +1887,15 @@ function cmdCi(flags) {
   if (!st.allLanded && status !== 'red')
     die('round ' + (n + 1) + ' has not all landed yet, so this cannot close it:\n       ' +
         st.tasks.filter((t) => t.status !== 'landed').map((t) => t.key).join(' '));
-  (r.ci ||= {})[String(n)] = { status, ref: flags.ref || '', why: flags.why || '', at: now() };
-  writeReg(r);
-  console.log('round ' + (n + 1) + ' CI: ' + status + (flags.ref ? '  ' + flags.ref : ''));
+  // resolved at write time: exactly which landed work this run saw
+  const covers = st.tasks.filter((t) => t.status === 'landed').map((t) => t.key);
+  const cp = { id: nextCheckpointId(r), status, ref: flags.ref || '', why: flags.why || '',
+               covers, mainSha: flags.sha || '', at: now() };
+  checkpoints(r).push(cp);
+  commit(r);
+  console.log(cp.id + ': round ' + (n + 1) + ' ' + status + (flags.ref ? '  ' + flags.ref : ''));
+  console.log('  covers ' + (covers.length ? covers.join(' ') : '(nothing landed)') +
+              ' — filed against those, not against a round number that moves.');
   if (status === 'green' || status === 'skipped') {
     const nxt = waveState(r, n + 1);
     console.log(nxt ? 'Round ' + (n + 2) + ' may now be opened: ' + nxt.tasks.map((t) => t.key).join(' ')
@@ -1701,7 +1913,7 @@ function cmdCi(flags) {
     const d = recordDefect(r, { task: '', kind: 'ci',
       what: 'CI red on round ' + (n + 1) + (flags.ref ? ' (' + flags.ref + ')' : ''),
       evidence: 'why: ' + flags.why + '\ncovers: ' + (covered.join(' ') || '(nothing landed)'), blocking: true });
-    writeReg(r);
+    commit(r);
     console.log('recorded ' + d.id + ' naming the ' + covered.length + ' landed task(s) it covers.');
     console.log('Nothing of the next round is created. Send the break back to whoever owns those files.');
   }
@@ -1770,7 +1982,7 @@ function cmdChip(key, flags) {
   if (flags.worktree) t.worktree = flags.worktree;
   const held = heldNeeds(r, t);
   t.status = held.length ? 'held' : 'ready';
-  writeReg(r);
+  commit(r);
   console.log(t.key + '  ' + t.status + (held.length ? '  waiting for ' + held.join(', ') : '  can start now'));
   if (held.length) {
     console.log('');
@@ -1785,7 +1997,7 @@ function cmdAgent(key, flags) {
   if (!flags.name) die('need --name <peer name it checked in from>');
   t.agent = flags.name;
   if (t.status === 'planned') t.status = (t.needs || []).some((n) => getTask(r, n).status !== 'landed') ? 'held' : 'ready';
-  writeReg(r);
+  commit(r);
   console.log(key + ' is reachable at ' + t.agent + '  (' + t.status + ')');
   const stillHeld = (t.needs || []).filter((n) => getTask(r, n).status !== 'landed');
   if (stillHeld.length) console.log('Reply to it now: you are on hold until ' + stillHeld.join(', ') + ' land. Do not start.');
@@ -1798,7 +2010,7 @@ function cmdRelease(key) {
   const held = heldNeeds(r, t);
   if (held.length) { console.error('✗ cannot release ' + key + ' — still waiting for ' + held.join(', ') + ' (not landed)'); process.exit(1); }
   t.status = 'ready';
-  writeReg(r);
+  commit(r);
   if (!t.agent) console.log('⚠ ' + key + ' has never checked in — you have no address for it. Wait for its check-in.\n');
   console.log('Send this with SendMessage to ' + (t.agent || '<no address yet>') + ':\n');
   console.log('requirements are done, you may start.');
@@ -1847,7 +2059,7 @@ function cmdDone(key) {
   let d = null;
   if (outcome !== 'passed') d = recordDefect(r, { task: key, kind: 'bug',
     what: key + ' reported itself as ' + outcome, evidence: rep.verified.slice(0, 500), blocking: outcome === 'failed' });
-  writeReg(r);
+  commit(r);
   console.log(key + ' recorded as ' + outcome + ' by its own account. Not landed until it is checked again.');
   if (d) console.log('  recorded ' + d.id + ' — it said so itself, so it will not be lost.');
 }
@@ -1880,7 +2092,7 @@ function cmdGuard(key, flags) {
     const d = recordDefect(r, { task: key, kind: 'guard',
       what: key + ' reported finished but its branch changed nothing against ' + base,
       evidence: 'git diff --name-only ' + base + '...' + t.branch + ' → empty', blocking: true });
-    writeReg(r);
+    commit(r);
     console.log('⚠ ' + key + ' changed nothing at all against ' + base + '. That is not finished work.');
     console.log('  recorded ' + d.id + '. Ask which branch it committed to — do not go looking yourself.');
     process.exit(1);
@@ -1896,7 +2108,7 @@ function cmdGuard(key, flags) {
     const d = recordDefect(r, { task: key, kind: 'guard',
       what: bad.length + ' file(s) changed outside what ' + key + ' owns',
       evidence: bad.join('\n'), blocking: true });
-    writeReg(r);
+    commit(r);
     console.log('  recorded ' + d.id + ' with the file list — it will not be forgotten when this scrolls away.');
     console.log('  Send it back. Do not fix it here — you would be writing code, and you would be');
     console.log('  writing it in the one place that has to stay able to judge it.');
@@ -1910,13 +2122,12 @@ function cmdLanded(key, flags) {
   if (t.status !== 'reported') die(key + ' is "' + t.status + '" — it cannot land before it reports finished');
   t.status = 'landed'; t.landedAt = now();
   t.landedSha = flags.sha || '';
-  const wv = waveOf(r, key);
-  if (wv >= 0 && (r.ci || {})[String(wv)]) {
-    delete r.ci[String(wv)];
-    console.log('round ' + (wv + 1) + ' had a CI result on record — invalidated, because this landing changed the main line after that run.');
-  }
+  // No checkpoint is destroyed by a landing. The new work is simply not covered
+  // by any run yet, which `frontier` and `digest` report as drift.
+  const un = unprovenLanded(r).length + 1;
+  if (un > 1) console.log(un + ' landing(s) now sit beyond the last checkpoint.');
   if (!t.landedSha) console.log('(no --sha given: a released chip cannot then prove its copy carries this work)');
-  writeReg(r);
+  commit(r);
   const freed = tasks(r).filter((x) => x.status === 'held' && (x.needs || []).includes(key) &&
     heldNeeds(r, x).length === 0);
   console.log(key + ' landed.');
@@ -2223,7 +2434,7 @@ function cmdSay(key, flags) {
   console.log('logged: → ' + key + ' [' + kind + ']');
   if (kind === 'sendback') {
     const d = recordDefect(r, { task: key, kind: 'sendback', what: flags.text, evidence: '', blocking: true });
-    writeReg(r);
+    commit(r);
     console.log('  recorded ' + d.id + ' — ' + key + ' stays on `outstanding` until you run: defect fixed ' + d.id);
     console.log('  (sending work back is not answering it; both are now tracked separately)');
   }
@@ -2238,7 +2449,7 @@ function cmdHeard(key, flags) {
   t.lastHeard = now();
   let d = null;
   if (kind === 'blocked') d = recordDefect(r, { task: key, kind: 'blocked', what: flags.text, evidence: '', blocking: true });
-  writeReg(r);
+  commit(r);
   console.log('logged: ← ' + key + ' [' + kind + ']');
   if (d) console.log('  recorded ' + d.id + ' — it stays open until you run: defect fixed ' + d.id);
   if (kind === 'question')
@@ -2291,9 +2502,7 @@ function cmdDigest() {
     L.push('**Owed** (' + owed.length + ' open, ' + owed.filter((o) => !o.to).length + ' unassigned) — a window closing on one closes for good:');
     for (const o of owed.slice(0, 5)) L.push('- ' + o.id + ' ' + String(o.what).slice(0, 60) + (o.to ? ' → ' + o.to : ' → **nobody**'));
   }
-  const ciAts = Object.values(r.ci || {}).map((c) => Date.parse(c.at)).filter(Boolean);
-  const last = ciAts.length ? Math.max(...ciAts) : 0;
-  const unproven = T.filter((t) => t.status === 'landed' && Date.parse(t.landedAt || 0) > last).length;
+  const unproven = unprovenLanded(r).length;
   if (unproven) L.push('\n**' + unproven + ' landing(s) since the last CI checkpoint.**' + (unproven >= 5 ? ' That is a lot of unproven main line.' : ''));
   L.push('');
   L.push('**Next:** `frontier` (what can open) · `outstanding` (who is waiting) · `board` (everything).');
@@ -2365,7 +2574,7 @@ function cmdResume(flags) {
   if (!flags.name) die('need --name <your new peer name> — get it from `whoami`');
   const was = r.orchestrator || '(none recorded)';
   r.orchestrator = flags.name;
-  writeReg(r);
+  commit(r);
   console.log('The run is now yours. It was ' + was + '; it is ' + flags.name + '.\n');
   console.log('Every brief names the old address, so they are all wrong. Rewriting them:');
   console.log('  node driver.mjs brief --all\n');
@@ -2499,6 +2708,10 @@ driving the work out, after the grill:
   ingest [--from dir]       rebuild the ledger from the on-disk transcripts — both directions,
                             retroactively, including messages a compaction already took.
   outstanding               who is waiting on you, and since when.
+  verify                    replay the record and prove it still equals the register. Exits 1 on drift.
+  rebuild [--to seq]        rewrite the register from the record. Total recovery from a lost register.
+  events [--since n] [--task k] [--grep s] [--n 40]   what happened, and which command did it.
+  log reseed --why "..."    start a fresh record from the register, marking the lost history honestly.
   digest                    the whole run in a few hundred words — what is true, what waits on you.
   hook-install              run the digest automatically after every compaction and resume.
   resume --name <peer>      take over a run after the session running it ended.
@@ -2539,7 +2752,7 @@ switch (cmd) {
     break;
   }
   case 'whoami': cmdWhoami(flags); break;
-  case 'iam': { const r = readReg(); r.orchestrator = rest[0] || die('need a name'); writeReg(r); console.log('briefs will tell chips to report to ' + r.orchestrator); break; }
+  case 'iam': { const r = readReg(); r.orchestrator = rest[0] || die('need a name'); commit(r); console.log('briefs will tell chips to report to ' + r.orchestrator); break; }
   case 'task': if (rest.shift() !== 'add') die('only `task add` is supported'); cmdTaskAdd(); break;
   case 'graph': cmdGraph(); break;
   case 'brief': if (flags.all) cmdBriefAll(); else cmdBrief(rest[0], flags); break;
@@ -2568,6 +2781,10 @@ switch (cmd) {
   case 'say': cmdSay(rest[0], flags); break;
   case 'heard': cmdHeard(rest[0], flags); break;
   case 'ingest': cmdIngest(flags); break;
+  case 'rebuild': cmdRebuild(flags); break;
+  case 'verify': cmdRebuild({ ...flags, check: true }); break;
+  case 'events': cmdEvents(flags); break;
+  case 'log': if (rest.shift() !== 'reseed') die('log reseed --why "..."'); cmdLogReseed(flags); break;
   case 'digest': cmdDigest(); break;
   case 'hook-install': cmdHookInstall(); break;
   case 'outstanding': cmdOutstanding(); break;

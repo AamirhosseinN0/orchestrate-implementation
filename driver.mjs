@@ -1284,10 +1284,25 @@ function cmdBundle(sub, rest, flags) {
   host.title = host.title + ' (+ ' + others.map((m) => m.key).join(', ') + ')';
   // the absorbed tasks are cancelled, not deleted — the record keeps them
   for (const m of others) { m.status = 'cancelled'; m.bundledInto = into; }
+  // Everything else about a member moved to the host; its open problems and its
+  // owed items have to move too, or they stay filed against a key nobody is
+  // building. The brief is written from the host's record, so an unmoved defect
+  // is one the agent doing that work never reads.
+  const moved = { defects: [], owed: [] };
+  for (const d of defectList(r))
+    if (d.status === 'open' && others.some((m) => m.key === d.task)) {
+      d.movedFrom = d.task; d.task = into; moved.defects.push(d.id);
+    }
+  for (const o of owedList(r))
+    if (o.status === 'open' && others.some((m) => m.key === o.to)) {
+      o.movedFrom = o.to; o.to = into; moved.owed.push(o.id);
+    }
   commit(r);
   console.log('bundled ' + keys.join(' + ') + ' into ' + into);
   console.log('  owns ' + host.owns.length + ' file(s), ' + host.verify.length + ' check(s), waits for ' + (host.needs.join(', ') || 'nothing'));
   console.log('  ' + others.length + ' task(s) marked cancelled and recorded as absorbed — nothing was deleted.');
+  if (moved.defects.length) console.log('  moved to ' + into + ': open defect(s) ' + moved.defects.join(' ') + ' — they are that agent\'s to fix now.');
+  if (moved.owed.length) console.log('  moved to ' + into + ': owed item(s) ' + moved.owed.join(' ') + ' — put them in the brief.');
   console.log('\nRe-run `graph` and `preflight brief ' + into + '` — the brief now covers all of it.');
 }
 
@@ -1793,9 +1808,9 @@ function cmdDoctor() {
   const shut = allShutWindows(r);
   if (shut.length) {
     bad += shut.length;
-    console.log('✗ ' + shut.length + ' owed item(s) assigned to work that has already landed:');
-    for (const o of shut) console.log('    ' + o.id + ' → ' + o.to + (o.loadBearing ? '  LOAD-BEARING' : '') +
-      '  ' + String(o.what || '').replace(/\s+/g, ' ').slice(0, 100));
+    console.log('✗ ' + shut.length + ' owed item(s) assigned to work that is over:');
+    for (const o of shut) console.log('    ' + o.id + ' → ' + o.to + ' (' + o.carrierStatus + ')' +
+      (o.loadBearing ? '  LOAD-BEARING' : '') + '  ' + String(o.what || '').replace(/\s+/g, ' ').slice(0, 100));
     console.log('    Their window is shut. Reassign or settle each — `owed list` shows them as SHUT.');
   }
   // A tick over nothing checked is how a green report starts meaning nothing.
@@ -1819,14 +1834,18 @@ function owedList(r) { return (r.owed ||= []); }
 // owed, it simply has nobody left to do it. Landing must NOT settle it — that
 // would make the loss automatic. It surfaces instead, which is the whole point
 // of the list: a window closing should be a decision somebody made.
+// Cancelled counts as shut too: a task absorbed by a bundle, or dropped, is not
+// going to carry anything either. Only the wording differs.
+const DEAD_STATUS = ['landed', 'cancelled'];
 function shutWindows(r, key) {
   const t = tasks(r).find((x) => x.key === key);
-  if (!t || t.status !== 'landed') return [];
+  if (!t || !DEAD_STATUS.includes(t.status)) return [];
   return owedList(r).filter((o) => o.status === 'open' && o.to === key);
 }
 function allShutWindows(r) {
-  const landed = new Set(tasks(r).filter((t) => t.status === 'landed').map((t) => t.key));
-  return owedList(r).filter((o) => o.status === 'open' && o.to && landed.has(o.to));
+  const dead = new Map(tasks(r).filter((t) => DEAD_STATUS.includes(t.status)).map((t) => [t.key, t.status]));
+  return owedList(r).filter((o) => o.status === 'open' && o.to && dead.has(o.to))
+                    .map((o) => ({ ...o, carrierStatus: dead.get(o.to) }));
 }
 
 
@@ -1927,8 +1946,8 @@ function cmdOwed(sub, rest, flags) {
     }
     const sh = allShutWindows(r);
     if (sh.length) {
-      console.log('\n' + sh.length + ' item(s) marked SHUT: the task they were assigned to has already landed,');
-      console.log('so nothing is carrying them any more. ' + sh.filter((o) => o.loadBearing).length +
+      console.log('\n' + sh.length + ' item(s) marked SHUT: the task they were assigned to has landed or been');
+      console.log('cancelled, so nothing is carrying them any more. ' + sh.filter((o) => o.loadBearing).length +
                   ' of those is load-bearing.');
       console.log('Reassign each to work that is still open, or settle it — leaving it is the loss.');
     }
@@ -2860,7 +2879,8 @@ function waitingOn(r, log) {
     if (t.status === 'planned' && t.agent)
       rows.push({ key: t.key, why: 'checked in but was never told where it stands', detail: '', since: '' });
     for (const o of shutWindows(r, t.key))
-      rows.push({ key: t.key, why: 'landed with ' + o.id + ' still owed on it' + (o.loadBearing ? ' — LOAD-BEARING' : '') +
+      rows.push({ key: t.key, why: (t.status === 'landed' ? 'landed with ' : 'was cancelled with ') +
+        o.id + ' still owed on it' + (o.loadBearing ? ' — LOAD-BEARING' : '') +
         ' — reassign it (`owed assign ' + o.id + ' --to <key>`) or settle it (`owed done ' + o.id + '`)',
         detail: String(o.what || '').slice(0, 90), since: o.windowShutAt || o.at || '' });
   }

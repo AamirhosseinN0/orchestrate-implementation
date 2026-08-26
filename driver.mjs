@@ -2921,13 +2921,17 @@ function cmdChip(key, flags) {
   const r = readReg(); const t = getTask(r, key);
   if (['landed', 'reported', 'cancelled'].includes(t.status))
     die(key + ' is ' + t.status + ' — a chip cannot rewind it. If this is really meant to run again, that is a new task.');
-  if (!t.chip) {
-    // The record has to be able to say which chip is which — without it there is
-    // no way back from a key to the thing actually running the work.
-    if (!flags.id)
-      die('chip ' + key + ' --id <task_id> — the chip id is how the record points at the running\n' +
-          '       agent. Take it from the tool that created the chip. Add --worktree <path> too if\n' +
-          '       the copy it works in is not the branch\'s own worktree.');
+  // The record has to be able to say which chip is which — without it there is
+  // no way back from a key to the thing actually running the work.
+  if (!t.chip && !flags.id)
+    die('chip ' + key + ' --id <task_id> — the chip id is how the record points at the running\n' +
+        '       agent. Take it from the tool that created the chip. Add --worktree <path> too if\n' +
+        '       the copy it works in is not the branch\'s own worktree.');
+  // Both gates below used to sit behind `if (!t.chip)`, so re-pointing a chip ran
+  // no check at all — and what a task owns can widen after its first chip, by
+  // `preflight done` or by a later `task add`. The second call is exactly when
+  // the answer may have changed, so it is the last call that may skip it.
+  {
     const pending = heldNeeds(r, t);
     if (pending.length) {
       console.error('✗ ' + key + ' still waits for ' + pending.join(', ') + ' to land.');
@@ -3155,7 +3159,7 @@ function cmdLanded(key, flags) {
   t.landedSha = flags.sha || '';
   // No checkpoint is destroyed by a landing. The new work is simply not covered
   // by any run yet, which `frontier` and `digest` report as drift.
-  const un = unprovenLanded(r).length + 1;
+  const un = unprovenLanded(r).length;   // t is already landed above, so it is counted
   if (un > 1) console.log(un + ' landing(s) now sit beyond the last checkpoint.');
   if (!t.landedSha) console.log('(no --sha given: a released chip cannot then prove its copy carries this work)');
   // Anything owed on this task can no longer be done by it. Stamp when the
@@ -3709,12 +3713,13 @@ function cmdBoard() {
   const r = readReg();
   if (!tasks(r).length) return console.log('no tasks yet');
   const ICON = { planned: '·', held: '⏸', ready: '▶', reported: '✓?', landed: '●', cancelled: '✗' };
-  console.log('key'.padEnd(14) + 'state'.padEnd(11) + 'waits for'.padEnd(14) + 'address'.padEnd(18) + 'title');
+  console.log('key'.padEnd(14) + 'state'.padEnd(11) + 'waits for'.padEnd(14) + 'address'.padEnd(26) + 'title');
   console.log('-'.repeat(90));
   for (const t of tasks(r)) {
     const held = (t.needs || []).filter((n) => { const d = tasks(r).find((x) => x.key === n); return !d || d.status !== 'landed'; });
     console.log(t.key.padEnd(14) + ((ICON[t.status] || '?') + ' ' + t.status).padEnd(11) +
-      (held.length ? held.join(',') : '—').padEnd(14) + (t.agent || 'not checked in').padEnd(18) + t.title.slice(0, 32));
+      (held.length ? held.join(',') : '—').padEnd(14) +
+      (t.agent || 'not checked in').slice(0, 24).padEnd(26) + t.title.slice(0, 32));
   }
   const n = (s) => tasks(r).filter((t) => t.status === s).length;
   console.log('\n' + n('landed') + ' landed · ' + n('reported') + ' waiting on your check · ' +

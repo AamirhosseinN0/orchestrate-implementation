@@ -260,6 +260,51 @@ else
   skip "bundling leaves the graph orderable" "nothing suggested"
 fi
 
+# found while reconciling the prose: the gates sat behind `if (!t.chip)`, so a
+# second chip call ran none of them — and what a task owns can widen after its
+# first chip. Reachable via `chip <key> --id <new_id>` on an already-chipped task.
+d3=$(fresh)
+cat > "$d3/t4.json" <<'J'
+[{"key":"A","title":"a","plan":"docs/plans/p1.md","owns":["src/a.py"],"needs":[],"serialises":["the migration head"]},
+ {"key":"B","title":"b","plan":"docs/plans/p1.md","owns":["src/b.py"],"needs":[],"serialises":["the migration head"]}]
+J
+( cd "$d3" && node "$DRV" task add < t4.json >/dev/null 2>&1 )
+( cd "$d3" && node "$DRV" chip A --id c1 >/dev/null 2>&1 )
+node -e '
+const fs=require("fs"),p=process.argv[1]+"/.claude/orchestration/register.json";
+const r=JSON.parse(fs.readFileSync(p));const b=r.tasks.find(t=>t.key==="B");
+b.chip="stale"; b.status="planned"; fs.writeFileSync(p,JSON.stringify(r,null,2)+"\n");' "$d3"
+( cd "$d3" && node "$DRV" log reseed --why fixture >/dev/null 2>&1 )
+out=$(cd "$d3" && node "$DRV" chip B --id c3 2>&1); c=$?
+[ $c -ne 0 ] && ok "re-pointing an existing chip is gated too, not waved through" \
+             || bad "re-pointing an existing chip is gated too, not waved through" "B opened alongside A"
+
+# landed counted itself twice: t.status is set to landed before the count is taken
+d4=$(fresh)
+echo '[{"key":"A","title":"a","plan":"docs/plans/p1.md","owns":["src/a.py"],"needs":[]}]' \
+  | ( cd "$d4" && node "$DRV" task add >/dev/null 2>&1 )
+( cd "$d4" && node "$DRV" chip A --id c1 >/dev/null 2>&1 )
+echo '{"verified":"ran true","outcome":"passed"}' | ( cd "$d4" && node "$DRV" done A >/dev/null 2>&1 )
+out=$(cd "$d4" && node "$DRV" landed A --sha abc 2>&1 | awk '/landing\(s\) now sit/')
+[ -z "$out" ] && ok "landed counts one landing as one, not two" \
+              || bad "landed counts one landing as one, not two" "$out"
+
+# board ran the address straight into the title on every row of a real run
+d5=$(corpus)
+collide=$(cd "$d5" && node "$DRV" board 2>&1 | node -e '
+let s="";process.stdin.on("data",c=>s+=c).on("end",()=>{
+  const rows=s.split("\n").filter(l=>/^\S+\s+[●○◐?]/.test(l));
+  const hdr=s.split("\n").find(l=>l.startsWith("key"));
+  if(!hdr||!rows.length){console.log("no-rows");return}
+  const at=hdr.indexOf("title");
+  const bad=rows.filter(l=>l.length>at && l[at-1]!==" ").length;
+  console.log(bad?("collide:"+bad):"clear");});')
+case "$collide" in
+  clear) ok "board keeps the address out of the title column" ;;
+  no-rows) skip "board column alignment" "no rows to measure" ;;
+  *) bad "board keeps the address out of the title column" "${collide#collide:} row(s) run together" ;;
+esac
+
 # ─────────────────────────────────────────────────── wave 4: grill and ledger
 
 head_ "Wave 4 — the grill and the ledger"

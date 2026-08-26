@@ -779,13 +779,38 @@ function briefPath(key) { return path.join(orchDir('briefs'), fileKey(key) + '.m
 function reportPath(planPath) { return path.join(orchDir('refine'), slug(planPath.replace(/\.md$/, '')) + '.json'); }
 // What the brief is built from. Volatile fields (who checked in, what landed)
 // are excluded — they change without changing a word of the brief.
+
+// ------------------------------------------------------- shared decision text
+// Standing decisions repeat across every task that must obey them. On a real
+// 51-task run, 817 decision entries were only 131 distinct strings, and seven
+// of them appeared on every single task — 413 KB of byte-identical repetition,
+// 37% of the register, and now a cost in every event that carries one too. Long
+// texts are interned once and referenced; short ones stay inline, because a
+// reference is only worth it when it is shorter than the thing it replaces.
+const DECISION_REF = /^@([0-9a-f]{12})$/;
+function decisionPool(r) { return (r.decisionTexts ||= {}); }
+function internDecision(r, text) {
+  const t = String(text);
+  if (t.length < 120) return t;
+  const h = crypto.createHash('sha256').update(t).digest('hex').slice(0, 12);
+  decisionPool(r)[h] = t;
+  return '@' + h;
+}
+function decisionText(r, entry) {
+  const m = DECISION_REF.exec(String(entry));
+  if (!m) return String(entry);
+  const t = (r.decisionTexts || {})[m[1]];
+  return t === undefined ? '(a decision whose text is missing from the record — run rebuild)' : t;
+}
+function decisionsOf(r, t) { return (t.decisions || []).map((d) => decisionText(r, d)); }
+
 function briefSha(t, r) {
   // exactly the fields the brief's text is built from — no more (a notes-only
   // change must not cry stale) and no less (a new orchestrator address must)
   return crypto.createHash('sha256').update(JSON.stringify({
     key: t.key, title: t.title, plan: t.plan, needs: t.needs, owns: t.owns,
     serialises: t.serialises || [], context: t.context, verify: t.verify,
-    decisions: t.decisions, branch: t.branch, orchestrator: (r && r.orchestrator) || '',
+    decisions: r ? decisionsOf(r, t) : t.decisions, branch: t.branch, orchestrator: (r && r.orchestrator) || '',
   })).digest('hex').slice(0, 12);
 }
 
@@ -1046,13 +1071,16 @@ function cmdTaskAdd() {
     if (at >= 0) {
       const t = tasks(r)[at];
       const touched = [];
-      for (const k of TASK_FIELDS) if (it[k] !== undefined) { t[k] = it[k]; touched.push(k); }
+      for (const k of TASK_FIELDS) if (it[k] !== undefined) {
+        t[k] = k === 'decisions' ? it[k].map((d) => internDecision(r, d)) : it[k];
+        touched.push(k);
+      }
       said.push('updated ' + it.key + ': ' + (touched.join(', ') || '(nothing — no known field was sent)') + tail);
     } else {
       tasks(r).push({
         key: it.key, title: it.title, plan: it.plan || '', needs: it.needs || [],
         owns: it.owns, serialises: it.serialises || [], context: it.context || [],
-        verify: it.verify || [], decisions: it.decisions || [], notes: it.notes || '',
+        verify: it.verify || [], decisions: (it.decisions || []).map((d) => internDecision(r, d)), notes: it.notes || '',
         branch: it.branch || ('step/' + it.key), worktree: '', chip: '',
         status: 'planned', reports: [],
       });
@@ -1299,9 +1327,10 @@ function cmdBrief(key, flags) {
     B.push('');
   }
   if ((t.decisions || []).length) {
+    // resolved here — an agent must never be handed a reference it cannot read
     B.push('**Already settled with the author. Do not reopen, do not improve on:**');
     B.push('');
-    for (const d of t.decisions) B.push('- ' + d);
+    for (const d of decisionsOf(r, t)) B.push('- ' + d);
     B.push('');
   }
   B.push('**Build on what is already there. These exist — read them before you write anything that');

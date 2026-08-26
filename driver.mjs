@@ -2582,6 +2582,25 @@ function keyIn(text, keys) {
   return '';
 }
 
+// Everything outside the tags is Claude Code's own wrapper — the "Another
+// Claude session sent a message:" line before it, the standing instructions
+// after it — and none of it was written by the peer. Taking only what is
+// BETWEEN them keeps their words and nothing else. It also stops the wrapper
+// from spending the character budget, which is the part that was losing data:
+// reports are the longest messages in a run, and on the live ledger 83 of 102
+// recovered messages were being cut off at the cap.
+function innerMessage(text) {
+  const m = text.match(/<cross-session-message[^>]*>([\s\S]*?)<\/cross-session-message>/);
+  if (m) return m[1].trim();
+  // No closing tag: a truncated transcript line. Keep what follows the opening
+  // tag rather than dropping the message — some of it beats none of it.
+  return text.replace(/^[\s\S]*?<cross-session-message[^>]*>/, '')
+             .replace(/^Another Claude session sent a message:\s*/, '').trim();
+}
+// An agent's report is the substance of the run, not chatter. The old 2000 was
+// cutting the conclusion off the end of most of them.
+const MSG_CAP = 4000;
+
 function harvest(dir, keys) {
   const out = [];
   const seen = { files: 0, lines: 0, candidates: 0, parsed: 0, wrongCwd: 0 };
@@ -2600,15 +2619,15 @@ function harvest(dir, keys) {
         const text = textOf(j.message);
         const env = text.match(/<cross-session-message[^>]*from-name="([^"]+)"/);
         if (!env) continue;
-        const body = text.replace(/<cross-session-message[^>]*>/, '').replace(/<\/cross-session-message>/, '').trim();
+        const body = innerMessage(text);
         out.push({ at: j.timestamp, dir: 'in', kind: 'derived', agent: env[1],
-                   key: keyIn(body, keys), text: body.slice(0, 2000), uuid: j.uuid, session: j.sessionId });
+                   key: keyIn(body, keys), text: body.slice(0, MSG_CAP), uuid: j.uuid, session: j.sessionId });
       } else if (j.type === 'assistant' && Array.isArray(j.message && j.message.content)) {
         for (const b of j.message.content) {
           if (!b || b.type !== 'tool_use' || b.name !== 'SendMessage' || !b.input) continue;
           const body = String(b.input.message || '');
           out.push({ at: j.timestamp, dir: 'out', kind: 'derived', agent: String(b.input.to || ''),
-                     key: keyIn(body, keys), text: body.slice(0, 2000), uuid: b.id || j.uuid, session: j.sessionId,
+                     key: keyIn(body, keys), text: body.slice(0, MSG_CAP), uuid: b.id || j.uuid, session: j.sessionId,
                      summary: b.input.summary || '' });
         }
       }
@@ -2648,10 +2667,41 @@ function cmdIngest(flags) {
   const fresh = found.filter((e) => e.uuid && !have.has(e.uuid))
                      .sort((a, b) => String(a.at).localeCompare(String(b.at)));
   for (const e of fresh) append(e);
+  // Entries recovered before the wrapper was being stripped still carry it, and
+  // several were cut short by it. They are derived, so they can simply be
+  // derived again — the transcript is still the source. Only the text of
+  // entries harvest can still see is touched; anything typed by hand, and
+  // anything whose transcript has aged out, is left exactly as it is.
+  let recleaned = null;
+  if (flags.reclean) {
+    const byUuid = new Map(found.map((e) => [e.uuid, e]));
+    const cur = ledger();
+    let fixed = 0, gained = 0;
+    for (const e of cur) {
+      const f = e.uuid && byUuid.get(e.uuid);
+      if (!f || typeof f.text !== 'string' || f.text === e.text) continue;
+      gained += f.text.length - String(e.text || '').length;
+      e.text = f.text; if (!e.key && f.key) e.key = f.key;
+      fixed++;
+    }
+    if (fixed) {
+      fs.copyFileSync(ledgerPath(), ledgerPath() + '.bak');
+      fs.writeFileSync(ledgerPath(), cur.map((e) => JSON.stringify(e)).join('\n') + '\n');
+    }
+    recleaned = { fixed, gained };
+  }
   console.log('read ' + rel(dir) + '  (' + seen.files + ' transcript(s), ' + seen.candidates + ' candidate line(s))');
   console.log('  ' + found.length + ' message(s) in the transcripts, ' + fresh.length + ' new to the ledger.');
   const named = fresh.filter((e) => e.key).length;
   console.log('  ' + named + ' name a task; ' + (fresh.length - named) + ' do not (still logged, just unattributed).');
+  if (recleaned) {
+    console.log('  re-derived ' + recleaned.fixed + ' entr(ies) already in the ledger' +
+      (recleaned.fixed ? ': ' + (recleaned.gained >= 0 ? '+' : '') + recleaned.gained +
+        ' chars of message text recovered, previous file kept as messages.jsonl.bak' : ' — nothing to repair'));
+  } else if (ledger().some((e) => /^Another Claude session sent a message:/.test(String(e.text || '')))) {
+    console.log('\nSome entries still carry the wrapper Claude Code puts around a message, and were');
+    console.log('cut short by it. They can be derived again: `ingest --reclean`.');
+  }
   if (fresh.length) {
     const ins = fresh.filter((e) => e.dir === 'in').length;
     console.log('  ' + ins + ' inbound, ' + (fresh.length - ins) + ' outbound.');
@@ -2972,6 +3022,8 @@ driving the work out, after the grill:
   heard <key> --kind k --text t   log what arrived (checkin|report|question|blocked|note).
   ingest [--from dir]       rebuild the ledger from the on-disk transcripts — both directions,
                             retroactively, including messages a compaction already took.
+         [--reclean]        also re-derive entries already in the ledger, for ones recovered
+                            before the message wrapper was being stripped off.
   outstanding               who is waiting on you, and since when.
   verify                    replay the record and prove it still equals the register. Exits 1 on drift.
   rebuild [--to seq]        rewrite the register from the record. Total recovery from a lost register.

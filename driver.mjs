@@ -2100,33 +2100,97 @@ function cmdOwed(sub, rest, flags) {
 function slotLockPath(name) {
   const d = path.join(path.dirname(REG_PATH), 'slots');
   fs.mkdirSync(d, { recursive: true });
+  // A steal that is killed between the rename and the delete leaves the carried-off
+  // claim behind. It holds nothing and nothing reads it, so sweep the old ones.
+  try {
+    for (const f of fs.readdirSync(d)) {
+      if (!f.includes('.evicted.')) continue;
+      const p = path.join(d, f);
+      if (Date.now() - fs.statSync(p).mtimeMs > 600000) fs.rmSync(p, { recursive: true, force: true });
+    }
+  } catch { /* best effort */ }
   return path.join(d, slug(name) + '.lock');
 }
 function slotHolder(lock) {
   try { return JSON.parse(fs.readFileSync(path.join(lock, 'holder.json'), 'utf8')); } catch { return null; }
 }
-function slotTryTake(name, task) {
+// Every claim carries a token nobody else can guess. It is what makes "free this
+// slot" mean "free the claim I took" rather than "delete whatever is at that path"
+// — the difference between a process tidying up after itself and an evicted one
+// wiping out the run that replaced it.
+function slotToken() {
+  return crypto.randomBytes(9).toString('hex') + '-' + process.pid;
+}
+// `manual` marks a claim taken by `slot take`, where the process that wrote the
+// claim exits immediately by design. Judging such a claim by whether its pid is
+// still alive declares it dead a moment after it is made, which is no exclusion
+// at all — so a manual take records no pid to check and lives on the time limit.
+function slotTryTake(name, task, { manual = false } = {}) {
   const lock = slotLockPath(name);
   try { fs.mkdirSync(lock, { recursive: false }); } catch { return null; }
-  fs.writeFileSync(path.join(lock, 'holder.json'), JSON.stringify({
-    pid: process.pid, host: os.hostname(), task: task || '', since: now(),
-  }, null, 2) + '\n');
-  return lock;
+  const claim = {
+    token: slotToken(), manual: !!manual, pid: manual ? null : process.pid,
+    host: os.hostname(), task: task || '', since: now(),
+  };
+  // Written by rename so a waiter never reads a half-written claim and mistakes
+  // it for the "holder unknown" leftover case.
+  const tmp = path.join(lock, 'holder.json.tmp');
+  fs.writeFileSync(tmp, JSON.stringify(claim, null, 2) + '\n');
+  fs.renameSync(tmp, path.join(lock, 'holder.json'));
+  return { lock, token: claim.token };
 }
+// Never steal from a holder we can prove is alive. A suite that legitimately runs
+// past the time limit is still running: taking its slot away starts a second one
+// beside it, which is the crash this whole mechanism exists to prevent. So the
+// liveness question is asked FIRST, and the time limit applies only to a holder
+// whose liveness cannot be established — a different host, or no pid to check.
 function slotIsStale(lock, staleMs) {
   const h = slotHolder(lock);
   if (!h) { try { return Date.now() - fs.statSync(lock).mtimeMs > 10000; } catch { return false; } }
-  if (Date.now() - Date.parse(h.since || 0) > staleMs) return true;
-  if (h.host === os.hostname() && h.pid) {
+  if (h.pid && h.host === os.hostname()) {
     try { process.kill(h.pid, 0); return false; } catch (e) { return e.code === 'ESRCH'; }
+    // EPERM means the process is there and owned by someone else: alive, not ours to judge.
   }
-  return false;
+  return Date.now() - Date.parse(h.since || 0) > staleMs;
+}
+// Take a stale claim away by renaming the whole lock directory out of the path.
+// Rename is atomic and only one racer can win it, so two waiters cannot both
+// conclude they evicted the holder and both proceed — which check-then-rmSync let
+// them do. The token we judged is checked against what we actually carried off;
+// if a fresh claim slipped in between the judgement and the rename, it is put
+// straight back and we go on waiting.
+function slotSteal(lock, judgedToken) {
+  const carried = lock + '.evicted.' + process.pid + '.' + Date.now();
+  try { fs.renameSync(lock, carried); } catch { return false; }   // someone else got there first
+  const got = slotHolder(carried);
+  if (got && judgedToken && got.token !== judgedToken) {
+    try {                                       // not the claim we judged — hand it back
+      fs.mkdirSync(lock, { recursive: false });
+      fs.renameSync(path.join(carried, 'holder.json'), path.join(lock, 'holder.json'));
+      fs.rmSync(carried, { recursive: true, force: true });
+      return false;
+    } catch {
+      console.error('slot: a claim changed hands mid-eviction and could not be restored.');
+    }
+  }
+  fs.rmSync(carried, { recursive: true, force: true });
+  return true;
+}
+// Free only what we hold. `expect` is the token from our own take; if the claim
+// sitting there now is somebody else's, we were evicted long ago and deleting it
+// would drop a live run's protection on the floor.
+function slotDrop(lock, expect) {
+  const h = slotHolder(lock);
+  if (expect && h && h.token && h.token !== expect) return false;
+  try { fs.rmSync(lock, { recursive: true, force: true }); } catch { /* already gone */ }
+  return true;
 }
 function describeHolder(lock) {
   const h = slotHolder(lock);
   if (!h) return 'held (holder unknown — claim being written, or leftover)';
   const mins = Math.round((Date.now() - Date.parse(h.since || 0)) / 60000);
-  return 'held by ' + (h.task || 'pid ' + h.pid) + ' on ' + h.host + ' for ' + mins + ' min';
+  return 'held by ' + (h.task || (h.pid ? 'pid ' + h.pid : 'a manual take')) + ' on ' + h.host +
+         ' for ' + mins + ' min' + (h.manual ? ' (taken by hand)' : '');
 }
 
 // The command after `--` is handed to bash, so every word has to be quoted or a
@@ -2156,7 +2220,7 @@ function bashCommandLine(raw) {
 function cmdSlot(sub, rest, flags, raw) {
   const name = rest[0] || 'ci';
   const lock = slotLockPath(name);
-  const staleMs = (Number(flags.stale) > 0 ? Number(flags.stale) : 30) * 60000;
+  const staleMs = (numFlag(flags, 'stale', { min: 1, what: 'a whole number of minutes' }) ?? 30) * 60000;
 
   if (sub === 'status') {
     const d = path.dirname(lock);
@@ -2167,17 +2231,27 @@ function cmdSlot(sub, rest, flags, raw) {
   }
   if (sub === 'free') {
     if (!fs.existsSync(lock)) return console.log(name + ' is already free.');
-    if (!flags.force && !slotIsStale(lock, staleMs))
+    const held = slotHolder(lock);
+    // The `--force` guard exists for one case: a `slot run` holder with a live
+    // command inside it. A claim taken by hand has no run inside it — the process
+    // that took it exited on purpose — so freeing one plainly is the normal path
+    // and does not need the flag whose refusal is the load-bearing part.
+    const byHand = !!(held && held.manual);
+    if (!flags.force && !byHand && !slotIsStale(lock, staleMs))
       die(name + ' is ' + describeHolder(lock) + " — its run may be inside it right now.\n" +
           '       Freeing under a live run causes the exact crash the slot exists to stop.\n' +
           '       If you are certain the holder is gone: slot free ' + name + ' --force');
-    fs.rmSync(lock, { recursive: true, force: true });
+    // Drop the claim we just looked at, not whatever happens to be at that path by
+    // the time the rm runs — otherwise a slow decision deletes somebody's fresh run.
+    if (!slotDrop(lock, held && held.token))
+      return console.log(name + ' changed hands while we looked — it is now ' + describeHolder(lock) + ', left alone.');
     console.log(name + ' freed.');
     return;
   }
   if (sub === 'take') {
-    const got = slotTryTake(name, flags.task);
-    if (got) return console.log(name + ' taken. You MUST free it when done: slot free ' + name + ' --force');
+    const got = slotTryTake(name, flags.task, { manual: true });
+    if (got) return console.log(name + ' taken. Free it the moment you are done: slot free ' + name +
+      '\n(--force is only for a slot whose holder you know is gone — do not reach for it by habit.)');
     die(name + ' is ' + describeHolder(lock) + '. Prefer `slot run` — it frees itself.');
   }
   if (sub === 'wait' || sub === 'run') {
@@ -2189,9 +2263,11 @@ function cmdSlot(sub, rest, flags, raw) {
     for (;;) {
       mine = slotTryTake(name, flags.task);
       if (mine) break;
+      const held = slotHolder(lock);
       if (slotIsStale(lock, staleMs)) {
-        console.error('slot ' + name + ': holder is dead or over the ' + Math.round(staleMs / 60000) + ' min limit — taking over.');
-        fs.rmSync(lock, { recursive: true, force: true });
+        if (slotSteal(lock, held && held.token))
+          console.error('slot ' + name + ': holder is gone, or unreachable and over the ' +
+                        Math.round(staleMs / 60000) + ' min limit — taking over.');
         continue;
       }
       if (Date.now() - t0 > timeoutMs)
@@ -2201,7 +2277,9 @@ function cmdSlot(sub, rest, flags, raw) {
       // ~10s with jitter, so a crowd of waiters does not stampede the same instant
       try { execSync('sleep ' + (8 + Math.floor(Math.random() * 5))); } catch { /* keep waiting */ }
     }
-    const free = () => { try { fs.rmSync(mine, { recursive: true, force: true }); } catch { /* gone */ } };
+    // Free our own claim by its token. If we were evicted while the suite ran, the
+    // lock now belongs to whoever replaced us and is not ours to delete.
+    const free = () => { try { slotDrop(mine.lock, mine.token); } catch { /* gone */ } };
     if (sub === 'wait') { free(); return console.log(name + ' became free.'); }
     process.on('exit', free);
     for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(sig, () => { free(); process.exit(130); });

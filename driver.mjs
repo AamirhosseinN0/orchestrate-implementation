@@ -2802,9 +2802,52 @@ function innerMessage(text) {
 // cutting the conclusion off the end of most of them.
 const MSG_CAP = 4000;
 
+// A cut message used to be stored as `body.slice(0, MSG_CAP)` and nothing else
+// — no ellipsis, no flag, no original length — so 33 of 311 entries on the real
+// ledger ended mid-sentence and were read afterwards as complete statements.
+// The mark is in the text where a reader will see it, and the two fields say
+// exactly how much is missing so a total can be trusted.
+function capped(body) {
+  const s = String(body);
+  if (s.length <= MSG_CAP) return { text: s };
+  return { text: s.slice(0, MSG_CAP) + '\n\n… [cut at ' + MSG_CAP + ' of ' + s.length + ' characters]',
+           truncated: true, fullLength: s.length };
+}
+
+// The peer that sent a message, off the opening tag. Claude Code writes two
+// wrapper shapes and only one of them carries from-name:
+//
+//   <cross-session-message from="uds:/…/1234.sock" from-name="lms-v2-3d" …>
+//   <cross-session-message from="local_<uuid>" name="<title>" encoded="1">
+//
+// The second is what it emits when the peer channel is gone and the transcript
+// is the only surviving copy of the message — which is precisely the case
+// `ingest` exists for. Requiring from-name counted those lines as candidates
+// and then dropped them in silence, so `ingest` reported success having lost
+// them; on the real run that was 3 complete task reports, about 14.6 KB. Here
+// the name is taken from whichever attribute carries one, and `name` is kept
+// separately because on that shape it is the message's title, not the sender.
+function senderOf(openTag) {
+  const attr = (n) => { const m = openTag.match(new RegExp('\\b' + n + '="([^"]*)"')); return m ? m[1] : ''; };
+  const fromName = attr('from-name');
+  const from = attr('from');
+  return { agent: fromName || from, subject: fromName ? '' : attr('name') };
+}
+
+// Whether a transcript line was written from this run. An exact string match
+// dropped every line whose cwd was a subdirectory — and the orchestrator
+// routinely works from apps/api and the like — which on the real run cost 13
+// outbound "released, rebase now" messages, exactly the ones `waitingOn` reads
+// to decide a question has been answered.
+function underCwd(cwd) {
+  if (!cwd) return true;
+  const a = path.resolve(cwd), b = path.resolve(CWD);
+  return a === b || a.startsWith(b + path.sep);
+}
+
 function harvest(dir, keys) {
   const out = [];
-  const seen = { files: 0, lines: 0, candidates: 0, parsed: 0, wrongCwd: 0 };
+  const seen = { files: 0, lines: 0, candidates: 0, parsed: 0, wrongCwd: 0, underCwd: 0 };
   for (const f of fs.readdirSync(dir).filter((x) => x.endsWith('.jsonl'))) {
     let lines;
     try { lines = fs.readFileSync(path.join(dir, f), 'utf8').split('\n'); } catch { continue; }
@@ -2814,21 +2857,22 @@ function harvest(dir, keys) {
       seen.candidates++;
       let j; try { j = JSON.parse(line); } catch { continue; }
       seen.parsed++;
-      if (j.cwd && j.cwd !== CWD) seen.wrongCwd++;
-      if (j.cwd && j.cwd !== CWD) continue;
+      if (j.cwd && j.cwd !== CWD) { if (underCwd(j.cwd)) seen.underCwd++; else { seen.wrongCwd++; continue; } }
       if (j.type === 'user') {
         const text = textOf(j.message);
-        const env = text.match(/<cross-session-message[^>]*from-name="([^"]+)"/);
-        if (!env) continue;
+        const open = text.match(/<cross-session-message[^>]*>/);
+        if (!open) continue;
+        const who = senderOf(open[0]);
         const body = innerMessage(text);
-        out.push({ at: j.timestamp, dir: 'in', kind: 'derived', agent: env[1],
-                   key: keyIn(body, keys), text: body.slice(0, MSG_CAP), uuid: j.uuid, session: j.sessionId });
+        out.push({ at: j.timestamp, dir: 'in', kind: 'derived', agent: who.agent,
+                   key: keyIn(body, keys), ...capped(body), uuid: j.uuid, session: j.sessionId,
+                   ...(who.subject ? { summary: who.subject } : {}) });
       } else if (j.type === 'assistant' && Array.isArray(j.message && j.message.content)) {
         for (const b of j.message.content) {
           if (!b || b.type !== 'tool_use' || b.name !== 'SendMessage' || !b.input) continue;
           const body = String(b.input.message || '');
           out.push({ at: j.timestamp, dir: 'out', kind: 'derived', agent: String(b.input.to || ''),
-                     key: keyIn(body, keys), text: body.slice(0, MSG_CAP), uuid: b.id || j.uuid, session: j.sessionId,
+                     key: keyIn(body, keys), ...capped(body), uuid: b.id || j.uuid, session: j.sessionId,
                      summary: b.input.summary || '' });
         }
       }
@@ -2886,28 +2930,47 @@ function cmdIngest(flags) {
   if (flags.reclean) {
     const byUuid = new Map(found.map((e) => [e.uuid, e]));
     const cur = ledger();
-    let fixed = 0, gained = 0;
+    let fixed = 0, gained = 0, marked = 0;
     for (const e of cur) {
       const f = e.uuid && byUuid.get(e.uuid);
-      if (!f || typeof f.text !== 'string' || f.text === e.text) continue;
-      gained += f.text.length - String(e.text || '').length;
+      if (!f || typeof f.text !== 'string') continue;
+      // An entry already at the cap cannot be lengthened — the transcript
+      // yields the same cut text — but it CAN stop passing itself off as
+      // whole. Carry the marks across whether or not the text changed, and
+      // count them apart from text actually recovered, so the "+n chars"
+      // figure never claims the cut-here note as content.
+      const wasCut = !!e.truncated;
+      if (f.truncated && !wasCut) { e.truncated = true; e.fullLength = f.fullLength; marked++; }
+      if (f.text === e.text) continue;
+      const before = String(e.text || '').length;
       e.text = f.text; if (!e.key && f.key) e.key = f.key;
+      gained += (f.truncated ? MSG_CAP : f.text.length) - (wasCut ? before : Math.min(before, MSG_CAP));
       fixed++;
     }
-    if (fixed) {
+    if (fixed || marked) {
       fs.copyFileSync(ledgerPath(), ledgerPath() + '.bak');
       fs.writeFileSync(ledgerPath(), cur.map((e) => JSON.stringify(e)).join('\n') + '\n');
     }
-    recleaned = { fixed, gained };
+    recleaned = { fixed, gained, marked };
   }
   console.log('read ' + rel(dir) + '  (' + seen.files + ' transcript(s), ' + seen.candidates + ' candidate line(s))');
+  if (seen.underCwd)
+    console.log('  ' + seen.underCwd + ' from a directory under this one (a worktree or a package) — kept.');
+  if (seen.wrongCwd)
+    console.log('  ' + seen.wrongCwd + ' line(s) belong to another project entirely — skipped.');
   console.log('  ' + found.length + ' message(s) in the transcripts, ' + fresh.length + ' new to the ledger.');
   const named = fresh.filter((e) => e.key).length;
   console.log('  ' + named + ' name a task; ' + (fresh.length - named) + ' do not (still logged, just unattributed).');
+  const cut = fresh.filter((e) => e.truncated).length;
+  if (cut) console.log('  ' + cut + ' were longer than ' + MSG_CAP + ' characters and are stored cut, and marked as cut.');
   if (recleaned) {
     console.log('  re-derived ' + recleaned.fixed + ' entr(ies) already in the ledger' +
       (recleaned.fixed ? ': ' + (recleaned.gained >= 0 ? '+' : '') + recleaned.gained +
         ' chars of message text recovered, previous file kept as messages.jsonl.bak' : ' — nothing to repair'));
+    if (recleaned.marked)
+      console.log('  ' + recleaned.marked + ' entr(ies) already at the cap could not be lengthened — the transcript');
+    if (recleaned.marked)
+      console.log('  holds the same cut text — but are now marked as cut, with their true length.');
   } else if (ledger().some((e) => /^Another Claude session sent a message:/.test(String(e.text || '')))) {
     console.log('\nSome entries still carry the wrapper Claude Code puts around a message, and were');
     console.log('cut short by it. They can be derived again: `ingest --reclean`.');

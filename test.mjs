@@ -106,6 +106,18 @@ function corpusBox(name) {
   for (const f of fs.readdirSync(CORPUS)) fs.copyFileSync(path.join(CORPUS, f), path.join(o, f));
   return d;
 }
+// Plants a lock with a named holder. A driver that steals locks it should not
+// can delete the directory between the mkdir and the write, and that is a
+// failing check below — not a reason for the whole sweep to fall over here.
+function holdLock(d, pid) {
+  const lock = path.join(d, '.claude/orchestration/register.json.lock');
+  try {
+    fs.mkdirSync(lock, { recursive: true });
+    fs.writeFileSync(path.join(lock, 'holder.json'),
+      JSON.stringify({ pid, host: os.hostname(), since: new Date().toISOString() }));
+  } catch { /* it was taken from under us; the check says so */ }
+  return lock;
+}
 // One transcript line in the shape Claude Code writes, for the cases that go in
 // through `ingest`.
 function transcript(cwd, body) {
@@ -266,13 +278,9 @@ say('a project with no register says so');
 say('the lock still holds against a live holder');
 {
   const d = box('lock');
-  const lock = path.join(d, '.claude/orchestration/register.json.lock');
-  fs.mkdirSync(lock, { recursive: true });
-  fs.writeFileSync(path.join(lock, 'holder.json'),
-    JSON.stringify({ pid: process.pid, host: os.hostname(), since: new Date().toISOString() }));
+  holdLock(d, process.pid);
   ok('a live holder is not robbed', drv(d, ['iam', 'x']).code !== 0);
-  fs.writeFileSync(path.join(lock, 'holder.json'),
-    JSON.stringify({ pid: 0x7ffffff, host: os.hostname(), since: new Date().toISOString() }));
+  holdLock(d, 0x7ffffff);
   ok('a dead holder is taken over', drv(d, ['iam', 'x']).code === 0);
 }
 
@@ -375,10 +383,7 @@ say('a lost record does not take the register with it');
 say('the commands that rewrite the record respect a lock somebody holds');
 {
   const d = box('reclock');
-  const lock = path.join(d, '.claude/orchestration/register.json.lock');
-  fs.mkdirSync(lock, { recursive: true });
-  fs.writeFileSync(path.join(lock, 'holder.json'),
-    JSON.stringify({ pid: process.pid, host: os.hostname(), since: new Date().toISOString() }));
+  const lock = holdLock(d, process.pid);
   ok('rebuild waits and then refuses', drv(d, ['rebuild']).code !== 0);
   ok('verify does too', drv(d, ['verify']).code !== 0);
   ok('and so does log reseed', drv(d, ['log', 'reseed', '--why', 'x']).code !== 0);

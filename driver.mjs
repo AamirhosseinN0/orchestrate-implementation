@@ -9,7 +9,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { execSync, spawnSync } from 'node:child_process';
+import { execSync, execFileSync, spawnSync } from 'node:child_process';
 import os from 'node:os';
 
 const CWD = process.cwd();
@@ -1152,6 +1152,26 @@ function overlap(t1, t2) {
   return out;
 }
 
+// A serialisation point is a shared invariant named in prose by whoever wrote
+// the task — "docker-compose.yml", "docker compose file", "Docker-Compose.yml".
+// Comparing those by exact string equality is a check that can only ever fire
+// when two authors typed the same characters, and on a real run it never fired
+// once: a pre-flight found a docker-compose.yml collision this reported clean.
+// Normalise before comparing; keep both spellings when reporting so the
+// mismatch is visible and can be tidied.
+function normPoint(s) { return String(s).trim().toLowerCase().replace(/\s+/g, ' '); }
+function sharedPoints(t1, t2) {
+  const theirs = new Map();
+  for (const y of t2.serialises || []) theirs.set(normPoint(y), y);
+  const out = [];
+  for (const x of t1.serialises || []) {
+    const y = theirs.get(normPoint(x));
+    if (y === undefined) continue;
+    out.push(y === x ? x : x + ' ≈ ' + y);
+  }
+  return out;
+}
+
 function waves(r) {
   const ts = tasks(r).filter((t) => t.status !== 'cancelled');
   const placed = new Map(); const out = [];
@@ -1210,7 +1230,32 @@ function cmdTaskAdd() {
     const probs = taskProblems(it, at < 0);
     const label = 'item ' + (i + 1) + (it && it.key ? ' ("' + it.key + '")' : '');
     if (probs.length) { for (const x of probs) errs.push(label + ' ' + x); continue; }
-    plans.push({ it, at });
+    plans.push({ it, at, label });
+  }
+  // "two tasks may not touch one file" was asserted in the message above and
+  // then never checked against another task. A path claimed twice is the one
+  // failure this whole arrangement exists to prevent, so a NEW task claiming a
+  // path some still-open task already owns is refused here, at the only moment
+  // it is cheap to fix. Existing state is not re-judged — `doctor` reports that
+  // — because a register with the collision already in it must stay usable.
+  const contender = (t) => !['landed', 'cancelled'].includes(t.status);
+  for (let n = 0; n < plans.length; n++) {
+    const { it, at, label } = plans[n];
+    if (at >= 0) continue;                       // an update, not a new claim
+    for (const own of it.owns || []) {
+      const clashes = [];
+      for (const other of tasks(r)) {
+        if (other.key === it.key || !contender(other)) continue;
+        for (const b of other.owns || []) if (collides(own, b)) clashes.push(other.key + ' owns ' + b);
+      }
+      for (let m = 0; m < plans.length; m++) {
+        if (m === n || plans[m].it.key === it.key) continue;
+        for (const b of plans[m].it.owns || []) if (collides(own, b)) clashes.push(plans[m].it.key + ' (same batch) owns ' + b);
+      }
+      if (clashes.length)
+        errs.push(label + ' claims ' + own + ', which is already owned: ' + [...new Set(clashes)].join('; ') +
+          ' — two tasks may not touch one file. Narrow one of them, or make one wait for the other and split the file.');
+    }
   }
   if (errs.length) die('nothing was saved:\n       ' + errs.join('\n       '));
   const said = [];
@@ -1244,7 +1289,8 @@ function cmdTaskAdd() {
 function cmdGraph() {
   const r = readReg(); const ws = waves(r);
   if (!ws.length) die('no tasks yet');
-  let bad = 0;
+  let bad = 0, pairs = 0, skipped = 0;
+  const history = [];
   const lines = [];
   lines.push('## The work, and what can run side by side');
   lines.push('');
@@ -1277,7 +1323,16 @@ function cmdGraph() {
     // is merged work, not a contender, so it collides with nobody
     for (let i = 0; i < w.tasks.length; i++) for (let j = i + 1; j < w.tasks.length; j++) {
       const a = w.tasks[i], b = w.tasks[j];
-      if (a.status === 'landed' || b.status === 'landed') continue;
+      if (a.status === 'landed' || b.status === 'landed') {
+        // Still worth naming: the pair is not a gating decision, but "these two
+        // did share a file" is exactly the thing somebody reads this to find out.
+        skipped++;
+        const o = overlap(a, b), s = sharedPoints(a, b);
+        if (o.length) history.push('Round ' + (w.wave + 1) + ': ' + a.key + ' ↔ ' + b.key + ' share ' + o.join('; '));
+        if (s.length) history.push('Round ' + (w.wave + 1) + ': ' + a.key + ' ↔ ' + b.key + ' share serialisation point ' + s.join(', '));
+        continue;
+      }
+      pairs++;
       const o = overlap(a, b);
       if (o.length) {
         bad++;
@@ -1287,7 +1342,7 @@ function cmdGraph() {
       // A shared file is the easy case. A shared invariant — a migration chain
       // head, a lockfile, a closed list some test asserts exact equality over —
       // collides in CI with zero file overlap.
-      const shared = (a.serialises || []).filter((x) => (b.serialises || []).includes(x));
+      const shared = sharedPoints(a, b);
       if (shared.length) {
         bad++;
         lines.push('  ⚠ **' + a.key + '** and **' + b.key + '** both move the same serialisation point: ' + shared.join(', '));
@@ -1321,8 +1376,22 @@ function cmdGraph() {
     }
   }
   console.log(lines.join('\n'));
-  if (bad) { console.error('\n' + bad + ' problem(s) — fix the plan before creating any chip.'); process.exit(1); }
-  console.log('\nNothing clashes. Every round above can run side by side.');
+  // The all-clear used to be "Nothing clashes. Every round above can run side by
+  // side." — an absolute sentence about a check that is anything but. Pairs
+  // where either side has landed are skipped on purpose (merged work is not a
+  // contender), so the same register says "nothing clashes" today and would
+  // have said "these two collide" yesterday. Say what was actually looked at.
+  if (history.length) {
+    console.log('\nAlready merged, so not a gate — but it is what happened:');
+    for (const h of history) console.log('  · ' + h);
+  }
+  const scope = pairs + ' pair(s) of tasks that could still collide were checked for shared files\n' +
+    'and shared serialisation points' +
+    (skipped ? ('; ' + skipped + ' pair(s) were skipped because one side has already landed.') : '.');
+  if (bad) { console.error('\n' + bad + ' problem(s) — fix the plan before creating any chip.\n' + scope); process.exit(1); }
+  console.log('\n✓ ' + scope);
+  console.log('Nothing among them clashes, so every round above can run side by side.');
+  if (skipped) console.log('That is not a statement about the run as a whole — a landed task is not re-judged.');
 }
 
 
@@ -1333,11 +1402,18 @@ function cmdGraph() {
 // actually breaks parallel work.
 function interference(t, other) {
   const files = overlap(t, other);
-  const points = (t.serialises || []).filter((x) => (other.serialises || []).includes(x));
+  const points = sharedPoints(t, other);
   return files.length || points.length ? { files, points } : null;
 }
+// A task is open — its files are in somebody's hands — from the moment it is
+// handed out until it lands. This used to be keyed off `x.chip`, the chip id,
+// which is bookkeeping and which the documented invocation never passes. The
+// effect was that every gate reading this went dark: `frontier` saw nothing
+// open, `chip` refused nothing, and two tasks owning one file both went ready
+// with no complaint. Status is what actually says whether work is out there.
+const OPEN_STATUSES = ['held', 'ready', 'reported'];
 function openTasks(r, except) {
-  return tasks(r).filter((x) => x.key !== except && x.chip && !['landed', 'cancelled'].includes(x.status));
+  return tasks(r).filter((x) => x.key !== except && OPEN_STATUSES.includes(x.status));
 }
 
 
@@ -1428,11 +1504,40 @@ function cmdBundle(sub, rest, flags) {
   host.decisions = uniq(members.flatMap((m) => m.decisions || []));
   host.context = uniq(members.flatMap((m) => (m.context || []).map((c) => JSON.stringify(c)))).map((x) => JSON.parse(x));
   host.needs = uniq(members.flatMap((m) => m.needs || []).filter((n) => !keys.includes(n)));
-  host.bundled = uniq([...(host.bundled || []), ...members.map((m) => ({ key: m.key, title: m.title }))
-    .filter((x) => x.key !== into).map((x) => JSON.stringify(x))]).map((x) => JSON.parse(x));
+  // Bundling twice into the same host used to throw SyntaxError out of the
+  // driver: the entries already on `host.bundled` are objects, and they were fed
+  // to JSON.parse alongside the freshly stringified new ones.
+  host.bundled = uniq([...(host.bundled || []), ...others.map((m) => ({ key: m.key, title: m.title }))]
+    .map((x) => JSON.stringify(x))).map((x) => JSON.parse(x));
   host.title = host.title + ' (+ ' + others.map((m) => m.key).join(', ') + ')';
   // the absorbed tasks are cancelled, not deleted — the record keeps them
   for (const m of others) { m.status = 'cancelled'; m.bundledInto = into; }
+  // A member's key still appears in OTHER tasks' `needs`, and nothing used to
+  // repoint them. `waves` drops a cancelled task, so a dependent was never
+  // placed and `graph` exited 1 for ever; `heldNeeds` reads a cancelled dep as
+  // not-landed, so its chip could never open. The work did not disappear — it
+  // moved to the host — so the dependency moves with it.
+  const absorbed = new Set(others.map((m) => m.key));
+  const repointed = [];
+  for (const t of tasks(r)) {
+    if (absorbed.has(t.key) || !(t.needs || []).some((n) => absorbed.has(n))) continue;
+    t.needs = uniq(t.needs.map((n) => (absorbed.has(n) ? into : n))).filter((n) => n !== t.key);
+    repointed.push(t.key);
+  }
+  // A pre-flight gap belongs to the files, not to the key that happened to own
+  // them. Left behind on a cancelled member it stops being read, and `preflight
+  // check` — which skips cancelled tasks — flipped from red to green because
+  // the work was renamed rather than done.
+  const pfs = members.map((m) => m.preflight).filter(Boolean);
+  const neverFlown = members.filter((m) => !m.preflight).map((m) => m.key);
+  if (pfs.length) {
+    host.preflight = {
+      at: now(),
+      missing: uniq(pfs.flatMap((p) => p.missing || []).map((x) => JSON.stringify(x))).map((x) => JSON.parse(x)),
+      verify: uniq(pfs.flatMap((p) => p.verify || []).map((x) => JSON.stringify(x))).map((x) => JSON.parse(x)),
+      notes: pfs.map((p) => p.notes).filter(Boolean).join('\n'),
+    };
+  }
   // Everything else about a member moved to the host; its open problems and its
   // owed items have to move too, or they stay filed against a key nobody is
   // building. The brief is written from the host's record, so an unmoved defect
@@ -1452,6 +1557,14 @@ function cmdBundle(sub, rest, flags) {
   console.log('  ' + others.length + ' task(s) marked cancelled and recorded as absorbed — nothing was deleted.');
   if (moved.defects.length) console.log('  moved to ' + into + ': open defect(s) ' + moved.defects.join(' ') + ' — they are that agent\'s to fix now.');
   if (moved.owed.length) console.log('  moved to ' + into + ': owed item(s) ' + moved.owed.join(' ') + ' — put them in the brief.');
+  if (repointed.length) console.log('  repointed at ' + into + ': ' + repointed.join(', ') +
+    ' waited on an absorbed key. Without this they wait for ever on a cancelled task.');
+  const openGaps = (host.preflight?.missing || []).filter((m) => m.loadBearing &&
+    !(host.owns || []).some((o) => coveredBy(o, m.path)));
+  if (pfs.length) console.log('  carried across: ' + (host.preflight.missing || []).length +
+    ' pre-flight gap(s)' + (openGaps.length ? ', ' + openGaps.length + ' of them load-bearing and still outside `owns`' : ''));
+  if (neverFlown.length) console.log('  ⚠ never pre-flighted: ' + neverFlown.join(', ') +
+    ' — the host now owns their files on nobody\'s word. Run `preflight brief ' + into + '`.');
   console.log('\nRe-run `graph` and `preflight brief ' + into + '` — the brief now covers all of it.');
 }
 
@@ -1896,7 +2009,10 @@ function cmdPreflightCheck(flags) {
   if (n === undefined) {
     // the round you are about to open: first one holding a task with no chip yet
     const ws = waves(r).filter((w) => w.wave >= 0);
-    const cand = ws.find((w) => w.tasks.some((t) => !t.chip && !['landed', 'cancelled'].includes(t.status)));
+    // "not handed out yet" is a status, not the presence of a chip id — the id
+    // is optional bookkeeping, and reading it here picked the wrong round
+    // whenever one had not been passed.
+    const cand = ws.find((w) => w.tasks.some((t) => t.status === 'planned'));
     n = cand ? cand.wave : currentWave(r);
   }
   const st = waveState(r, n);
@@ -2016,6 +2132,48 @@ function cmdDoctor() {
     bad++;
     console.log('✗ ' + t.key);
     for (const x of probs) console.log('    ' + x);
+  }
+  // `task add` refuses a new claim on a path some other open task already owns.
+  // Nothing ever looked at what was already on record, and on a real run 52 of
+  // 203 owned paths turned out to be claimed twice, one of them seven times.
+  // This is the only place that says so.
+  const open = tasks(r).filter((t) => !['landed', 'cancelled'].includes(t.status));
+  const dup = [];
+  for (let i = 0; i < open.length; i++) for (let j = i + 1; j < open.length; j++) {
+    const o = overlap(open[i], open[j]);
+    if (o.length) dup.push(open[i].key + ' ↔ ' + open[j].key + '   ' + o.join('; '));
+  }
+  if (dup.length) {
+    bad += dup.length;
+    console.log('✗ ' + dup.length + ' pair(s) of open tasks claim the same path:');
+    for (const x of dup.slice(0, 40)) console.log('    ' + x);
+    if (dup.length > 40) console.log('    … and ' + (dup.length - 40) + ' more.');
+    console.log('    Ownership is the rule everything else rests on. Narrow one side of each pair,');
+    console.log('    or make one wait for the other — they cannot both be handed out.');
+  }
+  // Duplicates where one side has already merged are history, not a gate — but
+  // the count says how often the rule was broken while nothing was checking.
+  const everything = tasks(r).filter((t) => t.status !== 'cancelled');
+  let past = 0;
+  for (let i = 0; i < everything.length; i++) for (let j = i + 1; j < everything.length; j++)
+    if ((everything[i].status === 'landed' || everything[j].status === 'landed') &&
+        overlap(everything[i], everything[j]).length) past++;
+  if (past) console.log('· ' + past + ' further pair(s) share a path with work that has already landed — history, not a gate.');
+  // A serialisation point is a claim about something two tasks share. One named
+  // by a single task is either a typo for somebody else's spelling, or a note
+  // that gates nothing — and it reads, wrongly, like a live constraint.
+  const byPoint = new Map();
+  for (const t of open) for (const s of t.serialises || []) {
+    const e = byPoint.get(normPoint(s)) || { keys: new Set(), spellings: new Set() };
+    e.keys.add(t.key); e.spellings.add(s);
+    byPoint.set(normPoint(s), e);
+  }
+  const lone = [...byPoint.entries()].filter(([, e]) => e.keys.size === 1);
+  if (lone.length) {
+    console.log('· ' + lone.length + ' serialisation point(s) only one task names:');
+    for (const [, e] of lone) console.log('    ' + [...e.spellings][0] + '   (' + [...e.keys][0] + ' alone)');
+    console.log('    A point nobody else claims gates nothing. Either another task should be naming');
+    console.log('    it — check the spelling against theirs — or it does not belong in `serialises`.');
   }
   // An owed item outlives the task it was assigned to, and nothing else looks.
   const shut = allShutWindows(r);
@@ -2143,7 +2301,14 @@ function cmdOwed(sub, rest, flags) {
   } else if (sub === 'assign') {
     const o = owedList(r).find((x) => x.id === rest[0]); if (!o) die('no owed item ' + rest[0]);
     if (!flags.to) die('need --to <task key>');
-    getTask(r, flags.to); o.to = flags.to; commit(r);
+    // Assigning to work that is over is how an item is lost while looking
+    // settled: `owed list` shows it SHUT again the moment it is written, and the
+    // advice printed here — put it in that task's brief — cannot be followed.
+    const carrier = getTask(r, flags.to);
+    if (['landed', 'cancelled'].includes(carrier.status))
+      die(flags.to + ' is ' + carrier.status + ' — its window is already shut, so it cannot carry ' +
+        o.id + '.\n       Assign it to work that is still open (`frontier` says which), or settle it: owed done ' + o.id);
+    o.to = flags.to; commit(r);
     console.log(o.id + ' → ' + flags.to + '. Put it in that task\'s brief — an assignment the agent never sees is not one.');
   } else if (sub === 'done') {
     const o = owedList(r).find((x) => x.id === rest[0]); if (!o) die('no owed item ' + rest[0]);
@@ -2464,6 +2629,12 @@ function cmdChip(key, flags) {
   if (['landed', 'reported', 'cancelled'].includes(t.status))
     die(key + ' is ' + t.status + ' — a chip cannot rewind it. If this is really meant to run again, that is a new task.');
   if (!t.chip) {
+    // The record has to be able to say which chip is which — without it there is
+    // no way back from a key to the thing actually running the work.
+    if (!flags.id)
+      die('chip ' + key + ' --id <task_id> — the chip id is how the record points at the running\n' +
+          '       agent. Take it from the tool that created the chip. Add --worktree <path> too if\n' +
+          '       the copy it works in is not the branch\'s own worktree.');
     const pending = heldNeeds(r, t);
     if (pending.length) {
       console.error('✗ ' + key + ' still waits for ' + pending.join(', ') + ' to land.');
@@ -2486,6 +2657,9 @@ function cmdChip(key, flags) {
   }
   if (flags.id) t.chip = flags.id;
   if (flags.worktree) t.worktree = flags.worktree;
+  // --branch used to be accepted and then dropped on the floor, so `guard` and
+  // `release` went looking for a branch nobody had ever created.
+  if (flags.branch) t.branch = flags.branch;
   const held = heldNeeds(r, t);
   t.status = held.length ? 'held' : 'ready';
   commit(r);
@@ -2502,10 +2676,17 @@ function cmdAgent(key, flags) {
   const r = readReg(); const t = getTask(r, key);
   if (!flags.name) die('need --name <peer name it checked in from>');
   t.agent = flags.name;
-  if (t.status === 'planned') t.status = (t.needs || []).some((n) => getTask(r, n).status !== 'landed') ? 'held' : 'ready';
+  // heldNeeds treats a requirement that is not on record as unlanded and names
+  // it. Reading it with getTask instead used to abort the whole command with
+  // "no task X (have: ...)", which reads like the task being checked in is the
+  // one that does not exist.
+  const stillHeld = heldNeeds(r, t);
+  if (t.status === 'planned') t.status = stillHeld.length ? 'held' : 'ready';
   commit(r);
   console.log(key + ' is reachable at ' + t.agent + '  (' + t.status + ')');
-  const stillHeld = (t.needs || []).filter((n) => getTask(r, n).status !== 'landed');
+  const missing = (t.needs || []).filter((n) => !depOf(r, n));
+  if (missing.length) console.log('⚠ it waits on ' + missing.join(', ') + ', which ' +
+    (missing.length > 1 ? 'are' : 'is') + ' not on record — a typo, or a task never added. Fix `needs`.');
   if (stillHeld.length) console.log('Reply to it now: you are on hold until ' + stillHeld.join(', ') + ' land. Do not start.');
 }
 
@@ -2547,8 +2728,20 @@ function cmdRelease(key) {
 }
 
 const OUTCOMES = ['passed', 'partial', 'failed'];
+// `chip`, `release` and `landed` all refuse to move a task that is not in a
+// state the move makes sense from. `done` did not, and it is the one command an
+// agent runs itself: a report on a landed task rewound it to `reported` while
+// keeping its landedAt, and a report on a task nobody had ever handed out was
+// accepted as if there were work behind it.
+const REPORTABLE = ['held', 'ready', 'reported'];
 function cmdDone(key) {
   const r = readReg(); const t = getTask(r, key);
+  if (!REPORTABLE.includes(t.status))
+    die(key + ' is "' + t.status + '" — ' + (t.status === 'planned'
+      ? 'it has never been handed out, so there is no work to report on.\n' +
+        '       Create the chip first: driver.mjs chip ' + key + ' --id <task_id>'
+      : 'a report cannot rewind finished work. If this is really meant to run\n' +
+        '       again, that is a new task.'));
   const rep = stdinJson();
   // This one is run by the chip's own process, so it takes untrusted input.
   if (rep === null || typeof rep !== 'object' || Array.isArray(rep))
@@ -2583,21 +2776,50 @@ function worktreeFor(t) {
   return null;
 }
 
+// git, run as an argument vector rather than a shell string. Nothing here is
+// interpolated into a command line: a branch name arrives from agent-authored
+// `task add < json`, and as a shell string one called `main; touch /tmp/PWNED`
+// did exactly that. `-z` also stops core.quotePath mangling any path that is
+// not ASCII, which used to be recorded as a blocking trespass defect.
+function gitZ(args, cwd) {
+  return execFileSync('git', ['-c', 'core.quotePath=false', ...args],
+    { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).split('\0');
+}
+// `main` was hardcoded, so guard was unusable in any repo whose default branch
+// is called something else. Ask the repo what its integration branch is.
+function defaultBase() {
+  for (const ref of ['refs/remotes/origin/HEAD', 'HEAD']) {
+    try {
+      const out = execFileSync('git', ['symbolic-ref', '--short', '-q', ref],
+        { cwd: CWD, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+      if (out) return out.replace(/^origin\//, '');
+    } catch { /* not set, or not a repo */ }
+  }
+  return 'main';
+}
+
 function cmdGuard(key, flags) {
   const r = readReg(); const t = getTask(r, key);
   const wt = worktreeFor(t);
   if (!wt) die('cannot find a copy of the repository on branch ' + t.branch +
     '\n       Record it: driver.mjs chip ' + key + ' --worktree <path>');
-  const base = flags.base || 'main';
+  const base = flags.base || defaultBase();
+  for (const [what, v] of [['--base', base], ['the branch', t.branch]])
+    if (!v || v.startsWith('-')) die(what + ' is not a usable git ref: "' + v + '"');
+  // --no-renames matters: with renames detected, `git diff --name-only` prints
+  // only a rename's destination. `git mv other/config.ts src/config.ts` deletes
+  // a file this task does not own, and guard used to call that clean.
+  const range = base + '...' + t.branch;
+  const cmdText = 'git diff --no-renames -z --name-only ' + range;
   let changed;
   try {
-    changed = execSync('git diff --name-only ' + base + '...' + t.branch, { cwd: wt, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })
-      .split('\n').map((x) => x.trim()).filter(Boolean);
-  } catch (e) { die('could not diff ' + base + '...' + t.branch + ' in ' + wt); }
+    changed = gitZ(['diff', '--no-renames', '-z', '--name-only', range, '--'], wt)
+      .map((x) => x.trim()).filter(Boolean);
+  } catch (e) { die('could not diff ' + range + ' in ' + wt + '\n       (is "' + base + '" a branch this repo has? pass --base <ref> if not)'); }
   if (!changed.length) {
     const d = recordDefect(r, { task: key, kind: 'guard',
       what: key + ' reported finished but its branch changed nothing against ' + base,
-      evidence: 'git diff --name-only ' + base + '...' + t.branch + ' → empty', blocking: true });
+      evidence: cmdText + ' → empty', blocking: true });
     commit(r);
     console.log('⚠ ' + key + ' changed nothing at all against ' + base + '. That is not finished work.');
     console.log('  recorded ' + d.id + '. Ask which branch it committed to — do not go looking yourself.');
@@ -2626,6 +2848,16 @@ function cmdGuard(key, flags) {
 function cmdLanded(key, flags) {
   const r = readReg(); const t = getTask(r, key);
   if (t.status !== 'reported') die(key + ' is "' + t.status + '" — it cannot land before it reports finished');
+  // Landing on top of an unlanded requirement puts work in the main line that
+  // was built without the thing it was told to build on.
+  const held = heldNeeds(r, t);
+  if (held.length) {
+    console.error('✗ ' + key + ' cannot land — it waits for ' + held.join(', ') + ', and ' +
+      (held.length > 1 ? 'those have' : 'that has') + ' not landed.');
+    console.error('  Whatever it built, it built without them. Land them first, or fix `needs` if');
+    console.error('  the requirement is not real.');
+    process.exit(1);
+  }
   t.status = 'landed'; t.landedAt = now();
   t.landedSha = flags.sha || '';
   // No checkpoint is destroyed by a landing. The new work is simply not covered
@@ -2661,9 +2893,18 @@ function cmdLanded(key, flags) {
 function trespass(r) {
   let out = [];
   try {
-    const dirty = execSync('git status --porcelain', { cwd: CWD, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })
-      .split('\n').map((l) => l.slice(3).trim()).filter(Boolean)
-      .map((l) => l.includes(' -> ') ? l.split(' -> ')[1] : l);
+    // -z, so a non-ASCII path is not handed back quoted and mangled, and so a
+    // rename's two halves arrive as two records instead of one " -> " line.
+    // Both halves count: renaming a file away is changing it.
+    const parts = gitZ(['status', '--porcelain', '-z'], CWD);
+    const dirty = [];
+    for (let i = 0; i < parts.length; i++) {
+      const e = parts[i];
+      if (!e) continue;
+      const xy = e.slice(0, 2), p = e.slice(3).trim();
+      if (p) dirty.push(p);
+      if (/[RC]/.test(xy)) { const src = (parts[++i] || '').trim(); if (src) dirty.push(src); }
+    }
     for (const f of dirty) for (const t of tasks(r)) {
       if ((t.owns || []).some((o) => collides(f, o))) out.push({ file: f, key: t.key });
     }
@@ -3260,7 +3501,7 @@ const flags = {}; const rest = [];
 // boolean was not on the short list. Both failures reported success.
 const BOOL_FLAGS = new Set(['stdout', 'all', 'load-bearing', 'dry-run', 'force',
   'not-blocking', 'reclean', 'check']);
-const VALUE_FLAGS = new Set(['base', 'evidence', 'from', 'grep', 'id', 'into', 'key',
+const VALUE_FLAGS = new Set(['base', 'branch', 'evidence', 'from', 'grep', 'id', 'into', 'key',
   'kind', 'n', 'name', 'note', 'out', 'plan', 'ref', 'register', 'scope', 'session',
   'sha', 'since', 'stale', 'status', 'subject', 'task', 'text', 'timeout', 'title',
   'to', 'wave', 'what', 'why', 'window', 'worktree']);
@@ -3348,11 +3589,15 @@ driving the work out, after the grill:
   owed add|assign|done|list work only possible in a window between two pieces — record it, assign
                             it, and close no round on top of it silently.
   brief <key> [--stdout]    write the chip's brief to a file; print what to send. --all rewrites every one.
-  chip <key> --id <task_id> [--worktree p]    record the chip, set held or ready.
+  chip <key> --id <task_id> [--worktree p] [--branch b]   record the chip, set held or ready.
+                            --id is required the first time: it is how the record points at the
+                            agent actually doing the work. Refuses while the task would interfere
+                            with anything still open.
   agent <key> --name <peer>  record where a chip checked in from — without it you cannot release it.
   release <key>             refuses while a requirement has not landed; prints the release message.
   done <key>     < json     {commit, verified, notes} — a chip's own report.
   guard <key> [--base b]    diff its branch and name any file it was not allowed to touch. Exits 1.
+                            The base defaults to the repo's own default branch, not to "main".
   say <key> --kind k --text t     log what you sent (release|reply|sendback|note|hold|announce).
   heard <key> --kind k --text t   log what arrived (checkin|report|question|blocked|note).
   ingest [--from dir]       rebuild the ledger from the on-disk transcripts — both directions,

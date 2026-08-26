@@ -1789,6 +1789,15 @@ function cmdDoctor() {
     console.log('✗ ' + t.key);
     for (const x of probs) console.log('    ' + x);
   }
+  // An owed item outlives the task it was assigned to, and nothing else looks.
+  const shut = allShutWindows(r);
+  if (shut.length) {
+    bad += shut.length;
+    console.log('✗ ' + shut.length + ' owed item(s) assigned to work that has already landed:');
+    for (const o of shut) console.log('    ' + o.id + ' → ' + o.to + (o.loadBearing ? '  LOAD-BEARING' : '') +
+      '  ' + String(o.what || '').replace(/\s+/g, ' ').slice(0, 100));
+    console.log('    Their window is shut. Reassign or settle each — `owed list` shows them as SHUT.');
+  }
   // A tick over nothing checked is how a green report starts meaning nothing.
   if (!bad && !checked) console.log('· nothing to check — every task is landed, cancelled, or not yet handed out.\n  Run this again when work is about to go out; it proves nothing right now.');
   else if (!bad) console.log('✓ ' + checked + ' task(s): every cited path exists, every verify binary resolves, no brief is stale.');
@@ -1796,13 +1805,29 @@ function cmdDoctor() {
   console.log('not started), and any number quoted in a note. Run each verify once by hand before a');
   console.log('brief asserts it, and never put a number in a brief that the run itself can change —');
   console.log('write where to read it instead.');
-  if (bad) { console.error('\n' + bad + ' task(s) failed. Fix the record, `brief --all`, run doctor again.'); process.exit(1); }
+  if (bad) { console.error('\n' + bad + ' problem(s). Fix the record (`brief --all` after), reassign or settle any shut\n' +
+    'owed item, then run doctor again.'); process.exit(1); }
 }
 
 // --------------------------------------------------------------------- owed
 // Work that is only possible in a window between two pieces, recorded so the
 // window closing is a decision somebody made rather than a thing nobody saw.
 function owedList(r) { return (r.owed ||= []); }
+
+// An owed item is work that is only possible while some other piece is still
+// open. When the task carrying it lands, that window is shut: the item is still
+// owed, it simply has nobody left to do it. Landing must NOT settle it — that
+// would make the loss automatic. It surfaces instead, which is the whole point
+// of the list: a window closing should be a decision somebody made.
+function shutWindows(r, key) {
+  const t = tasks(r).find((x) => x.key === key);
+  if (!t || t.status !== 'landed') return [];
+  return owedList(r).filter((o) => o.status === 'open' && o.to === key);
+}
+function allShutWindows(r) {
+  const landed = new Set(tasks(r).filter((t) => t.status === 'landed').map((t) => t.key));
+  return owedList(r).filter((o) => o.status === 'open' && o.to && landed.has(o.to));
+}
 
 
 // ------------------------------------------------------------------ defects
@@ -1893,10 +1918,19 @@ function cmdOwed(sub, rest, flags) {
   } else if (sub === 'list' || sub === undefined) {
     const os = owedList(r);
     if (!os.length) return console.log('nothing is owed.');
+    const shut = new Set(allShutWindows(r).map((o) => o.id));
     for (const o of os) {
+      const to = o.to ? '→ ' + o.to + (shut.has(o.id) ? ' SHUT' : '') : 'UNASSIGNED';
       console.log(o.id + '  ' + o.status.padEnd(6) + (o.loadBearing ? 'LOAD-BEARING  ' : '              ') +
-        (o.to ? '→ ' + o.to : 'UNASSIGNED').padEnd(14) + o.what);
+        to.padEnd(19) + o.what);
       if (o.status === 'open') console.log('      why: ' + o.why + (o.window ? '   window: ' + o.window : ''));
+    }
+    const sh = allShutWindows(r);
+    if (sh.length) {
+      console.log('\n' + sh.length + ' item(s) marked SHUT: the task they were assigned to has already landed,');
+      console.log('so nothing is carrying them any more. ' + sh.filter((o) => o.loadBearing).length +
+                  ' of those is load-bearing.');
+      console.log('Reassign each to work that is still open, or settle it — leaving it is the loss.');
     }
   } else die('owed add|assign <id> --to <key>|done <id>|list');
 }
@@ -2316,10 +2350,24 @@ function cmdLanded(key, flags) {
   const un = unprovenLanded(r).length + 1;
   if (un > 1) console.log(un + ' landing(s) now sit beyond the last checkpoint.');
   if (!t.landedSha) console.log('(no --sha given: a released chip cannot then prove its copy carries this work)');
+  // Anything owed on this task can no longer be done by it. Stamp when the
+  // window shut so the record says it, and say it here — this is the one moment
+  // somebody is looking, and after it the item has no carrier at all.
+  const shut = shutWindows(r, key);
+  for (const o of shut) if (!o.windowShutAt) o.windowShutAt = now();
   commit(r);
   const freed = tasks(r).filter((x) => x.status === 'held' && (x.needs || []).includes(key) &&
     heldNeeds(r, x).length === 0);
   console.log(key + ' landed.');
+  if (shut.length) {
+    const lb = shut.filter((o) => o.loadBearing);
+    console.log('\n⚠ ' + shut.length + ' owed item(s) were assigned to ' + key + '. Its window is now shut —');
+    console.log('  it landed without them, and nothing else is carrying them:');
+    for (const o of shut) console.log('    ' + o.id + (o.loadBearing ? '  LOAD-BEARING  ' : '                ') + o.what);
+    console.log('  Reassign each (`owed assign <id> --to <key>`) or settle it (`owed done <id>`).');
+    if (lb.length) console.log('  ' + lb.length + ' of them is load-bearing. Something depends on it being done.');
+    console.log('  They stay open and on `outstanding` until you do one or the other.');
+  }
   if (freed.length) { console.log('\nHeld chips waiting only on it (legacy — new chips open instead of waiting):'); for (const f of freed) console.log('  driver.mjs release ' + f.key); }
   console.log('\nRun `frontier` — this landing may have opened more than its direct dependents,');
   console.log('and its files are no longer in flight, so tasks it was blocking can open too.');
@@ -2671,20 +2719,17 @@ function cmdDigest() {
     L.push('**Open right now** (reply to these addresses):');
     for (const t of open) L.push('- `' + t.key + '` ' + t.title.slice(0, 44) + ' — ' + (t.agent || '⚠ never checked in') + (t.status === 'reported' ? '  **← waiting on your check**' : ''));
   }
-  // outstanding, computed the same way `outstanding` does
-  const log = ledger();
-  const waits = [];
-  for (const t of T) {
-    const mine = log.filter((e) => e.key === t.key);
-    const ask = [...mine].reverse().find((e) => e.dir === 'in' && ['question', 'blocked'].includes(e.kind));
-    if (ask && !mine.some((e) => e.dir === 'out' && ['reply', 'release'].includes(e.kind) && e.at > ask.at))
-      waits.push(t.key + ' asked something and has had no answer');
-    if (t.status === 'reported') waits.push(t.key + ' says it is finished and needs your check');
+  // Exactly what `outstanding` says, because it is the same function. This was
+  // a second copy of the rules, which is how one blind spot shipped twice.
+  const waits = waitingOn(r, ledger());
+  if (waits.length) {
+    L.push('');
+    L.push('**Waiting on you:**');
+    for (const w of waits.slice(0, 8))
+      L.push('- ' + w.key + ' ' + w.why + (w.detail ? ': ' + w.detail.slice(0, 70) : ''));
+    if (waits.length > 8)
+      L.push('- …and ' + (waits.length - 8) + ' more. Run `outstanding` — this list is cut, not complete.');
   }
-  const defs = openDefects(r, null);
-  if (defs.length) for (const d of defs)
-    waits.push((d.task ? d.task + ' ' : '') + '— open ' + d.kind + ' (' + d.id + '): ' + d.what.slice(0, 70));
-  if (waits.length) { L.push(''); L.push('**Waiting on you:**'); for (const w of waits) L.push('- ' + w); }
   const owed = owedList(r).filter((o) => o.status !== 'done');
   if (owed.length) {
     L.push('');
@@ -2720,32 +2765,63 @@ function cmdHookInstall() {
   console.log('\nIt runs: ' + cmd);
 }
 
-function cmdOutstanding() {
-  const r = readReg(); const log = ledger();
+// What is waiting on the orchestrator, decided in ONE place. This used to be
+// written out twice — here and again inside `digest` — and both times a rule
+// was wrong it was wrong in both copies. A rule that two commands depend on
+// belongs in neither of them.
+function waitingOn(r, log) {
   const rows = [];
   for (const t of tasks(r)) {
     const mine = log.filter((e) => e.key === t.key);
+    let spokeFor = false;
     const lastAsk = [...mine].reverse().find((e) => e.dir === 'in' && ['question', 'blocked'].includes(e.kind));
     if (lastAsk) {
       // Only an actual reply answers a question. Sending the work back is a
       // rejection, not an answer — counting it as one is how an agent ends up
       // waiting for ever on a list that says nothing is waiting.
       const replied = mine.some((e) => e.dir === 'out' && ['reply', 'release'].includes(e.kind) && e.at > lastAsk.at);
-      if (!replied) rows.push({ key: t.key, why: 'asked you something and has had no answer',
-        detail: lastAsk.text.slice(0, 90), since: lastAsk.at });
+      if (!replied) {
+        spokeFor = true;
+        rows.push({ key: t.key, why: 'asked you something and has had no answer',
+          detail: String(lastAsk.text || '').slice(0, 90), since: lastAsk.at });
+      }
     }
     for (const d of openDefects(r, t.key))
       rows.push({ key: t.key, why: (d.blocking ? 'is blocked by ' : 'has an open ') + d.kind + ' (' + d.id + ') — `defect fixed ' + d.id + '` when it is dealt with',
         detail: d.what.slice(0, 90), since: d.at });
-    if (t.status === 'reported') rows.push({ key: t.key, why: 'says it is finished and is waiting on your check',
-      detail: ((t.reports || []).slice(-1)[0] || {}).verified || '', since: ((t.reports || []).slice(-1)[0] || {}).at || '' });
+    if (t.status === 'reported') {
+      spokeFor = true;
+      rows.push({ key: t.key, why: 'says it is finished and is waiting on your check',
+        detail: ((t.reports || []).slice(-1)[0] || {}).verified || '', since: ((t.reports || []).slice(-1)[0] || {}).at || '' });
+    }
+    // A message `ingest` recovers from a transcript carries no kind — the
+    // transcript never recorded one — so every rule that tests for 'question'
+    // is blind to it, and after a compaction that is most of the ledger. This
+    // rule asks nothing about kind and guesses nothing: they spoke last, and
+    // nothing has gone back. Both halves are read straight off the ledger.
+    if (!spokeFor && !['landed', 'cancelled'].includes(t.status)) {
+      const lastIn = [...mine].reverse().find((e) => e.dir === 'in');
+      if (lastIn && !mine.some((e) => e.dir === 'out' && e.at > lastIn.at))
+        rows.push({ key: t.key, why: 'spoke last and has had no answer from you',
+          detail: String(lastIn.text || '').slice(0, 90), since: lastIn.at });
+    }
     if (t.status === 'held' && (t.needs || []).every((n) => { const d = tasks(r).find((x) => x.key === n); return d && d.status === 'landed'; }))
       rows.push({ key: t.key, why: 'is free to start and has not been released', detail: 'waited for ' + (t.needs || []).join(', '), since: '' });
     if (t.status === 'planned' && t.agent)
       rows.push({ key: t.key, why: 'checked in but was never told where it stands', detail: '', since: '' });
+    for (const o of shutWindows(r, t.key))
+      rows.push({ key: t.key, why: 'landed with ' + o.id + ' still owed on it' + (o.loadBearing ? ' — LOAD-BEARING' : '') +
+        ' — reassign it (`owed assign ' + o.id + ' --to <key>`) or settle it (`owed done ' + o.id + '`)',
+        detail: String(o.what || '').slice(0, 90), since: o.windowShutAt || o.at || '' });
   }
   for (const d of openDefects(r, null).filter((x) => !x.task))
     rows.push({ key: '(no task)', why: 'open ' + d.kind + ' (' + d.id + ')', detail: d.what.slice(0, 90), since: d.at });
+  return rows;
+}
+
+function cmdOutstanding() {
+  const r = readReg();
+  const rows = waitingOn(r, ledger());
   if (!rows.length) return console.log('Nothing is waiting on you.');
   console.log('These are waiting on you. Deal with each one — none of them will ask twice.\n');
   for (const x of rows) {

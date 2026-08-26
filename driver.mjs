@@ -682,6 +682,17 @@ const JARGON = ['idempoten', 'schema', 'endpoint', 'api', 'rls', 'jwt', 'oauth',
   'algorithm', 'implementation', 'architecture', 'infrastructure', 'configuration', 'authenticat',
   'authoris', 'authoriz', 'provision', 'orchestrat', 'instantiat', 'parameteris', 'parameteriz'];
 
+// Each entry above is a STEM, and a stem only counts where a word starts. Held
+// as bare substrings they matched inside ordinary English — "orm" sits in
+// normal, format, information, performance and platform, "api" in rapid — so
+// the linter refused plain words and, naming only the stem, never said which
+// word of the question it had objected to. Anchored to a word start and run on
+// to the end of that word, it catches the growths a stem is there for
+// ("schema" in schemas, "authoris" in authorisation) and reports the word the
+// writer actually used.
+const JARGON_RE = new RegExp(
+  '\\b(?:' + JARGON.map((j) => j.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|') + ')[a-z]*', 'i');
+
 const PATHY = /(^|\s|\()[\w.\-/]*\/[\w.\-/]+|\b\w+\.(md|ts|tsx|js|mjs|py|json|sql|toml|yaml|yml|sh|rs|go|java|rb)\b|`[^`]+`/i;
 
 function words(s) { return s.trim().split(/\s+/).filter(Boolean); }
@@ -692,8 +703,8 @@ function lintText(label, s, maxWords) {
   const w = words(s);
   if (w.length > maxWords) p.push(label + ' is ' + w.length + ' words, max ' + maxWords);
   if (PATHY.test(s)) p.push(label + ' names a file or path — say what it does instead');
-  const low = ' ' + s.toLowerCase() + ' ';
-  for (const j of JARGON) if (low.includes(j)) { p.push(label + ' uses "' + j + '" — plainer word needed'); break; }
+  const j = s.match(JARGON_RE);
+  if (j) p.push(label + ' uses "' + j[0] + '" — say what it does instead (see reference/plain-words.md)');
   // Measure each unhyphenated run: "multiply-the-gap" is plain English,
   // "implementation" is not.
   const long = w.flatMap((x) => x.split(/[-\u2013\u2014/]/)).find((x) => x.replace(/[^a-z]/gi, '').length >= 14);

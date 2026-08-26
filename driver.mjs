@@ -3116,11 +3116,19 @@ function waitingOn(r, log) {
     if (lastAsk) {
       // Only an actual reply answers a question. Sending the work back is a
       // rejection, not an answer — counting it as one is how an agent ends up
-      // waiting for ever on a list that says nothing is waiting.
-      const replied = mine.some((e) => e.dir === 'out' && ['reply', 'release'].includes(e.kind) && e.at > lastAsk.at);
+      // waiting for ever on a list that says nothing is waiting. A `release`
+      // was counted here for the same reason a sendback once was, and it is
+      // the same hole: telling somebody to go ahead is not telling them the
+      // thing they asked. `heard` promises the operator "only a reply clears
+      // it", and now that is what happens.
+      const replied = mine.some((e) => e.dir === 'out' && e.kind === 'reply' && e.at > lastAsk.at);
       if (!replied) {
         spokeFor = true;
-        rows.push({ key: t.key, why: 'asked you something and has had no answer',
+        // A blocked message did not ask anything — saying it did sends the
+        // operator looking for a question that was never put.
+        rows.push({ key: t.key, why: lastAsk.kind === 'blocked'
+            ? 'says it is blocked and has had nothing back'
+            : 'asked you something and has had no answer',
           detail: String(lastAsk.text || '').slice(0, 90), since: lastAsk.at });
       }
     }

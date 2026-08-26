@@ -493,16 +493,27 @@ rewriting the record:
 ```bash
 cat <<'J' | node $DRV task add
 [{"key":"0.14","title":"the sweeper and the shelf of tuned numbers","plan":"docs/plans/0.14-the-sweeper.md",
-  "needs":[],"owns":["packages/tuning","apps/api/src/core/sweeper"],
+  "needs":[],"owns":["packages/tuning","apps/api/src/core/sweeper"],"serialises":[],
   "context":[{"path":"apps/api/src/core/worker","what":"the background queue a sweep runs on — use it, do not write another"}],
   "decisions":["One shelf of tuned numbers, versioned, shipped in both builds"],
   "verify":["pnpm -C apps/api test"]},
  {"key":"2.1","title":"the flashcard scheduler","plan":"docs/plans/2.1-flashcards.md",
   "needs":["0.14"],"owns":["apps/api/src/core/cards","packages/offline/src/cards"],
+  "serialises":["alembic-head"],
   "context":[{"path":"packages/tuning","what":"the shelf 0.14 built — put your constants there"}],
   "verify":["pnpm -C apps/api test","pnpm -C packages/offline test"]}]
 J
 ```
+
+The fields it reads are `title`, `plan`, `needs`, `owns`, `serialises`,
+`context`, `verify`, `decisions`, `notes` and `branch`. Anything else is named
+back to you as ignored rather than saved.
+
+**A new task may not claim a path a live task already owns.** `task add` refuses
+the whole batch and saves nothing, naming which task holds it. That is the one
+failure this arrangement exists to prevent, and this is the cheapest moment to
+fix it. An existing pair is not re-judged — a register that already has one has
+to stay usable — so `doctor` is what reports those.
 
 **Ownership is not optional, and a shared file is only the easy case.** Two
 tasks running at the same time may never touch one file — `owns` is how that is
@@ -533,6 +544,24 @@ rather than let a broken plan out of the door. It stops three things:
 Paste the output into the chat. That is the shared picture of what can be
 launched in parallel and what each thing is waiting for. Fix the plan until it
 is green. **Do not create a single chip while `graph` exits 1.**
+
+**Read what its green actually says.** It ends by naming how many pairs of tasks
+it judged, and how many it skipped because one side had already landed:
+
+```
+✓ 8 pair(s) of tasks that could still collide were checked for shared files
+and shared serialisation points; 74 pair(s) were skipped because one side has
+already landed.
+Nothing among them clashes, so every round above can run side by side.
+That is not a statement about the run as a whole — a landed task is not re-judged.
+```
+
+Skipped pairs that did overlap are listed above that as history, under "Already
+merged, so not a gate". Both halves matter: late in a run the judged number gets
+small and the skipped number gets large, and a green over eight pairs is not the
+same claim as a green over eighty-two. Merged work is not a contender, which is
+why it is skipped — but it means the same register says "nothing clashes" today
+and would have said "these two collide" yesterday.
 
 ## 11. Pre-flight the round before opening it
 
@@ -601,7 +630,38 @@ buildable but held back and by whom, on which file or point, and what is still
 waiting for work to land. Run it after every landing — a landing frees both its
 dependents *and* every task its files were blocking.
 
-`chip` enforces the same two rules and refuses otherwise:
+Record each chip as you create it. **`--id` is required the first time**, and it
+is the whole gate:
+
+```bash
+node $DRV chip 2.1 --id task_def456
+node $DRV chip 2.1 --id task_def456 --worktree ../wt-2.1 --branch step/2.1
+```
+
+`--id` is the id the tool that created the chip gave back — it is how the record
+points from a key to the thing actually doing the work. Without it the command
+refuses and nothing is written:
+
+```
+error: chip 2.1 --id <task_id> — the chip id is how the record points at the running
+       agent. Take it from the tool that created the chip. Add --worktree <path> too if
+       the copy it works in is not the branch's own worktree.
+```
+
+That refusal is not paperwork. Every interference check below runs **only on a
+task's first chip** — the run where `--id` is being set. Call `chip` without it
+and the command stops before the checks; call it a second time on a task that
+already has an id and the checks are skipped, because the chip already exists.
+So the one call that decides whether this work may open is the one that carries
+`--id`, and there is exactly one of them per task.
+
+`--worktree` is where its copy of the repository actually sits — pass it when
+that is not the branch's own worktree, or `guard` will not find it later.
+`--branch` sets the branch the work lands on; it is honoured, so a name you pass
+here is the name `guard` and `release` will look for.
+
+On that first chip, `chip` enforces the same two rules `frontier` does and
+refuses otherwise:
 
 ```
 ✗ D would interfere with work that is open right now:
@@ -684,15 +744,31 @@ survives the window being closed:
 
 ```bash
 node $DRV done 2.1 <<'J'
-{"commit":"9f3c1ae","verified":"apps/api 214 passed","notes":"the shelf ships empty"}
+{"commit":"9f3c1ae","verified":"apps/api 214 passed","outcome":"passed","notes":"the shelf ships empty"}
 J
 ```
+
+`verified` is required — a report with no proof in it is refused. `outcome` is
+`passed`, `partial` or `failed`, and defaults to `passed` if it is left out;
+either of the other two opens a defect against the task on the spot, so the
+half-passing run cannot be rounded up. `commit` and `notes` are optional.
+
+`done` is refused on a task that has landed and on one that was never handed
+out. Both used to go through: a report on landed work rewound it, and a report
+on a task with no chip behind it was taken as if there were work under it.
 
 Then **you check it again. Its own word is not enough.**
 
 ```bash
 node $DRV guard 2.1
+node $DRV guard 2.1 --base trunk    # only if the base is not the repo's own default
 ```
+
+`guard` asks the repository what its integration branch is called rather than
+assuming `main`, so it works in a repo whose default is `trunk`, `master` or
+anything else. Pass `--base` when you want a different one. It compares without
+rename detection, so a file *moved out* of a path the task does not own still
+shows up as the deletion it is.
 
 It diffs the branch itself and marks every file — you are not comparing lists by
 eye, which is where attention goes at task forty of fifty:
@@ -719,27 +795,53 @@ owns, which is the same idea as a path filter on a CI job. On the run that
 prompted this, 38 of 131 queued checks were the same whole-repo lint, waiting
 behind database suites for no reason.
 
+Installing packages counts as heavy, whatever it looks like. `pnpm install`,
+`pip install`, `poetry lock` and their kin saturate the network, rewrite a shared
+store and churn gigabytes of disk. They used to read as cheap, and every agent
+was told to run one bare and at the same time.
+
 **The machine is still a serialisation point for the heavy half.** With six or seven chips open, six
 or seven full suites can start at once — and that is a memory panic, not a
 speed-up. So the run's heavy checks share one slot: a claim taken atomically
 (two agents seeing "free" at the same instant cannot both win), freed by the
-holder's process exiting rather than by anyone remembering, stolen if the holder
-is dead or has held it past 30 minutes, polled every ~10 seconds by whoever is
-waiting.
+holder's process exiting rather than by anyone remembering, polled every ~10
+seconds by whoever is waiting.
 
-Every brief already wires this in: a wrapper script is generated into
-`.claude/orchestration/bin/with-ci-slot`, and each verify command in a brief is
-printed *through* it. Your own round-closing CI run and any full-suite check you
-run while judging returned work go through the same wrapper:
+**A holder that is alive is never taken from.** The waiter asks the operating
+system whether the holder's process is still there, and if it is, it keeps
+waiting however long the run takes — a suite that legitimately runs past any
+limit is still running, and starting a second one beside it is the crash this
+whole thing exists to stop. The 30-minute limit applies only where liveness
+cannot be established: a claim from another machine, or one taken by hand, which
+records no process to ask about.
+
+Every brief wires this in: a wrapper script is generated into
+`.claude/orchestration/bin/with-ci-slot`, and **the heavy half** of that brief's
+checks is printed through it. The cheap half is printed bare, to run straight
+away — that is the point of the split, and a linter behind a database suite is
+the waste it was there to remove. Your own round-closing CI run and any
+full-suite check you run while judging returned work go through the same
+wrapper:
 
 ```bash
 .claude/orchestration/bin/with-ci-slot pnpm -C apps/api test
 node $DRV slot status          # who holds it, since when
 ```
 
-Never free the slot by hand while a run may be inside it — `slot free` refuses
-unless the claim is stale, because emptying it under a live run causes the exact
-crash the slot exists to stop.
+Never free a slot with a run inside it: `slot free` refuses a live `slot run`
+claim without `--force`, because emptying it under a live run causes the exact
+crash the slot exists to stop. A claim taken by hand with `slot take` is
+different — the process that took it exited on purpose, so nothing is inside it
+and `slot free ci` frees it plainly, no flag.
+
+One sharp edge is left, and it is worth knowing rather than being surprised by.
+Taking a stale claim away is two steps — judge it stale, then carry it off by
+renaming the whole claim aside. A claim created in the sub-millisecond gap
+between those two is carried off with it. It is recognised and put straight back,
+but putting it back is itself two calls, so for that instant the slot is not
+held by the run that owns it. Nothing here can close that gap; what it means in
+practice is that a "slot freed itself" you cannot account for is possible, and
+worth a `slot status` rather than a shrug.
 
 Log the send-back:
 

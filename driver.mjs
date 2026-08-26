@@ -2129,6 +2129,30 @@ function describeHolder(lock) {
   return 'held by ' + (h.task || 'pid ' + h.pid) + ' on ' + h.host + ' for ' + mins + ' min';
 }
 
+// The command after `--` is handed to bash, so every word has to be quoted or a
+// path with a space becomes two arguments. But quoting the FIRST word turns a
+// leading `FOO=1` into a command named "FOO=1" — and the register is full of
+// verify lines in exactly that shape, so `slot run ci -- FOO=1 ./scripts/test`
+// died with "FOO=1: command not found" before it ran anything at all.
+//
+// Shell grammar says a leading run of NAME=value words are assignments and the
+// first word that is not one is the command, so reproduce that: keep the names
+// bare, quote the values, quote everything after.
+const SH_ASSIGN = /^([A-Za-z_][A-Za-z0-9_]*)=([\s\S]*)$/;
+const shq = (s) => "'" + String(s).replace(/'/g, "'\\''") + "'";
+function bashCommandLine(raw) {
+  const words = raw.map(String);
+  const out = [];
+  let i = 0;
+  for (; i < words.length; i++) {
+    const m = SH_ASSIGN.exec(words[i]);
+    if (!m) break;
+    out.push(m[1] + '=' + shq(m[2]));
+  }
+  for (; i < words.length; i++) out.push(shq(words[i]));
+  return out.join(' ');
+}
+
 function cmdSlot(sub, rest, flags, raw) {
   const name = rest[0] || 'ci';
   const lock = slotLockPath(name);
@@ -2181,7 +2205,7 @@ function cmdSlot(sub, rest, flags, raw) {
     if (sub === 'wait') { free(); return console.log(name + ' became free.'); }
     process.on('exit', free);
     for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(sig, () => { free(); process.exit(130); });
-    const q = raw.map((x) => "'" + String(x).replace(/'/g, "'\\''") + "'").join(' ');
+    const q = bashCommandLine(raw);
     console.error('slot ' + name + ': taken — running: ' + raw.join(' '));
     const res = spawnSync('/bin/bash', ['-c', q], { stdio: 'inherit', cwd: process.cwd() });
     free();

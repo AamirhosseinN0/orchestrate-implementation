@@ -101,6 +101,12 @@ function lockIsDead() {
 }
 
 function writeReg(r) {
+  // Nothing writes the register without holding the lock. `rebuild`, `verify` and
+  // `log reseed` used to call straight in here and land on the same
+  // `register.json.tmp` a locked writer was using, so a chip's concurrent `done`
+  // was overwritten without a word. The commands take the lock themselves, and
+  // this is the backstop that makes "no unlocked writer" true by construction.
+  if (!HAS_LOCK) acquireLock();
   fs.mkdirSync(path.dirname(REG_PATH), { recursive: true });
   const next = JSON.stringify(r, null, 2) + '\n';
   let prev = null;
@@ -264,6 +270,10 @@ function commit(r, why) {
 }
 
 function cmdRebuild(flags) {
+  // Both of these read the register and the record and compare them, so both need
+  // the pair to be a single moment. `verify` locks for the same reason it reads
+  // twice; `rebuild` locks because it writes.
+  acquireLock();
   const { events, problems } = readEvents();
   const fatal = problems.find((x) => x.fatal);
   if (fatal) die('the record is damaged at line ' + fatal.line + ' — ' + fatal.why + '.\n' +
@@ -315,6 +325,9 @@ function cmdEvents(flags) {
 
 function cmdLogReseed(flags) {
   strFlag(flags, 'why', 'log reseed --why "..." — say what happened to the old record; this marks a hole in the history');
+  // Replaces the record wholesale from the register; a concurrent writer changing
+  // the register underneath that would be baked into the seed and then lost.
+  acquireLock();
   let cur = {};
   try { cur = JSON.parse(fs.readFileSync(path.resolve(CWD, REG_PATH), 'utf8')); } catch { die('no register to reseed from'); }
   const f = eventsPath();

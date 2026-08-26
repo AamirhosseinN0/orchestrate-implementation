@@ -19,6 +19,25 @@ let REG_PATH = path.join(CWD, '.claude', 'orchestration', 'register.json');
 const die = (m) => { console.error('error: ' + m); process.exit(2); };
 const now = () => new Date().toISOString();
 
+// Every flag that carries words an agent wrote goes through here. Checking only
+// truthiness let a boolean `true` through and recorded it as the agent's words —
+// a success message over a message that no longer existed.
+function strFlag(flags, name, why) {
+  const v = flags[name];
+  if (typeof v !== 'string' || !v.trim()) die(why);
+  return v;
+}
+// Same for the numeric ones: Number(true) is 1 and Number('bogus') is NaN, and
+// both used to sail into a filter that silently matched nothing.
+function numFlag(flags, name, { min = 0, max = Infinity, what } = {}) {
+  if (flags[name] === undefined) return undefined;
+  const n = Number(flags[name]);
+  if (!Number.isFinite(n) || !Number.isInteger(n) || n < min || n > max)
+    die('--' + name + ' needs ' + (what || 'a whole number from ' + min +
+        (max === Infinity ? ' up' : ' to ' + max)) + ' — got "' + flags[name] + '"');
+  return n;
+}
+
 function readReg() {          // for read-modify-write: holds the lock until exit
   // Ask whether there is anything to read BEFORE taking the lock. Locking first
   // means a project with no register at all reports a lock conflict, which is
@@ -250,7 +269,10 @@ function cmdRebuild(flags) {
   if (fatal) die('the record is damaged at line ' + fatal.line + ' — ' + fatal.why + '.\n' +
     '       Not rebuilding from a log with a hole in it.');
   if (!events.length) die('no record at ' + rel(eventsPath()) + ' — nothing to rebuild from.');
-  const upto = flags.to !== undefined ? Number(flags.to) : Infinity;
+  const maxSeq = events.reduce((m, e) => Math.max(m, e.seq || 0), 0);
+  const to = numFlag(flags, 'to', { min: 1, max: maxSeq,
+    what: 'a sequence number from 1 to ' + maxSeq + ' (the record ends there)' });
+  const upto = to === undefined ? Infinity : to;
   const use = events.filter((e) => (e.seq || 0) <= upto);
   const { state, problems: rp, lastSeq } = replay(use);
   for (const x of problems) console.error('· ' + x.why);
@@ -277,10 +299,11 @@ function cmdEvents(flags) {
   const { events, problems } = readEvents();
   for (const x of problems) console.error('· ' + x.why);
   let show = events;
-  if (flags.since !== undefined) show = show.filter((e) => (e.seq || 0) > Number(flags.since));
+  const since = numFlag(flags, 'since', { min: 0 });
+  if (since !== undefined) show = show.filter((e) => (e.seq || 0) > since);
   if (typeof flags.task === 'string') show = show.filter((e) => JSON.stringify(e.ops).includes('"' + flags.task + '"') || String(e.cmd).includes(flags.task));
   if (typeof flags.grep === 'string') show = show.filter((e) => JSON.stringify(e).includes(flags.grep));
-  const n = flags.n ? Number(flags.n) : 40;
+  const n = numFlag(flags, 'n', { min: 1 }) ?? 40;
   for (const e of show.slice(-n)) {
     console.log(String(e.seq).padStart(5) + '  ' + String(e.at).slice(0, 19).replace('T', ' ') + '  ' + String(e.cmd || '').slice(0, 46));
     for (const o of e.ops.slice(0, 4))
@@ -291,7 +314,7 @@ function cmdEvents(flags) {
 }
 
 function cmdLogReseed(flags) {
-  if (!flags.why) die('log reseed --why "..." — say what happened to the old record; this marks a hole in the history');
+  strFlag(flags, 'why', 'log reseed --why "..." — say what happened to the old record; this marks a hole in the history');
   let cur = {};
   try { cur = JSON.parse(fs.readFileSync(path.resolve(CWD, REG_PATH), 'utf8')); } catch { die('no register to reseed from'); }
   const f = eventsPath();
@@ -1955,12 +1978,13 @@ function openDefects(r, key) {
 function cmdDefect(sub, rest, flags) {
   const r = readReg();
   if (sub === 'add') {
-    if (typeof flags.what !== 'string' || !flags.what.trim()) die('defect add --task <key> --kind <' + DEFECT_KINDS.join('|') + '> --what "..." [--evidence "..."] [--not-blocking]');
+    const what = strFlag(flags, 'what', 'defect add --task <key> --kind <' + DEFECT_KINDS.join('|') + '> --what "..." [--evidence "..."] [--not-blocking]');
     const kind = flags.kind || 'bug';
     if (!DEFECT_KINDS.includes(kind)) die('--kind must be one of: ' + DEFECT_KINDS.join(', '));
     if (flags.task !== undefined) { if (typeof flags.task !== 'string') die('--task needs a key'); getTask(r, flags.task); }
-    const d = recordDefect(r, { task: flags.task || '', kind, what: flags.what,
-                                evidence: typeof flags.evidence === 'string' ? flags.evidence : '',
+    const d = recordDefect(r, { task: flags.task || '', kind, what,
+                                evidence: flags.evidence === undefined ? ''
+                                  : strFlag(flags, 'evidence', '--evidence was given with nothing in it — leave it off, or say what you saw'),
                                 blocking: !flags['not-blocking'] });
     commit(r);
     console.log(d.id + '  ' + d.kind + (d.task ? '  ' + d.task : '') + (d.blocking ? '  (blocking)' : ''));
@@ -2886,11 +2910,11 @@ function cmdHeard(key, flags) {
   const r = readReg(); const t = getTask(r, key);
   const kind = flags.kind || 'note';
   if (!IN_KINDS.includes(kind)) die('kind must be one of: ' + IN_KINDS.join(', '));
-  if (!flags.text) die('need --text "what they actually said"');
-  append({ dir: 'in', key, kind, agent: t.agent || '', text: flags.text });
+  const text = strFlag(flags, 'text', 'need --text "what they actually said"');
+  append({ dir: 'in', key, kind, agent: t.agent || '', text });
   t.lastHeard = now();
   let d = null;
-  if (kind === 'blocked') d = recordDefect(r, { task: key, kind: 'blocked', what: flags.text, evidence: '', blocking: true });
+  if (kind === 'blocked') d = recordDefect(r, { task: key, kind: 'blocked', what: text, evidence: '', blocking: true });
   commit(r);
   console.log('logged: ← ' + key + ' [' + kind + ']');
   if (d) console.log('  recorded ' + d.id + ' — it stays open until you run: defect fixed ' + d.id);
@@ -3117,16 +3141,46 @@ function cmdBoard() {
 
 const argv = process.argv.slice(2);
 const flags = {}; const rest = [];
-const BOOL_FLAGS = new Set(['stdout', 'all', 'load-bearing']);
+// Both sets are declared, because the old rule — "takes a value unless the next
+// word starts with --" — silently turned a value into `true` whenever an agent
+// wrote one that began with a dash, and silently ate a positional whenever a
+// boolean was not on the short list. Both failures reported success.
+const BOOL_FLAGS = new Set(['stdout', 'all', 'load-bearing', 'dry-run', 'force',
+  'not-blocking', 'reclean', 'check']);
+const VALUE_FLAGS = new Set(['base', 'evidence', 'from', 'grep', 'id', 'into', 'key',
+  'kind', 'n', 'name', 'note', 'out', 'plan', 'ref', 'register', 'scope', 'session',
+  'sha', 'since', 'stale', 'status', 'subject', 'task', 'text', 'timeout', 'title',
+  'to', 'wave', 'what', 'why', 'window', 'worktree']);
+const flagName = (s) => s.startsWith('--') ? s.slice(2).split('=')[0] : null;
+const isKnownFlag = (s) => {
+  const k = flagName(s);
+  return k !== null && (BOOL_FLAGS.has(k) || VALUE_FLAGS.has(k));
+};
 const raw = [];   // everything after `--`, verbatim — the command a slot runs
 for (let i = 0; i < argv.length; i++) {
-  if (argv[i] === '--') { raw.push(...argv.slice(i + 1)); break; }
-  if (argv[i].startsWith('--')) {
-    const k = argv[i].slice(2);
-    flags[k] = (!BOOL_FLAGS.has(k) && argv[i + 1] && !argv[i + 1].startsWith('--')) ? argv[++i] : true;
-  } else rest.push(argv[i]);
+  const a = argv[i];
+  if (a === '--') { raw.push(...argv.slice(i + 1)); break; }
+  if (!a.startsWith('--')) { rest.push(a); continue; }
+  let k = a.slice(2), v;
+  const eq = k.indexOf('=');
+  if (eq >= 0) { v = k.slice(eq + 1); k = k.slice(0, eq); }
+  if (!BOOL_FLAGS.has(k) && !VALUE_FLAGS.has(k))
+    die('unknown flag --' + k + '\n       A misspelled flag used to be ignored, and the command ran on without it.');
+  if (BOOL_FLAGS.has(k)) {
+    if (v !== undefined) die('--' + k + ' is a yes/no flag and takes no value');
+    flags[k] = true; continue;
+  }
+  if (v === undefined) {
+    // Consume whatever comes next, dash or not — that is the whole point. Only a
+    // flag this driver actually knows stops it, so `--text "--force broke it"` is
+    // kept while `--text --kind note` is reported as the missing value it is.
+    if (i + 1 >= argv.length || argv[i + 1] === '--' || isKnownFlag(argv[i + 1]))
+      die('--' + k + ' needs a value.\n       If the value itself starts with --, write it as --' + k + '="--like this".');
+    v = argv[++i];
+  }
+  flags[k] = v;
 }
-if (flags.register) REG_PATH = path.resolve(CWD, flags.register);
+if (flags.register !== undefined) REG_PATH = path.resolve(CWD, flags.register);
 
 const cmd = rest.shift();
 const HELP = `orchestrate-implementation driver — bookkeeping for a grill session.

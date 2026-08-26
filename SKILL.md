@@ -119,6 +119,15 @@ Every driver command locks the register first, and the lock asks the operating
 system whether its holder is alive, so a slow command is never mistaken for a
 dead one. `rebuild`, `verify` and `log reseed` take that lock too.
 
+A long run makes the register large — most of it finished detail on tasks nobody
+will read again. `archive` moves that out, and the record still holds it, so
+`verify` stays clean:
+
+```bash
+node $DRV archive --dry-run    # what it would move, and how much
+node $DRV archive
+```
+
 Two habits follow, and they are not optional:
 
 - **Never retype data you have already extracted — pass the file.** Compaction
@@ -365,13 +374,21 @@ node $DRV render --title "the flashcard grill" --name flashcards
 node $DRV render --plan docs/plans/2.1-flashcards.md
 ```
 
+`check` asks whether the work was done, not whether a word says so. It exits 1
+on an unjudged candidate, a gap with no scope, an in-scope gap unanswered — and
+on two states that used to walk straight past it: a register nothing was ever
+scanned against, and a gap marked answered with no answer recorded under it.
+Neither of those is a formality; an empty gap list satisfied every other
+condition, and `render` then died on the very register `check` had blessed.
+
 Write the record — that one is yours, it is what the user decided and you are
 the one who heard it.
 
-**Do not edit the plans yourself.** The settled-decisions table and the vague
-sentences that need replacing are handed to the refining agent in the next act,
-along with the codebase. It is the one that rewrites plans; you would be doing
-its job with worse information and a dirtier context.
+**Do not edit the plans yourself.** `render --plan` prints the settled-decisions
+table for a plan and `render` names the plans that gained one, but the rewriting
+goes to the refining agent in the next act, along with the codebase. It is the
+one that rewrites plans; you would be doing its job with worse information and a
+dirtier context.
 
 **Act one and a half does not begin until `check` passes.**
 

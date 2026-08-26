@@ -3,3 +3,7 @@
 node_modules/
 *.log
 .DS_Store
+
+# acceptance.sh reads a real recorded run from here. It is somebody
+# else's project state — copy one in to run the harness, never commit it.
+replay/

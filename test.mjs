@@ -799,7 +799,886 @@ say('a brief the record has moved past is called out');
      !has(drv(d, ['board']).out, 'record changed after these briefs'));
 }
 
-// ------------------------------------------------------------- the real corpus
+// --------------------------------------------------------------- the grill, in full
+// The gap commands are the register's edit surface. Together they take a plan
+// with open questions, judge each candidate, settle it, and write the decisions
+// file — and every one of them was part of the coverage gap before this block.
+say('the grill runs a gap all the way to a rendered decision');
+{
+  const d = planBox('grill', ['# The plan', '',
+    '## What is open', '',
+    'The retry limit is TBD.', 'The upload size cap should probably be configurable.','',
+    '## Another section', '', 'Maybe ship it atomically?', ''].join('\n'));
+  // Silence: name the categories the plan never mentions.
+  const sil = drv(d, ['silence']).out;
+  ok('silence names a missing category', has(sil, 'never says'));
+  // Scan produces candidates.
+  drv(d, ['scan']);
+  const gaps = gapsOf(d);
+  ok('scan found suspects to judge', gaps.length > 0, gaps.length + ' gap(s)');
+  const g = gaps[0].id;
+  ok('list shows the first gap', has(drv(d, ['list']).out, g) && has(drv(d, ['list']).out, 'of '));
+  ok('show prints the whole gap', has(drv(d, ['show', g]).out, '"plan"'));
+  const badSet = drv(d, ['set', g, 'status=superman']);
+  ok('set refuses an unknown status', badSet.code !== 0 && has(badSet.out, 'bad status'));
+  ok('set accepts a real status and scope', drv(d, ['set', g, 'status=gap', 'scope=in', 'title=Retry limit']).code === 0);
+  const badScope = drv(d, ['set', g, 'scope=sideways']);
+  ok('set refuses a bad scope', badScope.code !== 0 && has(badScope.out, 'scope must be'));
+  // Research records what was looked at.
+  ok('research records options', has(drv(d, ['research', g], { stdin: JSON.stringify([{ name: 'db', url: 'https://x' }]) }).out, 'option(s) researched'));
+
+  // A good question passes the lint and is saved.
+  const q = drv(d, ['question', g], { stdin: JSON.stringify({ text: 'Should the retry limit be stored?',
+    options: [{ label: 'Store it', gain: 'fast to read', cost: 'more to keep right', recommended: true },
+              { label: 'Work it out each time', gain: 'never stale', cost: 'slower' }] }) });
+  ok('a clear question is accepted', q.code === 0 && has(q.out, 'passes the plain-words rules'), q.out.split('\n')[0]);
+  const badQ = drv(d, ['question', g], { stdin: JSON.stringify({ text: 'Should the schema be denormalised?',
+    options: [{ label: 'A', gain: 'g', cost: 'c', recommended: true }, { label: 'B', gain: 'g2', cost: 'c2' }] }) });
+  ok('a jargon question is refused', badQ.code !== 0 && has(badQ.out, 'schema'));
+  ok('lint names the good question', drv(d, ['lint', g]).code === 0);
+  // A question that is still a candidate keeps the gap open; try to answer it.
+  ok('answering a gap records the choice', has(drv(d, ['answer', g], { stdin: JSON.stringify({ choice: 'Store it', note: 'fast' }) }).out, 'answered:'));
+  ok('batch says nothing is batched', has(drv(d, ['batch']).out, 'nothing batched'));
+  ok('status reports the counts', has(drv(d, ['status']).out, 'found:') && has(drv(d, ['status']).out, 'answered=1'));
+  // Judge every remaining candidate so the register is actually finished: keep
+  // the first two (already decided), drop the rest out of scope.
+  for (const x of gapsOf(d)) {
+    if (x.id === g) continue;
+    drv(d, ['set', x.id, 'status=dropped']);
+  }
+  // A finished register is checkable and renderable.
+  const chk = drv(d, ['check']);
+  ok('check passes once everything is judged and answered', chk.code === 0, chk.out.split('\n')[0].slice(0, 60));
+  ok('render writes the decisions file', drv(d, ['render']).code === 0 &&
+     fs.readFileSync(path.join(d, 'docs/decisions-implementation.md'), 'utf8').includes('Store it'));
+}
+
+// A gap added by hand (via `add`) is a candidate for the same lifecycle, and a
+// question marked batched lands on the batch list instead of being asked now.
+say('an added gap can be batched and batched ones are approved in one list');
+{
+  const d = planBox('grill2', '# a plan\n\n## What is open\n\nThe retry limit is TBD.\n');
+  drv(d, ['scan']);
+  const g = gapsOf(d)[0].id;
+  drv(d, ['set', g, 'status=gap']);
+  const out = drv(d, ['add'], { stdin: JSON.stringify({ title: 'A second thing', plan: 'docs/plan.md' }) }).out;
+  ok('add records a hand-found gap', has(out, 'added:') && gapsOf(d).length === 2, gapsOf(d).length + ' gap(s)');
+  ok('add refuses a gap with no title', drv(d, ['add'], { stdin: JSON.stringify({}) }).code !== 0);
+  const batched = drv(d, ['set', g, 'status=batched']);
+  ok('a gap can be marked batched', batched.code === 0);
+  drv(d, ['question', g], { stdin: JSON.stringify({ text: 'Should the retry limit be stored?',
+    options: [{ label: 'Store it', gain: 'fast', cost: 'more', recommended: true },
+              { label: 'Look it up', gain: 'never stale', cost: 'slower' }] }) });
+  const batch = drv(d, ['batch']).out;
+  ok('the batch names the batched item', has(batch, '1 item(s)') && has(batch, 'ids: ' + g));
+}
+
+// -------------------------------------------------------------- refining a plan
+// Refinement turns a settled plan into a buildable one. It reads the agent's own
+// report file, records the proposed tasks, and reopens gaps it found.
+say('refine drives a plan from settled to buildable');
+{
+  const d = planBox('refine', '# the plan\n\n## What is open\n\nThe retry limit is TBD.\n');
+  drv(d, ['scan']);
+  const g = gapsOf(d)[0].id;
+  drv(d, ['set', g, 'status=gap', 'scope=in']);
+  drv(d, ['answer', g], { stdin: JSON.stringify({ choice: 'Store it', note: 'decided' }) });
+  // A report in the shape the brief tells the agent to write.
+  const rep = path.join(d, '.claude/orchestration/refine/docs-plan.json');
+  fs.mkdirSync(path.dirname(rep), { recursive: true });
+  fs.writeFileSync(rep, JSON.stringify({ summary: 'made it buildable',
+    builtOn: [{ path: 'src/util.js', what: 'existing helper' }],
+    newGaps: [{ title: 'a thing nobody decided', why: 'blocks', quote: 'the upload size' }],
+    tasks: [{ key: '1.1', title: 'wiring', owns: ['src/a.js'], needs: [], verify: ['true'] }] }) + '\n');
+  ok('refine list says what is not refined', has(drv(d, ['refine', 'list']).out, 'still to refine'));
+  ok('refine brief names the plan', has(drv(d, ['refine', 'brief', 'plan']).out, 'The plan'));
+  ok('refine done reads the agent report', has(drv(d, ['refine', 'done', 'plan']).out, 'refined.'));
+  const r = reg(d);
+  ok('refinement recorded the proposed task', tasksOf(d).some((t) => t.key === '1.1'));
+  ok('a new gap was reopened', r.gaps.some((x) => x.title === 'a thing nobody decided'));
+  // The reopened gap is in scope and unanswered — settle it, then the check
+  // is not trying to approve a run that still has an open question.
+  const reopened = r.gaps.find((x) => x.title === 'a thing nobody decided');
+  drv(d, ['answer', reopened.id], { stdin: JSON.stringify({ choice: 'Store it', note: 'settled' }) });
+  ok('refine check passes once everything is refined', drv(d, ['refine', 'check']).code === 0);
+}
+
+// A refine done report can also come over stdin when the file is missing, but it
+// must be told that is second best.
+say('refine done falls back to stdin and says the file is better');
+{
+  const d = planBox('refine-stdin', '# p\n\n## What is open\n\nThe retry limit is TBD.\n');
+  drv(d, ['scan']);
+  const g = gapsOf(d)[0].id;
+  drv(d, ['set', g, 'status=gap', 'scope=in']);
+  drv(d, ['answer', g], { stdin: JSON.stringify({ choice: 'Store it' }) });
+  const out = drv(d, ['refine', 'done', 'plan'], { stdin: JSON.stringify({ summary: 'ok', builtOn: [], tasks: [], newGaps: [] }) }).out;
+  ok('it took the report from stdin', has(out, 'from stdin'));
+  ok('and marked the plan refined', (reg(d).plans || [])[0]?.refined === true);
+}
+
+// ---------------------------------------------------------------- pre-flight
+// A read-only agent tests a task's owns against the code before a chip exists.
+say('pre-flight finds what the record missed and gates the round');
+{
+  const d = planBox('preflight', '# the plan\n\n## What is open\n\nThe retry limit is TBD.\n');
+  drv(d, ['scan']);
+  const g = gapsOf(d)[0].id;
+  drv(d, ['set', g, 'status=gap', 'scope=in']);
+  drv(d, ['answer', g], { stdin: JSON.stringify({ choice: 'Store it' }) });
+  drv(d, ['refine', 'done', 'plan'], { stdin: JSON.stringify({ summary: 'ok', builtOn: [],
+    tasks: [{ key: '1.1', title: 'wiring', owns: ['src/a.js'], needs: [], verify: ['true'] }], newGaps: [] }) });
+  ok('preflight brief names the task and plan', has(drv(d, ['preflight', 'brief', '1.1']).out, 'Pre-flight one task'));
+  ok('preflight check refuses before a report exists', drv(d, ['preflight', 'check']).code !== 0);
+  const rep = path.join(d, '.claude/orchestration/preflight/1.1.json');
+  fs.mkdirSync(path.dirname(rep), { recursive: true });
+  fs.writeFileSync(rep, JSON.stringify({ missing: [{ path: 'src/b.js', why: 'the helper', evidence: 'src/a.js:3', loadBearing: true }],
+    serialises: ['alembic-head'], verify: [{ command: 'true', runnable: true, why: '' }], notes: '' }) + '\n');
+  const done = drv(d, ['preflight', 'done', '1.1']);
+  ok('preflight done records the gaps', done.code === 0 && has(done.out, 'Load-bearing gaps'));
+  const r = reg(d);
+  ok('the task carries a preflight', (r.tasks || []).find((t) => t.key === '1.1')?.preflight?.missing?.length === 1);
+  // The load-bearing gap is not in owns yet, so the round is still not ready.
+  ok('preflight check still refuses the load-bearing gap', drv(d, ['preflight', 'check']).code !== 0);
+}
+
+// ------------------------------------------------------------ whoami and the rest
+// whoami reads the local session registry; a missing registry is a clean error.
+say('whoami says when there is no session registry');
+{
+  const d = bare('whoami');
+  const home = path.join(d, 'home');
+  // Point HOME at a dir with no registry so the error path is real, not env wild.
+  const old = process.env.HOME;
+  process.env.HOME = home;
+  const res = drv(d, ['whoami']);
+  process.env.HOME = old;
+  ok('whoami names the missing registry', res.code !== 0 && has(res.out, 'no session registry'));
+}
+
+// -------------------------------------------------------------- release, resume
+// A task that has never been handed out has no chip; release refuses on a held
+// task that is still waiting, and a live task with a landed requirement can be
+// released.
+say('release refuses blocked work and frees what it can');
+{
+  const d = box('release2');
+  drv(d, ['chip', 't1', '--id', 'chip-t1']);
+  // t3 waits on t1; t1 is still unlanded, so t3's chip refuses.
+  const c3 = drv(d, ['chip', 't3', '--id', 'chip-t3']);
+  ok('a chip does not open on top of unlanded work', c3.code !== 0 && has(c3.out, 'still waits for t1'));
+  // Release t1 after it has checked in.
+  drv(d, ['agent', 't1', '--name', 'peer-a']);
+  const rel = drv(d, ['release', 't1']);
+  ok('release tells the agent to start', rel.code === 0 && has(rel.out, 'you may start'));
+}
+
+// ------------------------------------------------------------------- ci and wave
+say('ci records a green run and the next round may open');
+{
+  const d = box('ci2');
+  drv(d, ['chip', 't1', '--id', 'chip-t1']);
+  drv(d, ['done', 't1'], { stdin: '{"verified":"ran true","outcome":"passed"}' });
+  drv(d, ['landed', 't1', '--sha', 'abc']);
+  drv(d, ['chip', 't2', '--id', 'chip-t2']);
+  drv(d, ['done', 't2'], { stdin: '{"verified":"ran true","outcome":"passed"}' });
+  drv(d, ['landed', 't2', '--sha', 'def']);
+  const red = drv(d, ['ci', '--status', 'red']);
+  ok('CI red without a why is refused', red.code !== 0 && has(red.out, '--why'));
+  const green = drv(d, ['ci', '--status', 'green', '--ref', 'run-1']);
+  ok('green records a checkpoint', green.code === 0 && has(green.out, 'c01'));
+  ok('ci list shows it', has(drv(d, ['ci', 'list']).out, 'run-1'));
+  ok('wave says the finished round is green and the next may open', has(drv(d, ['wave', '--wave', '1']).out, 'may be opened'));
+}
+
+// ------------------------------------------------------------- bundle suggest
+// Two unstarted, non-interfering siblings share a plan; suggest proposes one chip.
+say('bundle suggest names the siblings worth merging');
+{
+  const d = box('bundle-suggest');
+  ok('bundle suggest proposes a group', has(drv(d, ['bundle', 'suggest']).out, 'one chip'));
+}
+
+// --------------------------------------------------------------- hook install
+// The SessionStart hook rewrites settings.json; installing twice is a no-op.
+say('hook-install writes a SessionStart hook and is idempotent');
+{
+  const d = box('hook');
+  const first = drv(d, ['hook-install']);
+  ok('it writes the hook once', first.code === 0 && has(first.out, 'added a SessionStart hook'));
+  const second = drv(d, ['hook-install']);
+  ok('installing again says it is already there', has(second.out, 'already installed'));
+  const settings = JSON.parse(fs.readFileSync(path.join(d, '.claude/settings.json'), 'utf8'));
+  ok('the hook is on SessionStart', (settings.hooks.SessionStart || []).length === 1);
+}
+
+// -------------------------------------------------------------- resume the run
+// A dead session's address is replaced; agents are re-announced.
+say('resume takes over a run and names what to do next');
+{
+  const d = box('resume');
+  drv(d, ['iam', 'old-boss']);
+  ok('resume needs a name', drv(d, ['resume']).code !== 0);
+  const out = drv(d, ['resume', '--name', 'new-boss']);
+  ok('resume records the new address', out.code === 0 && has(out.out, 'now yours'));
+  ok('the register carries it', (reg(d).orchestrator) === 'new-boss');
+}
+
+// ------------------------------------------------- load with globs and dirs
+// A plan directory (or glob) is walked for plan files; a wildcard matches a
+// segment at a time so `docs/**/*.md` resolves instead of looking literally.
+say('load walks a directory and resolves a glob across nesting');
+{
+  const d = bare('loadglob');
+  fs.mkdirSync(path.join(d, 'docs/plans/nested'), { recursive: true });
+  fs.writeFileSync(path.join(d, 'docs/plans/a.md'), '# a\n\nbuild the a thing.\n');
+  fs.writeFileSync(path.join(d, 'docs/plans/nested/b.md'), '# b\n\nbuild the b thing.\n');
+  fs.writeFileSync(path.join(d, 'docs/plans/nested/notes.json'), '{}');
+  const glo = drv(d, ['load', 'docs/plans/**/*.md']);
+  ok('a ** glob matches at any depth', glo.code === 0 && has(glo.out, '2 plan file(s)'), glo.out.split('\n')[1]);
+  const dir = drv(d, ['load', 'docs/plans']);
+  ok('a directory is walked for plans', dir.code === 0 && has(dir.out, '2 plan file(s)'));
+  ok('a non-plan .json is never loaded', !has(drv(d, ['load', 'docs/plans']).out, 'notes.json'));
+}
+
+// ------------------------------------------------------------ list and status
+// list filters by status, scope and plan; status reports the open and unsettled.
+say('list filters the gap register and status reports the open ones');
+{
+  const d = planBox('listfilt', '# p\n\n## What is open\n\nThe retry limit is TBD.\nThe upload cap is TBD too.\n');
+  drv(d, ['scan']);
+  const gs = gapsOf(d);
+  ok('there are candidates to filter', gs.length >= 2, gs.length + ' gap(s)');
+  const g0 = gs[0].id, g1 = gs[1].id;
+  drv(d, ['set', g0, 'status=gap', 'scope=in', 'title=Retry']);
+  drv(d, ['set', g1, 'status=dropped']);
+  ok('list --status gap shows only kept ones',
+     has(drv(d, ['list', '--status', 'gap']).out, g0) && !has(drv(d, ['list', '--status', 'gap']).out, g1));
+  ok('list --scope in shows the in-scope ones',
+     has(drv(d, ['list', '--scope', 'in']).out, g0) && !has(drv(d, ['list', '--scope', 'in']).out, g1));
+  ok('list --plan filters by plan', has(drv(d, ['list', '--plan', 'docs/plan.md']).out, 'of '));
+  ok('list with a filter that matches nothing says so', has(drv(d, ['list', '--status', 'asked']).out, '(none)'));
+  const st = drv(d, ['status']).out;
+  ok('status names the in-scope unanswered gap', has(st, g0) && has(st, 'in scope and still unanswered'));
+  ok('status names the dropped gap in the count', has(st, 'dropped=1'));
+}
+
+// --------------------------------------------------------------- render --plan
+// render can emit just the settled decisions for one plan, as a table to paste.
+say('render --plan prints the settled table for one plan');
+{
+  const d = planBox('renderplan', '# the plan\n\n## What is open\n\nThe retry limit is TBD.\nThe upload cap is TBD too.\n');
+  drv(d, ['scan']);
+  const gs = gapsOf(d);
+  const g0 = gs[0].id;
+  drv(d, ['set', g0, 'status=gap', 'scope=in', 'title=Retry']);
+  drv(d, ['answer', g0], { stdin: JSON.stringify({ choice: 'Store it', note: 'decided' }) });
+  for (const x of gs) { if (x.id === g0) continue; drv(d, ['set', x.id, 'status=dropped']); }
+  const out = drv(d, ['render', '--plan', 'docs/plan.md']);
+  ok('render --plan emits the decision table', out.code === 0 && has(out.out, '| Decision | Choice |'));
+}
+
+// ----------------------------------------------------- a long decision is interned
+// A standing decision repeated across tasks is stored once and referenced by a
+// hash, so the register does not carry 413 KB of byte-identical text.
+say('a repeated long decision is interned, not duplicated');
+{
+  const d = sandbox('intern');
+  const long = 'A standing decision about the retry behaviour that is deliberately long enough that interning it once is cheaper than repeating it inline in every single task record that must obey it.';
+  drv(d, ['task', 'add'], { stdin: JSON.stringify([
+    { key: 't1', title: 'first', plan: 'docs/plans/p.md', owns: ['src/a.py'], needs: [], verify: ['true'], decisions: [long] },
+    { key: 't2', title: 'second', plan: 'docs/plans/p.md', owns: ['src/b.py'], needs: [], verify: ['true'], decisions: [long] },
+  ]) });
+  drv(d, ['brief', 't1']);
+  const r = reg(d);
+  ok('the long text is stored once in a decision pool', (r.decisionTexts || {}) && Object.values(r.decisionTexts || {}).includes(long));
+  ok('the task carries a reference, not the whole text',
+     !(r.tasks || [])[0].decisions[0].includes('standing decision') && /^@[0-9a-f]{12}$/.test((r.tasks || [])[0].decisions[0]));
+  ok('the brief resolves the reference back to the real words',
+     has(drv(d, ['brief', 't1', '--stdout']).out, 'standing decision about the retry'));
+}
+
+// ---------------------------------------------------------------- brief --all
+// brief --all rewrites every open task's brief; an unchanged one writes nothing.
+say('brief --all rewrites the open briefs and says which changed');
+{
+  const d = box('briefall');
+  drv(d, ['brief', 't1']);
+  drv(d, ['chip', 't1', '--id', 'chip-t1']);
+  drv(d, ['agent', 't1', '--name', 'peer-a']);
+  const out = drv(d, ['brief', '--all']);
+  ok('brief --all checks the open briefs in', out.code === 0 && has(out.out, 'brief(s) checked in'));
+  ok('previously-written briefs are recognised as current', has(out.out, 'already current'));
+}
+
+// ------------------------------------------------------------------ whoami
+// whoami --session reads one session's name from the registry.
+say('whoami --session reads a name from the local session registry');
+{
+  const d = bare('whoamisession');
+  const sess = path.join(d, 'home/.claude/sessions');
+  fs.mkdirSync(sess, { recursive: true });
+  fs.writeFileSync(path.join(sess, 'abc.json'), JSON.stringify({ sessionId: 'abc', name: 'the-boss', cwd: d }));
+  const old = process.env.HOME;
+  process.env.HOME = path.join(d, 'home');
+  const res = drv(d, ['whoami', '--session', 'abc']);
+  process.env.HOME = old;
+  ok('whoami --session names the session', res.code === 0 && has(res.out, 'the-boss'));
+  process.env.HOME = old;
+  const missing = drv(d, ['whoami', '--session', 'nope']);
+  process.env.HOME = old;
+  ok('an unknown session id is a clean error', missing.code !== 0 && has(missing.out, 'no live session'));
+}
+
+// -------------------------------------------------------------- ingest reclean
+// A message recovered before the wrapper was stripped can be re-derived.
+say('ingest --reclean re-derives entries already stored');
+{
+  const d = box('reclean');
+  const fx = fs.mkdtempSync(path.join(os.tmpdir(), 'orch-fx-reclean-'));
+  const body = 't1 is done.\n' + Array.from({ length: 40 }, (_, i) => `LINE ${i}: ` + 'detail '.repeat(9)).join('\n') +
+    '\nTHE-CONCLUSION';
+  const wrapped = 'Another Claude session sent a message:\n' +
+    '<cross-session-message from="uds:/x.sock" from-name="peer-a" from-mode="prompting">\n' + body +
+    '\n</cross-session-message>\n';
+  fs.writeFileSync(path.join(fx, 't.jsonl'), JSON.stringify({ type: 'user', cwd: d,
+    timestamp: '2026-01-01T09:00:00.000Z', uuid: 'rx1', sessionId: 's1',
+    message: { role: 'user', content: wrapped } }) + '\n');
+  drv(d, ['ingest', '--from', fx]);
+  const rc = drv(d, ['ingest', '--from', fx, '--reclean']);
+  ok('ingest --reclean runs clean', rc.code === 0 && has(rc.out, 're-derived'));
+  boxes.push(fx);
+}
+
+// ----------------------------------------------------- wave across earlier rounds
+// wave names the earlier round still holding the current one up.
+say('wave says which earlier round is still blocking');
+{
+  const d = box('waveblock');
+  drv(d, ['chip', 't1', '--id', 'chip-t1']);
+  drv(d, ['done', 't1'], { stdin: '{"verified":"ran true","outcome":"passed"}' });
+  drv(d, ['landed', 't1', '--sha', 'abc']);
+  const out = drv(d, ['wave', '--wave', '2']).out;
+  ok('wave names the earlier unfinished round', has(out, 'Earlier rounds still holding this one up') && has(out, 't2'));
+}
+
+// ---------------------------------------------------------------- events filters
+// events narrows by sequence, task and grep — and reports how many it showed.
+say('events filters by task, grep and since');
+{
+  const d = box('eventsf');
+  drv(d, ['task', 'add'], { stdin: JSON.stringify([{ key: 't1', title: 'first, rewritten', owns: ['src/a.py'] }]) });
+  const g = drv(d, ['events', '--grep', 'rewritten']);
+  ok('events --grep finds the event', g.code === 0 && has(g.out, 'rewritten'));
+  const t = drv(d, ['events', '--task', 't1']);
+  ok('events --task narrows to that task', t.code === 0 && has(t.out, 't1'));
+  const s = drv(d, ['events', '--since', '0']);
+  ok('events --since is accepted', s.code === 0 && has(s.out, 'event(s)'));
+}
+
+// ---------------------------------------------------- lint with nothing to say
+// lint with no question yet is a calm message, not a crash.
+say('lint says when no question has been written');
+{
+  const d = planBox('lintnone', '# p\n\n## What is open\n\nThe retry limit is TBD.\n');
+  drv(d, ['scan']);
+  ok('lint reports no questions written', drv(d, ['lint']).code === 0 && has(drv(d, ['lint']).out, 'no questions written yet'));
+}
+
+// ------------------------------------------------------- a missing task is named
+// A command that names a task that is not on the record says the list it had.
+say('a command names the task when one is missing');
+{
+  const d = box('missingtask');
+  const res = drv(d, ['show', 'no-such']);
+  ok('show says there is no such gap', res.code !== 0 && has(res.out, 'no gap no-such'));
+  drv(d, ['chip', 't1', '--id', 'chip-t1']);
+  drv(d, ['agent', 't1', '--name', 'peer-a']);
+  const rel = drv(d, ['release', 'ghost']);
+  ok('release names the task it cannot find', rel.code !== 0 && has(rel.out, 'no task "ghost"'));
+}
+
+// ------------------------------------------------------------- task create/update
+// task add ignores fields it does not set, and an update keeps a task's state.
+say('task add records what it can and ignores the rest');
+{
+  const d = box('taskadd');
+  const out = drv(d, ['task', 'add'], { stdin: JSON.stringify([
+    { key: 't1', title: 'first, rewritten', owns: ['src/a.py'], ignored: 'nope' },
+  ]) });
+  ok('a re-add updates the task in place', out.code === 0 && (tasksOf(d).find((t) => t.key === 't1')?.title === 'first, rewritten'));
+  ok('the update keeps unrelated state', (tasksOf(d).find((t) => t.key === 't1')?.needs || []).length === 0);
+  ok('the ignored field is reported, not saved', has(out.out, 'ignored'));
+}
+
+// ------------------------------------------------------------------ agent note
+// agent on a task with a need that is not on the record says so.
+say('agent points out a dependency that is not on the record');
+{
+  const d = box('agentnote');
+  drv(d, ['chip', 't1', '--id', 'chip-t1']);
+  drv(d, ['task', 'add'], { stdin: JSON.stringify([{ key: 't1', needs: ['missing-dep'] }]) });
+  const out = drv(d, ['agent', 't1', '--name', 'peer-a']);
+  ok('agent flags the unresolvable need', out.code === 0 && has(out.out, 'not on record'));
+}
+
+// ------------------------------------------------------------ ci, in its cover
+// Red records a defect and names the landed work it covers; skipped needs a why.
+say('ci covers red, skipped and an empty list');
+{
+  const d = box('cired');
+  drv(d, ['chip', 't1', '--id', 'chip-t1']);
+  drv(d, ['done', 't1'], { stdin: '{"verified":"ran true","outcome":"passed"}' });
+  drv(d, ['landed', 't1', '--sha', 'abc']);
+  drv(d, ['chip', 't2', '--id', 'chip-t2']);
+  drv(d, ['done', 't2'], { stdin: '{"verified":"ran true","outcome":"passed"}' });
+  drv(d, ['landed', 't2', '--sha', 'def']);
+  const red = drv(d, ['ci', '--status', 'red', '--why', 'the suite blew up']);
+  ok('CI red is recorded as a defect', red.code === 0 && has(red.out, 'recorded') && has(red.out, 'red'));
+  const skip = drv(d, ['ci', '--status', 'skipped', '--why', 'no runners']);
+  ok('CI skipped needs and takes a why', skip.code === 0, skip.out.split('\n')[0]);
+  const listEmpty = drv(d, ['ci', 'list']);
+  ok('ci list reports its checkpoints', has(listEmpty.out, 'checkpoint(s)'));
+}
+
+// ------------------------------------------------------------------ slot doors
+// slot status and free on an empty slot are calm; take claims it by hand.
+say('slot status and free speak plainly when nothing is held');
+{
+  const d = box('slots');
+  ok('slot status says nothing is held', has(drv(d, ['slot', 'status']).out, 'no slot is held'));
+  ok('slot free says it was already free', has(drv(d, ['slot', 'free', 'ci']).out, 'already free'));
+  const take = drv(d, ['slot', 'take', 'ci', '--task', 't1']);
+  ok('slot take claims it by hand', take.code === 0 && has(take.out, 'taken'));
+  const taken = drv(d, ['slot', 'take', 'ci', '--task', 't1']);
+  ok('a second take is refused', taken.code !== 0 && has(taken.out, 'held by'));
+}
+
+// --------------------------------------------------------- board reports state
+// Board shows the round, open owed items, and held work that can now start.
+say('board reports the round and any held-but-freed work');
+{
+  const d = box('boardstate');
+  drv(d, ['owed', 'add', '--to', 't1', '--what', 'drop the shim', '--why', 'window']);
+  const out = drv(d, ['board']).out;
+  ok('board names the owed item', has(out, 'owed: 1 open'));
+  ok('board names the round', has(out, 'round 1 of 2'));
+}
+
+// ----------------------------------------------------- ingest from a transcript
+// ingest reads the transcript directory under ~/.claude/projects, and an
+// entry written from a subdirectory of the run still belongs to it.
+say('ingest finds the transcript directory and keeps a subdir-cwd line');
+{
+  const d = box('ingestsub');
+  // Override HOME so transcriptDir resolves to our scratch dir, and write a
+  // transcript whose cwd is a subdirectory of this run.
+  const fakeHome = fs.mkdtempSync(path.join(os.tmpdir(), 'orch-home-'));
+  const proj = path.join(fakeHome, '.claude/projects');
+  fs.mkdirSync(proj, { recursive: true });
+  const projDir = path.join(proj, d.replace(/[/_]/g, '-'));
+  fs.mkdirSync(projDir, { recursive: true });
+  const sub = path.join(d, 'apps/api');
+  const body = 't1 is done.\nTHE-CONCLUSION';
+  fs.writeFileSync(path.join(projDir, 'session.jsonl'), JSON.stringify({ type: 'user', cwd: sub,
+    timestamp: '2026-01-01T09:00:00.000Z', uuid: 'sub1', sessionId: 's1',
+    message: { role: 'user', content: 'Another Claude session sent a message:\n' +
+      '<cross-session-message from="uds:/x.sock" from-name="peer-a">\n' + body +
+      '\n</cross-session-message>\n' } }) + '\n');
+  const old = process.env.HOME;
+  process.env.HOME = fakeHome;
+  const res = drv(d, ['ingest']);
+  process.env.HOME = old;
+  ok('ingest found the transcript directory', res.code === 0 && has(res.out, 'transcript(s)'));
+  ok('the subdirectory-cwd line was kept', has(res.out, 'from a directory under this one'));
+}
+
+// --------------------------------------------------------------- owed settles
+// owed done and defect fixed record a resolution.
+say('owed done and defect fixed record a resolution');
+{
+  const d = box('oweddone');
+  drv(d, ['owed', 'add', '--what', 'drop the shim', '--why', 'window']);
+  const oid = (reg(d).owed || [])[0].id;
+  drv(d, ['defect', 'add', '--task', 't1', '--kind', 'bug', '--what', 'w']);
+  const did = (reg(d).defects || []).find((x) => x.task === 't1').id;
+  ok('owed done settles it', has(drv(d, ['owed', 'done', oid]).out, 'settled'));
+  ok('defect fixed clears it', has(drv(d, ['defect', 'fixed', did]).out, 'marked fixed'));
+}
+
+// --------------------------------------------------------- render, in its cover
+// render with nothing answered dies; a hollow "answered" is refused cleanly.
+say('render refuses an empty register and a hollow answer');
+{
+  const d = planBox('rendernone', '# p\n\n## What is open\n\nThe retry limit is TBD.\n');
+  drv(d, ['scan']);
+  const none = drv(d, ['render']);
+  ok('render with nothing answered says so', none.code !== 0 && has(none.out, 'nothing answered yet'));
+  const g = gapsOf(d)[0].id;
+  drv(d, ['set', g, 'status=answered']);   // a claim with no answer under it
+  const hollow = drv(d, ['render']);
+  ok('render refuses a hollow answered claim', hollow.code !== 0 && has(hollow.out, 'no answer recorded'));
+}
+
+// ------------------------------------------------------ refine check, all gates
+// refine check refuses unrefined plans and a reopened gap, and reads git status.
+say('refine check names every plan still unrefined');
+{
+  const d = planBox('refinecheck', '# p\n\n## What is open\n\nThe retry limit is TBD.\n');
+  drv(d, ['scan']);
+  const g = gapsOf(d)[0].id;
+  drv(d, ['set', g, 'status=gap', 'scope=in']);
+  drv(d, ['answer', g], { stdin: JSON.stringify({ choice: 'Store it' }) });
+  const chk = drv(d, ['refine', 'check']);
+  ok('refine check refuses a never-refined plan', chk.code !== 0 && has(chk.out, 'not refined'));
+}
+
+// --------------------------------------------------------- graph, the collision
+// graph reports two tasks that move the same serialisation point.
+say('graph names a shared serialisation point');
+{
+  const d = box('graphpoint');
+  drv(d, ['task', 'add'], { stdin: JSON.stringify([
+    { key: 't2', serialises: ['alembic-head'] },
+  ]) });
+  drv(d, ['task', 'add'], { stdin: JSON.stringify([
+    { key: 't1', serialises: ['alembic-head'] },
+  ]) });
+  const out = drv(d, ['graph']);
+  ok('graph names the shared point', out.code !== 0 && has(out.out, 'serialisation point'));
+}
+
+// ------------------------------------------------------------- frontier, unproven
+// A landing with no CI checkpoint is reported as unproven drift.
+say('frontier reports landings beyond the last checkpoint');
+{
+  const d = box('frontierunproven');
+  drv(d, ['chip', 't1', '--id', 'chip-t1']);
+  drv(d, ['done', 't1'], { stdin: '{"verified":"ran true","outcome":"passed"}' });
+  drv(d, ['landed', 't1', '--sha', 'abc']);
+  ok('frontier names the unproven landing', has(drv(d, ['frontier']).out, 'since the last CI checkpoint'));
+}
+
+// ------------------------------------------------------------------ whoami here
+// whoami lists the sessions for this directory.
+say('whoami lists the sessions for this directory');
+{
+  const d = bare('whoamihere');
+  const sess = path.join(d, 'home/.claude/sessions');
+  fs.mkdirSync(sess, { recursive: true });
+  fs.writeFileSync(path.join(sess, 'a.json'), JSON.stringify({ sessionId: 'aa', name: 'boss-a', cwd: d }));
+  fs.writeFileSync(path.join(sess, 'b.json'), JSON.stringify({ sessionId: 'bb', name: 'boss-b', cwd: path.join(d, 'elsewhere') }));
+  const old = process.env.HOME;
+  process.env.HOME = path.join(d, 'home');
+  const res = drv(d, ['whoami']);
+  process.env.HOME = old;
+  ok('whoami lists only the sessions in this directory', has(res.out, 'Live sessions in this directory') && has(res.out, 'boss-a') && !has(res.out, 'boss-b'));
+}
+
+// --------------------------------------------------- brief with a context it owns
+// A brief says when a context path is also one of the files it may change.
+say('brief marks a context it also owns as enditable');
+{
+  const d = box('briefcontext');
+  drv(d, ['task', 'add'], { stdin: JSON.stringify([
+    { key: 't1', context: [{ path: 'src/a.py', what: 'the helper' }], owns: ['src/a.py'] },
+  ]) });
+  ok('brief resolves a context path it also owns', drv(d, ['brief', 't1', '--stdout']).code === 0 &&
+     !/\(read it, do not change it/.test(drv(d, ['brief', 't1', '--stdout']).out));
+}
+
+// ---------------------------------------------------------------- doctor points
+// A serialisation point named by only one task gates nothing; doctor says so.
+say('doctor reports a serialisation point nobody shares');
+{
+  const d = box('doctorlone');
+  drv(d, ['task', 'add'], { stdin: JSON.stringify([{ key: 't1', serialises: ['alembic-head'] }]) });
+  const out = drv(d, ['doctor']);
+  ok('doctor names the lone serialisation point', has(out.out, 'only one task names') && has(out.out, 'alembic-head'));
+}
+
+// --------------------------------------------------------------- ci next round
+// Green with open owed items warns; a green close names the next round.
+say('ci green names the next round and flags open owed items');
+{
+  const d = box('cinext');
+  drv(d, ['owed', 'add', '--to', 't1', '--what', 'drop the shim', '--why', 'window']);
+  drv(d, ['chip', 't1', '--id', 'chip-t1']);
+  drv(d, ['done', 't1'], { stdin: '{"verified":"ran true","outcome":"passed"}' });
+  drv(d, ['landed', 't1', '--sha', 'abc']);
+  drv(d, ['chip', 't2', '--id', 'chip-t2']);
+  drv(d, ['done', 't2'], { stdin: '{"verified":"ran true","outcome":"passed"}' });
+  drv(d, ['landed', 't2', '--sha', 'def']);
+  const green = drv(d, ['ci', '--status', 'green', '--ref', 'run-x']);
+  ok('green warns about the still-open owed item', has(green.out, 'owed item(s) still open'));
+  ok('green says the round that can open next', has(green.out, 'may now be opened'));
+}
+
+// ------------------------------------------------------------- digest and outstanding
+// digest and outstanding both surface what is still waiting.
+say('digest and outstanding surface the waiting work');
+{
+  const d = box('digestout');
+  drv(d, ['heard', 't1', '--kind', 'question', '--text', 'which settings file did you mean']);
+  ok('outstanding names the question', has(drv(d, ['outstanding']).out, 'asked you something'));
+  ok('digest names it too', has(drv(d, ['digest']).out, 'Waiting on you'));
+}
+
+// --------------------------------------------------------- board, in its cover
+// board shows a stuck-held task and a trespass in the main checkout.
+say('board flags both stale briefs and a main-checkout trespass');
+{
+  const d = box('boardtres');
+  // a dirty file that a task owns is a trespass
+  fs.writeFileSync(path.join(d, 'src/a.py'), 'changed\n');
+  const out = drv(d, ['board']).out;
+  ok('board names the trespass', has(out, 'main checkout has changes') && has(out, 'src/a.py'));
+}
+
+// -------------------------------------------------------------- slot run, wait
+// slot run takes the slot, runs a command, and frees it; wait only waits.
+say('slot run executes behind the slot and a stale holder is taken over');
+{
+  const d = box('slotrun');
+  const run = drv(d, ['slot', 'run', 'ci', '--', 'true']);
+  ok('slot run runs the command and frees the slot', run.code === 0);
+  const wait = drv(d, ['slot', 'wait', 'ci']);
+  ok('slot wait reports the slot free', wait.code === 0 && has(wait.out, 'became free'));
+  // Plant a stale holder; the next run steals it.
+  const lock = path.join(d, '.claude/orchestration/slots/ci.lock');
+  fs.mkdirSync(lock, { recursive: true });
+  fs.writeFileSync(path.join(lock, 'holder.json'), JSON.stringify({ token: 'old', manual: true,
+    pid: null, host: os.hostname(), task: 'ghost', since: '2020-01-01T00:00:00.000Z' }));
+  const steal = drv(d, ['slot', 'run', 'ci', '--', 'true']);
+  ok('a stale holder is taken over', steal.code === 0);
+}
+
+// --------------------------------------------------------- bundle carries a preflight
+// Bundling absorbs a member's pre-flight into the host, and says what never flew.
+say('bundle carries a member pre-flight to the host');
+{
+  const d = box('bundlecarry');
+  const rep = path.join(d, '.claude/orchestration/preflight/t2.json');
+  fs.mkdirSync(path.dirname(rep), { recursive: true });
+  fs.writeFileSync(rep, JSON.stringify({ missing: [{ path: 'src/b.js', why: 'the helper', evidence: 'src/a.js:3', loadBearing: true }],
+    serialises: [], verify: [], notes: 'carried' }) + '\n');
+  drv(d, ['preflight', 'done', 't2']);
+  const out = drv(d, ['bundle', 't1', 't2', '--into', 't1']);
+  ok('the bundle carried the pre-flight gap', has(out.out, 'carried across: 1 pre-flight gap(s)'));
+  ok('and said the never-flown member', has(out.out, 'never pre-flighted'));
+}
+
+// ------------------------------------------------------------- render in detail
+// A full render writes rejected alternatives, conditions and reach-back notes.
+say('render writes the rejected, carried and reach-back detail');
+{
+  const d = planBox('renderdetail', '# the plan\n\n## What is open\n\nThe retry limit is TBD.\n');
+  drv(d, ['scan']);
+  const g = gapsOf(d)[0].id;
+  drv(d, ['set', g, 'status=gap', 'scope=in', 'title=Retry']);
+  drv(d, ['answer', g], { stdin: JSON.stringify({ choice: 'Store it',
+    rejected: [{ what: 'Compute it', why: 'slow' }], carries: ['keep the cache warm'],
+    reaches_back: 'the cache layer is already there', note: 'decided' }) });
+  drv(d, ['render']);
+  const doc = fs.readFileSync(path.join(d, 'docs/decisions-implementation.md'), 'utf8');
+  ok('the decision file carries the choice', has(doc, 'Store it'));
+  ok('it records the turned-down option', has(doc, 'Compute it') && has(doc, 'slow'));
+  ok('it records the conditions carried', has(doc, 'keep the cache warm'));
+  ok('it records the reach-back', has(doc, 'cache layer is already there'));
+}
+
+// ------------------------------------------------ owed assign to finished work
+// owed assign refuses a task whose window is already shut.
+say('owed assign refuses work that is already over');
+{
+  const d = box('owedshut');
+  drv(d, ['owed', 'add', '--to', 't1', '--what', 'drop the shim', '--why', 'window']);
+  drv(d, ['chip', 't1', '--id', 'chip-t1']);
+  drv(d, ['done', 't1'], { stdin: '{"verified":"ran true","outcome":"passed"}' });
+  drv(d, ['landed', 't1', '--sha', 'abc']);
+  const oid = (reg(d).owed || [])[0].id;
+  const res = drv(d, ['owed', 'assign', oid, '--to', 't1']);
+  ok('assign to landed work is refused', res.code !== 0 && has(res.out, 'window is already shut'));
+}
+
+// ------------------------------------------ brief narrows a whole-tree check
+// A pathable verify command is narrowed to the files the task actually owns.
+say('brief narrows a whole-tree linter to the owned files');
+{
+  const d = box('scopetool');
+  drv(d, ['task', 'add'], { stdin: JSON.stringify([{ key: 't1', verify: ['ruff .'], owns: ['src/a.py'] }]) });
+  const out = drv(d, ['brief', 't1', '--stdout']);
+  ok('brief rewrites the whole-tree check', has(out.out, 'ruff src/a.py'));
+}
+
+// ------------------------------------------------------------- render across plans
+// render reports which plans gained a decision and which were left alone.
+say('render names the plans it touched and those it left');
+{
+  const d = planBox('rendertouch', '# p\n\n## What is open\n\nThe retry limit is TBD.\n\nThe upload cap is TBD too.\n');
+  drv(d, ['scan']);
+  const gs = gapsOf(d);
+  const g0 = gs[0].id;
+  drv(d, ['set', g0, 'status=gap', 'scope=in', 'title=Retry']);
+  drv(d, ['answer', g0], { stdin: JSON.stringify({ choice: 'Store it' }) });
+  for (const x of gs) { if (x.id === g0) continue; drv(d, ['set', x.id, 'status=dropped']); }
+  const out = drv(d, ['render']);
+  ok('render writes the decisions file', out.code === 0 && has(out.out, 'wrote'));
+}
+
+// ------------------------------------------------------- re-refinding a live task
+// refine done on a task that already exists widens it rather than resetting it.
+say('refine done widens a task that is already on the record');
+{
+  const d = planBox('refineupdate', '# p\n\n## What is open\n\nThe retry limit is TBD.\n');
+  drv(d, ['scan']);
+  const g = gapsOf(d)[0].id;
+  drv(d, ['set', g, 'status=gap', 'scope=in']);
+  drv(d, ['answer', g], { stdin: JSON.stringify({ choice: 'Store it' }) });
+  drv(d, ['refine', 'done', 'plan'], { stdin: JSON.stringify({ summary: 'ok', builtOn: [],
+    tasks: [{ key: '1.1', title: 'wiring', owns: ['src/a.js'], needs: [], verify: ['true'] }], newGaps: [] }) });
+  const r1 = tasksOf(d).find((t) => t.key === '1.1');
+  drv(d, ['refine', 'done', 'plan'], { stdin: JSON.stringify({ summary: 'ok again', builtOn: [],
+    tasks: [{ key: '1.1', title: 'wiring, wider', owns: ['src/a.js', 'src/b.js'], needs: [], verify: ['true'] }], newGaps: [] }) });
+  const r2 = tasksOf(d).find((t) => t.key === '1.1');
+  ok('a re-refine widens owns instead of resetting it', (r2.owns || []).includes('src/b.js'));
+}
+
+// ---------------------------------------------------- digest with owed and drift
+// digest reports an open owed item and unproven landings.
+say('digest reports owed work and unproven landings');
+{
+  const d = box('digestdrift');
+  drv(d, ['owed', 'add', '--to', 't1', '--what', 'drop the shim', '--why', 'window']);
+  drv(d, ['chip', 't1', '--id', 'chip-t1']);
+  drv(d, ['done', 't1'], { stdin: '{"verified":"ran true","outcome":"passed"}' });
+  drv(d, ['landed', 't1', '--sha', 'abc']);
+  const out = drv(d, ['digest']).out;
+  ok('digest names the open owed item', has(out, '**Owed**'));
+  ok('digest reports unproven landings', has(out, 'landing(s) since the last CI checkpoint'));
+}
+
+// ------------------------------------------------------ outstanding, a report
+// outstanding names work that has reported and is waiting on the check.
+say('outstanding names reported work awaiting the check');
+{
+  const d = box('outreport');
+  drv(d, ['chip', 't1', '--id', 'chip-t1']);
+  drv(d, ['done', 't1'], { stdin: '{"verified":"ran true","outcome":"passed"}' });
+  ok('outstanding puts the report on you', has(drv(d, ['outstanding']).out, 'waiting on your check'));
+}
+
+// ----------------------------------------------------------- ingest wrapper note
+// ingest says when it re-derived an entry that had carried the wrapper.
+say('ingest says when an old entry still carries the wrapper');
+{
+  const d = box('ingestwrap');
+  const fx = fs.mkdtempSync(path.join(os.tmpdir(), 'orch-fx-wrap-'));
+  const body = 't1 is done.\nTHE-CONCLUSION';
+  const wrapped = 'Another Claude session sent a message:\n' +
+    '<cross-session-message from="uds:/x.sock" from-name="peer-a" from-mode="prompting">\n' + body +
+    '\n</cross-session-message>\n';
+  fs.writeFileSync(path.join(fx, 't.jsonl'), JSON.stringify({ type: 'user', cwd: d,
+    timestamp: '2026-01-01T09:00:00.000Z', uuid: 'wx1', sessionId: 's1',
+    message: { role: 'user', content: wrapped } }) + '\n');
+  drv(d, ['ingest', '--from', fx]);
+  boxes.push(fx);
+  const out = drv(d, ['ingest', '--from', fx]);
+  ok('ingest dedupes the same message on a second pass', has(out.out, '0 new to the ledger'));
+}
+
+// ------------------------------------------ graph's mid-edit and read-only notes
+// graph flags a task reading a file another task is rewriting in the same round.
+say('graph flags a task reading a file a sibling is rewriting');
+{
+  const d = box('graphcontext');
+  drv(d, ['task', 'add'], { stdin: JSON.stringify([
+    { key: 't1', context: [{ path: 'src/b.py', what: 'the helper' }] },
+  ]) });
+  const out = drv(d, ['graph']);
+  ok('graph names the mid-edit read', out.code !== 0 && has(out.out, 'mid-edit'));
+}
+
+// --------------------------------------------------------- graph, read-only note
+// A task builds on a path it may not change, and the owner is also open.
+say('graph says when a build-on path is read-only');
+{
+  const d = box('graphreadonly');
+  drv(d, ['task', 'add'], { stdin: JSON.stringify([
+    { key: 't1', context: [{ path: 'src/b.py', what: 'the helper' }], owns: ['src/a.py'] },
+  ]) });
+  const out = drv(d, ['graph']);
+  ok('graph names the read-only build-on', has(out.out, 'read-only'));
+}
+
+// ---------------------------------------------------------- tasks and their shape
+// task add validates a context field and refuses a malformed one.
+say('task add refuses a malformed context entry');
+{
+  const d = box('taskcontext');
+  const res = drv(d, ['task', 'add'], { stdin: JSON.stringify([
+    { key: 'x1', title: 'x', plan: 'docs/plans/p.md', owns: ['src/z.py'], needs: [], context: ['not-an-object'] },
+  ]) });
+  ok('a context that is not {path, what} is refused', res.code !== 0 && has(res.out, 'context must be'));
+}
+
+// --------------------------------------------------------- render, plan by plan
+// render wrote one plan's decisions and left the other alone.
+say('render touches one plan and names the other untouched');
+{
+  const d = bare('rendertouch2');
+  fs.mkdirSync(path.join(d, 'docs'), { recursive: true });
+  fs.writeFileSync(path.join(d, 'docs/a.md'), '# a\n\n## What is open\n\nThe retry limit is TBD.\n');
+  fs.writeFileSync(path.join(d, 'docs/b.md'), '# b\n\n## What is open\n\nThe upload cap is TBD.\n');
+  drv(d, ['load', 'docs/a.md', 'docs/b.md']);
+  drv(d, ['scan']);
+  for (const g of gapsOf(d)) {
+    if (g.plan === 'docs/a.md') { drv(d, ['set', g.id, 'status=gap', 'scope=in']); drv(d, ['answer', g.id], { stdin: JSON.stringify({ choice: 'Store it' }) }); }
+    else { drv(d, ['set', g.id, 'status=dropped']); }
+  }
+  const out = drv(d, ['render']);
+  ok('render says the other plan was untouched', out.code === 0 && has(out.out, 'unchanged, nothing was decided for them: docs/b.md'));
+  ok('render points at the touched plan', has(out.out, 'render --plan docs/a.md'));
+}
+
+// ------------------------------------------------------- refine with no tasks
+// A refinement that proposes no task cannot be handed out.
+say('refine check refuses a refinement that produced no task');
+{
+  const d = planBox('refinenotasks', '# p\n\n## What is open\n\nThe retry limit is TBD.\n');
+  drv(d, ['scan']);
+  const g = gapsOf(d)[0].id;
+  drv(d, ['set', g, 'status=gap', 'scope=in']);
+  drv(d, ['answer', g], { stdin: JSON.stringify({ choice: 'Store it' }) });
+  drv(d, ['refine', 'done', 'plan'], { stdin: JSON.stringify({ summary: 'ok', builtOn: [], tasks: [], newGaps: [] }) });
+  const chk = drv(d, ['refine', 'check']);
+  ok('refine check refuses with no task proposed', chk.code !== 0 && has(chk.out, 'no tasks proposed'));
+}
+
+// ------------------------------------------- brief narrows a check in a subdir
+// A whole-tree check scoped to a subdirectory is rebased onto those paths.
+say('brief rebases a check that already runs in a subdirectory');
+{
+  const d = box('scopecwd');
+  drv(d, ['task', 'add'], { stdin: JSON.stringify([{ key: 't1', verify: ['ruff --directory apps/api .'], owns: ['apps/api/src/a.py'] }]) });
+  const out = drv(d, ['brief', 't1', '--stdout']);
+  ok('brief keeps the tool in its subdirectory', has(out.out, 'ruff --directory apps/api'));
+}
+
+// -------------------------------------------------------------- defect list
+// defect list shows open defects and --all the settled ones.
+say('defect list separates open from fixed');
+{
+  const d = box('defectlist');
+  drv(d, ['defect', 'add', '--task', 't1', '--kind', 'bug', '--what', 'a wrong helper']);
+  const did = (reg(d).defects || []).find((x) => x.task === 't1').id;
+  ok('defect list shows the open one', has(drv(d, ['defect', 'list']).out, did));
+  drv(d, ['defect', 'fixed', did]);
+  ok('defect list hides a fixed one', !has(drv(d, ['defect', 'list']).out, did));
+  ok('defect list --all shows it again', has(drv(d, ['defect', 'list', '--all']).out, did));
+}
+
+// ----------------------------------------------------------------- the real corpus
 // Everything else in this file was written to satisfy the check it feeds. This
 // was not: it is a real run's record and register, trimmed but not invented.
 say('verify is green on a recorded run nobody made up');
@@ -820,7 +1699,7 @@ else console.log('\nsandboxes kept: ' + boxes.join('\n                '));
 // an exception thrown before its first `ok`, a case quietly commented out — and
 // the suite still ends on "all green", because green is only ever measured
 // against however many checks happened to run.
-const EXPECTED = 143;   // every check above counts; raise it deliberately when you add one
+const EXPECTED = 273;   // every check above counts; raise it deliberately when you add one
 
 console.log('\n' + '-'.repeat(60));
 if (pass + failures.length !== EXPECTED)

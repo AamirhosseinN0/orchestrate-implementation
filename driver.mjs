@@ -205,7 +205,7 @@ function applyOps(state, ops) {
 // the source of truth, not a message ledger.
 function readEvents({ tolerateTail = true } = {}) {
   const f = eventsPath();
-  if (!fs.existsSync(f)) return { events: [], problems: [], bytesGood: 0 };
+  if (!fs.existsSync(f)) return { events: [], problems: [], bytesGood: 0, ends: [] };
   // A record that is a directory, or that this user cannot read, is bad input like
   // any other bad input. It used to come out as a raw Node stack trace from every
   // single command, which tells the person nothing about what to do next.
@@ -221,7 +221,7 @@ function readEvents({ tolerateTail = true } = {}) {
         '       Fix its permissions, or recover it from .claude/orchestration/backups/.');
   }
   const lines = raw.split('\n');
-  const events = [], problems = [];
+  const events = [], problems = [], ends = [];
   let bytesGood = 0;
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
@@ -239,8 +239,9 @@ function readEvents({ tolerateTail = true } = {}) {
     }
     events.push(e);
     bytesGood += Buffer.byteLength(line) + 1;
+    ends.push(bytesGood);   // where this event's line ends — what `--to` truncates at
   }
-  return { events, problems, bytesGood };
+  return { events, problems, bytesGood, ends };
 }
 
 // A final line with no trailing newline is not corruption yet, but the next append
@@ -320,7 +321,7 @@ function cmdRebuild(flags) {
   // the pair to be a single moment. `verify` locks for the same reason it reads
   // twice; `rebuild` locks because it writes.
   acquireLock();
-  const { events, problems } = readEvents();
+  const { events, problems, ends } = readEvents();
   const fatal = problems.find((x) => x.fatal);
   if (fatal) die('the record is damaged at line ' + fatal.line + ' — ' + fatal.why + '.\n' +
     '       Not rebuilding from a log with a hole in it.');
@@ -349,6 +350,26 @@ function cmdRebuild(flags) {
   writeReg(state);
   console.log('rebuilt ' + rel(REG_PATH) + ' from ' + use.length + ' event(s) (seq ' + lastSeq + ').');
   console.log('The previous file was kept in backups/ — nothing was thrown away.');
+  // Rewinding the register while leaving the record at full length leaves the run
+  // permanently drifted: the register says seq N, the log says seq maxSeq, and
+  // every `verify` from then on reports the difference as damage. The two halves
+  // move together or not at all — so cut the log to the same point, keeping the
+  // full original beside it so the rewind is still reversible.
+  if (to !== undefined) {
+    const f = eventsPath();
+    const cutIdx = events.reduce((m, e, i) => ((e.seq || 0) <= upto ? i : m), -1);
+    const cut = cutIdx >= 0 ? ends[cutIdx] : 0;
+    let size = 0;
+    try { size = fs.statSync(f).size; } catch { /* gone */ }
+    if (cut < size) {
+      const keep = f + '.before-rewind-' + now().replace(/[:.]/g, '-');
+      fs.copyFileSync(f, keep);
+      fs.truncateSync(f, cut);
+      console.log('The record was cut to the same point, so the two stay in step.');
+      console.log('The full record as it was is kept at ' + rel(keep) + ' — ' +
+        (events.length - use.length) + ' event(s) beyond seq ' + lastSeq + ' are only there now.');
+    }
+  }
 }
 
 function cmdEvents(flags) {

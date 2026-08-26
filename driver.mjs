@@ -3032,7 +3032,11 @@ function cmdOutstanding() {
   console.log('These are waiting on you. Deal with each one — none of them will ask twice.\n');
   for (const x of rows) {
     console.log('  ' + x.key.padEnd(10) + x.why);
-    if (x.detail) console.log('             “' + x.detail + '”');
+    // Clip here rather than in each rule: a thorough agent's report runs to
+    // thousands of characters, and one of them printed whole buries the other
+    // nine rows. This is the index, not the document — `show <key>` has it all.
+    const d = String(x.detail || '').replace(/\s+/g, ' ').trim();
+    if (d) console.log('             “' + d.slice(0, 110) + (d.length > 110 ? '…”' : '”'));
     if (x.since) console.log('             since ' + x.since.slice(0, 19).replace('T', ' '));
   }
   console.log('\n' + rows.length + ' outstanding.');

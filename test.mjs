@@ -4,7 +4,13 @@
 //
 // Every case here failed before the fix it guards. A check nobody has watched
 // fail is not a check, so where a case guards a specific defect the comment says
-// what the old behaviour was.
+// what the old behaviour was. The way to watch them fail is to run this file
+// against the driver as it stood before the fixes — copy it, its fixtures and
+// that driver into one directory and run it there.
+//
+// A handful of checks are anchors rather than guards: they say the thing the
+// next line denies is actually present, so that "X is not in the output" cannot
+// pass on an empty page. They are marked where they appear.
 //
 //   node test.mjs            run it
 //   node test.mjs --keep     leave the sandbox behind to poke at
@@ -809,7 +815,7 @@ else console.log('\nsandboxes kept: ' + boxes.join('\n                '));
 // an exception thrown before its first `ok`, a case quietly commented out — and
 // the suite still ends on "all green", because green is only ever measured
 // against however many checks happened to run.
-const EXPECTED = 143;   // every check below counts; bump this deliberately when you add one
+const EXPECTED = 143;   // every check above counts; raise it deliberately when you add one
 
 console.log('\n' + '-'.repeat(60));
 if (pass + failures.length !== EXPECTED)

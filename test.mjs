@@ -8,9 +8,9 @@
 // against the driver as it stood before the fixes — copy it, its fixtures and
 // that driver into one directory and run it there.
 //
-// A handful of checks are anchors rather than guards: they say the thing the
-// next line denies is actually present, so that "X is not in the output" cannot
-// pass on an empty page. They are marked where they appear.
+// A handful of checks are anchors rather than guards. They say that the setup
+// the next line judges really happened, so that "X is not in the output" cannot
+// pass on an empty page and "none of them does Y" cannot pass on an empty list.
 //
 //   node test.mjs            run it
 //   node test.mjs --keep     leave the sandbox behind to poke at

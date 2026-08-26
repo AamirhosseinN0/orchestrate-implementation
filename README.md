@@ -99,6 +99,7 @@ payload.
 ```
 .claude/orchestration/
   register.json          every decision, gap and task
+  events.jsonl           the record every one of those changes appends to
   refine/<plan>.json     what each refining agent found, in its own words
   briefs/<key>.md        exactly what each chip was told
   messages.jsonl         every word that passed between the two
@@ -124,13 +125,20 @@ And when the session running everything ends, the run is recoverable rather than
 lost: a new one takes it over, rewrites every brief with its own address, and is
 handed the re-announcement to send to each agent still working.
 
-Recording a report the agent did not write is refused outright:
+Recording a report with nothing behind it is refused:
 
 ```
 error: no report at .claude/orchestration/refine/docs-plans-2.1.json and nothing on stdin.
        The agent was told to write its report to that path. Ask it to,
        rather than retyping what it told you — that is how files get dropped.
 ```
+
+Pipe the JSON in and it is taken anyway, with a warning that says so. That hatch
+is open on purpose, and it is the one place in the design where the payload
+travels through a context rather than a file — which is the thing the rest of it
+is built to avoid. On the one real run there is a record of, it was not the
+escape but the norm: nine plans refined, nine reports typed in, no `refine/`
+folder on disk at all. Read the warning as a defect in the run.
 
 And a record corrected after its brief went out does not silently disagree with
 what the agent is holding:
@@ -268,12 +276,23 @@ it. And nothing opens before its requirements land — a chip copies the
 repository when it is opened, so an early chip is stale by exactly what it
 waited for.
 
+Recording a chip takes the id of the thing actually running the work
+(`chip 2.1 --id <task_id>`), and it is required the first time. That is not
+bookkeeping: the checks above run on the call that sets the id, so a chip
+recorded without one is a chip recorded with the gate switched off. It is
+refused rather than defaulted, for the same reason an empty `owns` is.
+
 **The machine itself is a serialisation point.** Seven open chips means seven
 full test suites can start at once — a memory panic, not a speed-up. So heavy
 checks share one slot: taken atomically (two agents seeing "free" at the same
 instant cannot both win), freed by the holder's process exiting rather than by
-anyone remembering, stolen if the holder dies or overstays, polled every ~10
-seconds by whoever is waiting. A generated wrapper makes it one word long:
+anyone remembering, polled every ~10 seconds by whoever is waiting. A holder
+whose process is still alive is never taken from, however long it runs — a slow
+suite is still a running suite, and starting a second one beside it is the crash
+the slot exists to stop. There is a time limit, but it only reaches a holder
+whose liveness cannot be established: another machine, or a claim taken by hand.
+Installing packages counts as heavy too, which is where a stampede used to start.
+A generated wrapper makes it one word long:
 
 ```bash
 .claude/orchestration/bin/with-ci-slot pnpm -C apps/api test
@@ -326,6 +345,8 @@ Only then is it joined in a staging copy, run in full, and merged.
 | `SKILL.md` | the workflow — the three acts, what the agent reads and follows |
 | `driver.mjs` | the bookkeeping: scanning, the question linter, the task graph, the board |
 | `reference/plain-words.md` | the vocabulary to reach for instead of jargon |
+| `test.mjs` | the driver's own sweep, run in a throwaway git repo |
+| `acceptance.sh` | 32 end-to-end cases, each one a bug reproduced before it was fixed |
 
 The driver does the parts a model does badly — remembering every gap it found,
 refusing to call a session finished while one is unanswered, and holding each
@@ -347,13 +368,21 @@ node driver.mjs            # every command
   preflight/<key>.json   what each pre-flight agent found
   briefs/<key>.md        exactly what each chip was told
   messages.jsonl         every word that passed between the two
+  bin/with-ci-slot       the wrapper the heavy checks are run through
+  slots/                 the shared machine slot, while somebody holds it
 ```
 
 `verify` replays the record and proves it still equals the register; `rebuild
---to <seq>` reconstructs any earlier state from it. Because a removal is
-recorded like any other change, `archive` can take finished detail off landed
-and cancelled tasks — on a 54-task run that was 54% of the file — without the
-register and its own history drifting apart.
+--to <seq>` reconstructs any earlier state from it, and cuts the record to the
+same point so the two do not drift apart, keeping what it cut beside it. Because
+a removal is recorded like any other change, `archive` can take finished detail
+off landed and cancelled tasks — on a 54-task run that was 54% of the file —
+without the register and its own history drifting apart.
+
+The register is one run's working state rather than part of the project, so it
+is usually kept out of the project's history. Nothing here does that for you:
+decide it once, and remember that if it is ignored, the 30-deep backup ring is
+the only history the run has.
 
 Work that is only possible in a window between two pieces gets a first-class
 record (`owed`) — a round refuses to close silently on top of one, and when the
@@ -362,6 +391,11 @@ somebody to notice.
 
 `node test.mjs` runs the sweep: the whole lifecycle plus a case for every
 defect fixed so far, in a throwaway git repo.
+
+`bash acceptance.sh /path/to/driver.mjs` runs the second harness — 32 cases
+written against the audit rather than against the fixes, each one reproduced on
+the unfixed driver first. It drives a real recorded run, which it looks for in a
+`replay/` folder beside itself; without one every case that needs it skips.
 
 ## Licence
 

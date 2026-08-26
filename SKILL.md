@@ -51,12 +51,22 @@ and you read that file. Your context carries the pointer, never the payload.
 ```
 .claude/orchestration/
   register.json          every decision, gap and task
-  backups/               the last 30 states of it, kept automatically on every write
+  events.jsonl           the record — one line per change, appended, never rewritten
+  backups/               the last 30 states of the register, kept on every write
   refine/<plan>.json     what each refining agent found, in its own words
   preflight/<key>.json   what each pre-flight agent found, in its own words
   briefs/<key>.md        exactly what each chip was told
   messages.jsonl         every word that passed between you and an agent
+  bin/with-ci-slot       the wrapper the heavy checks are run through
+  slots/                 the shared machine slot, while somebody holds it
+  archive/tasks-NN.json  finished detail moved off landed and cancelled tasks
 ```
+
+Each of those is written by the tool, not by you. One is worth watching: on a
+real 56-task run every folder above was on disk **except `refine/`, which did
+not exist at all.** Nine plans were marked refined and not one agent report had
+been read from a file. See the note on `refine done` below — that is what the
+absence means.
 
 **The record is `events.jsonl`, and the register is derived from it.** Every
 change appends one line naming what actually changed and which command did it,
@@ -65,6 +75,7 @@ so the state is rebuildable from disk alone:
 ```bash
 node $DRV verify     # replay the record, prove it still equals the register
 node $DRV rebuild    # total recovery: rewrite the register from the record
+node $DRV rebuild --to 460      # wind both back to that point in the record
 node $DRV events --task 2.1     # what happened to this task, and what did it
 ```
 
@@ -73,15 +84,49 @@ and nothing can tell them apart for you: `rebuild` if the register was edited or
 damaged, `log reseed --why "..."` if the record lost its tail. Run `verify` when
 you come back to a run; the digest reports drift too.
 
+`rebuild --to <seq>` cuts the record to that point as well, so the two stay in
+step and `verify` is green straight after. What it cut is kept whole beside it as
+`events.jsonl.before-rewind-<stamp>` — the events past that point exist only
+there, so do not sweep that file until you are sure you meant the rewind.
+
 The record refuses to be silently wrong. A crash mid-write leaves a torn last
 line, which is dropped and reported, and trimmed before the next append. A bad
 line *anywhere else* is corruption and `rebuild` refuses rather than replaying a
-log with a hole in it.
+log with a hole in it. A missing `events.jsonl` is not treated as an empty one
+either: `rebuild` will not empty a full register on the strength of a record
+that is not there.
 
-The register itself is gitignored, so the backups remain a second net — thirty
-states, a no-op write burning no slot. Every driver command locks the register
-first, and the lock now asks the operating system whether its holder is alive,
-so a slow command is never mistaken for a dead one.
+`events --task <key>` is worth trusting now. Every event records the subcommand
+that made it — `chip 0.12.C`, `preflight done 0.12.C`, `owed assign o23` — so
+the filter finds the ones that touched a task, and each line says which command
+did it. It did not before: most events carried no command at all, and this line
+promised something the record could not answer. `--grep`, `--since` and `--n`
+narrow it the same way.
+
+The backups are a second net — thirty states, a no-op write burning no slot.
+They are the *only* net if the register is not in the project's history, and
+nothing here puts it there or keeps it out. Decide which, once, at the start:
+
+```bash
+grep -q '^.claude/orchestration/' .gitignore || echo '.claude/orchestration/' >> .gitignore
+```
+
+Ignoring it is the usual choice — it is one run's working state, not the
+project. Say so to the user rather than assuming it, because if it is ignored
+and the backups are swept, the run is gone.
+
+Every driver command locks the register first, and the lock asks the operating
+system whether its holder is alive, so a slow command is never mistaken for a
+dead one. `rebuild`, `verify` and `log reseed` take that lock too.
+
+A long run makes the register large — most of it finished detail on tasks nobody
+will read again. `archive` moves that out, and the record still holds it, so
+`verify` stays clean:
+
+```bash
+node $DRV archive --dry-run    # what it would move, and how much
+node $DRV archive
+```
 
 Two habits follow, and they are not optional:
 
@@ -97,7 +142,12 @@ Two habits follow, and they are not optional:
   answer is "nothing changes", it is not a check.
 - **Never summarise an agent's report into the record.** If a report is missing,
   ask the agent to write the file — do not reconstruct it from what it said in
-  the chat. `refine done` refuses rather than letting you type it in.
+  the chat. `refine done` will not stop you: with no file at the path it falls
+  back to reading stdin, prints `⚠ took the report from stdin`, and records
+  whatever you typed. That is the one place in this whole arrangement where the
+  payload goes through your context, and it is not a rare escape — on the real
+  56-task run it was every single refinement, all nine of them. Treat the
+  warning as a defect in the run, not a note.
 - **A failure is a record, not a remark.** A sendback, a guard trespass, a red
   run, a blocked message, a self-reported partial — each opens a defect with an
   id, the task, and the evidence, recorded automatically where it happens. It
@@ -324,13 +374,21 @@ node $DRV render --title "the flashcard grill" --name flashcards
 node $DRV render --plan docs/plans/2.1-flashcards.md
 ```
 
+`check` asks whether the work was done, not whether a word says so. It exits 1
+on an unjudged candidate, a gap with no scope, an in-scope gap unanswered — and
+on two states that used to walk straight past it: a register nothing was ever
+scanned against, and a gap marked answered with no answer recorded under it.
+Neither of those is a formality; an empty gap list satisfied every other
+condition, and `render` then died on the very register `check` had blessed.
+
 Write the record — that one is yours, it is what the user decided and you are
 the one who heard it.
 
-**Do not edit the plans yourself.** The settled-decisions table and the vague
-sentences that need replacing are handed to the refining agent in the next act,
-along with the codebase. It is the one that rewrites plans; you would be doing
-its job with worse information and a dirtier context.
+**Do not edit the plans yourself.** `render --plan` prints the settled-decisions
+table for a plan and `render` names the plans that gained one, but the rewriting
+goes to the refining agent in the next act, along with the codebase. It is the
+one that rewrites plans; you would be doing its job with worse information and a
+dirtier context.
 
 **Act one and a half does not begin until `check` passes.**
 
@@ -353,11 +411,14 @@ node $DRV refine list              # which plans still need it
 node $DRV refine brief docs/plans/2.1-flashcards.md
 ```
 
-The brief hands the agent the settled decisions that bind this plan, tells it to
-read the codebase and find what the work must build on, and tells it to rewrite
-the plan so every decided thing is stated as decided — **including pasting in the
-settled-decisions table**, which `render --plan` will print for you to include. It is bounded hard: it may
-touch no file but that plan, it writes no product code, and —
+The brief hands the agent the settled decisions that bind this plan — each one
+written out in the brief itself, with its conditions — tells it to read the
+codebase and find what the work must build on, and tells it to rewrite the plan
+so every decided thing is stated as decided. It does not mention the
+settled-decisions table and it does not name `render --plan`; the agent works
+from the decisions in its brief. If you want the table in the plan file as well,
+that is the line `render` prints for you when it writes the record. It is
+bounded hard: it may touch no file but that plan, it writes no product code, and —
 
 **it may decide nothing.** If it finds something the plan needs that nobody has
 settled — a number, a method, a rule that only became visible against the real
@@ -372,8 +433,7 @@ node $DRV refine done docs/plans/2.1-flashcards.md
 # read the agent's own report: .claude/orchestration/refine/docs-plans-2.1-flashcards.json
 ```
 
-If the file is not there, `refine done` refuses. Ask the agent to write it.
-Do not type in what it told you — that is exactly how a file goes missing:
+If the file is not there **and nothing is piped in**, `refine done` stops:
 
 ```
 error: no report at .claude/orchestration/refine/docs-plans-2.1-flashcards.json
@@ -382,14 +442,30 @@ error: no report at .claude/orchestration/refine/docs-plans-2.1-flashcards.json
        rather than retyping what it told you — that is how files get dropped.
 ```
 
-The shape it must write:
+**But pipe JSON in and it takes it.** It prints a warning and records it:
+
+```
+⚠ took the report from stdin, not from the agent's own file.
+  It passed through your context to get here, so check nothing was lost.
+```
+
+That hatch is open on purpose and it is the sharp edge of this act. A report
+that arrives that way came through your context, which is the one thing that
+gets compacted, so what is now on record is what you could still remember — not
+what the agent found. Do not use it. If the file is missing, the agent has not
+finished; ask it to write the file to the path in its brief.
+
+The shape it must write — `serialises` included, because `graph`, `chip` and
+pre-flight all read it and a task with an empty one is a task claiming it moves
+no migration chain, no lockfile and no closed list:
 
 ```bash
 # .claude/orchestration/refine/docs-plans-2.1-flashcards.json
 {"summary":"wrote the settled scheduler into the plan and named the queue it uses",
  "builtOn":[{"path":"packages/offline/src/outbox.ts","what":"the queue a phone already uses"}],
  "tasks":[{"key":"2.1","title":"the flashcard scheduler","needs":["0.14"],
-           "owns":["apps/api/src/core/cards"],"verify":["pnpm -C apps/api test"]}],
+           "owns":["apps/api/src/core/cards"],"serialises":["alembic-head"],
+           "verify":["pnpm -C apps/api test"]}],
  "newGaps":[{"title":"how long a phone keeps changes it could not send","why":"nothing says what happens after a week offline"}]}
 ```
 
@@ -449,16 +525,27 @@ rewriting the record:
 ```bash
 cat <<'J' | node $DRV task add
 [{"key":"0.14","title":"the sweeper and the shelf of tuned numbers","plan":"docs/plans/0.14-the-sweeper.md",
-  "needs":[],"owns":["packages/tuning","apps/api/src/core/sweeper"],
+  "needs":[],"owns":["packages/tuning","apps/api/src/core/sweeper"],"serialises":[],
   "context":[{"path":"apps/api/src/core/worker","what":"the background queue a sweep runs on — use it, do not write another"}],
   "decisions":["One shelf of tuned numbers, versioned, shipped in both builds"],
   "verify":["pnpm -C apps/api test"]},
  {"key":"2.1","title":"the flashcard scheduler","plan":"docs/plans/2.1-flashcards.md",
   "needs":["0.14"],"owns":["apps/api/src/core/cards","packages/offline/src/cards"],
+  "serialises":["alembic-head"],
   "context":[{"path":"packages/tuning","what":"the shelf 0.14 built — put your constants there"}],
   "verify":["pnpm -C apps/api test","pnpm -C packages/offline test"]}]
 J
 ```
+
+The fields it reads are `title`, `plan`, `needs`, `owns`, `serialises`,
+`context`, `verify`, `decisions`, `notes` and `branch`. Anything else is named
+back to you as ignored rather than saved.
+
+**A new task may not claim a path a live task already owns.** `task add` refuses
+the whole batch and saves nothing, naming which task holds it. That is the one
+failure this arrangement exists to prevent, and this is the cheapest moment to
+fix it. An existing pair is not re-judged — a register that already has one has
+to stay usable — so `doctor` is what reports those.
 
 **Ownership is not optional, and a shared file is only the easy case.** Two
 tasks running at the same time may never touch one file — `owns` is how that is
@@ -489,6 +576,24 @@ rather than let a broken plan out of the door. It stops three things:
 Paste the output into the chat. That is the shared picture of what can be
 launched in parallel and what each thing is waiting for. Fix the plan until it
 is green. **Do not create a single chip while `graph` exits 1.**
+
+**Read what its green actually says.** It ends by naming how many pairs of tasks
+it judged, and how many it skipped because one side had already landed:
+
+```
+✓ 8 pair(s) of tasks that could still collide were checked for shared files
+and shared serialisation points; 74 pair(s) were skipped because one side has
+already landed.
+Nothing among them clashes, so every round above can run side by side.
+That is not a statement about the run as a whole — a landed task is not re-judged.
+```
+
+Skipped pairs that did overlap are listed above that as history, under "Already
+merged, so not a gate". Both halves matter: late in a run the judged number gets
+small and the skipped number gets large, and a green over eight pairs is not the
+same claim as a green over eighty-two. Merged work is not a contender, which is
+why it is skipped — but it means the same register says "nothing clashes" today
+and would have said "these two collide" yesterday.
 
 ## 11. Pre-flight the round before opening it
 
@@ -557,7 +662,38 @@ buildable but held back and by whom, on which file or point, and what is still
 waiting for work to land. Run it after every landing — a landing frees both its
 dependents *and* every task its files were blocking.
 
-`chip` enforces the same two rules and refuses otherwise:
+Record each chip as you create it. **`--id` is required the first time**, and it
+is the whole gate:
+
+```bash
+node $DRV chip 2.1 --id task_def456
+node $DRV chip 2.1 --id task_def456 --worktree ../wt-2.1 --branch step/2.1
+```
+
+`--id` is the id the tool that created the chip gave back — it is how the record
+points from a key to the thing actually doing the work. Without it the command
+refuses and nothing is written:
+
+```
+error: chip 2.1 --id <task_id> — the chip id is how the record points at the running
+       agent. Take it from the tool that created the chip. Add --worktree <path> too if
+       the copy it works in is not the branch's own worktree.
+```
+
+That refusal is not paperwork. Every interference check below runs **only on a
+task's first chip** — the run where `--id` is being set. Call `chip` without it
+and the command stops before the checks; call it a second time on a task that
+already has an id and the checks are skipped, because the chip already exists.
+So the one call that decides whether this work may open is the one that carries
+`--id`, and there is exactly one of them per task.
+
+`--worktree` is where its copy of the repository actually sits — pass it when
+that is not the branch's own worktree, or `guard` will not find it later.
+`--branch` sets the branch the work lands on; it is honoured, so a name you pass
+here is the name `guard` and `release` will look for.
+
+On that first chip, `chip` enforces the same two rules `frontier` does and
+refuses otherwise:
 
 ```
 ✗ D would interfere with work that is open right now:
@@ -640,15 +776,31 @@ survives the window being closed:
 
 ```bash
 node $DRV done 2.1 <<'J'
-{"commit":"9f3c1ae","verified":"apps/api 214 passed","notes":"the shelf ships empty"}
+{"commit":"9f3c1ae","verified":"apps/api 214 passed","outcome":"passed","notes":"the shelf ships empty"}
 J
 ```
+
+`verified` is required — a report with no proof in it is refused. `outcome` is
+`passed`, `partial` or `failed`, and defaults to `passed` if it is left out;
+either of the other two opens a defect against the task on the spot, so the
+half-passing run cannot be rounded up. `commit` and `notes` are optional.
+
+`done` is refused on a task that has landed and on one that was never handed
+out. Both used to go through: a report on landed work rewound it, and a report
+on a task with no chip behind it was taken as if there were work under it.
 
 Then **you check it again. Its own word is not enough.**
 
 ```bash
 node $DRV guard 2.1
+node $DRV guard 2.1 --base trunk    # only if the base is not the repo's own default
 ```
+
+`guard` asks the repository what its integration branch is called rather than
+assuming `main`, so it works in a repo whose default is `trunk`, `master` or
+anything else. Pass `--base` when you want a different one. It compares without
+rename detection, so a file *moved out* of a path the task does not own still
+shows up as the deletion it is.
 
 It diffs the branch itself and marks every file — you are not comparing lists by
 eye, which is where attention goes at task forty of fifty:
@@ -675,27 +827,53 @@ owns, which is the same idea as a path filter on a CI job. On the run that
 prompted this, 38 of 131 queued checks were the same whole-repo lint, waiting
 behind database suites for no reason.
 
+Installing packages counts as heavy, whatever it looks like. `pnpm install`,
+`pip install`, `poetry lock` and their kin saturate the network, rewrite a shared
+store and churn gigabytes of disk. They used to read as cheap, and every agent
+was told to run one bare and at the same time.
+
 **The machine is still a serialisation point for the heavy half.** With six or seven chips open, six
 or seven full suites can start at once — and that is a memory panic, not a
 speed-up. So the run's heavy checks share one slot: a claim taken atomically
 (two agents seeing "free" at the same instant cannot both win), freed by the
-holder's process exiting rather than by anyone remembering, stolen if the holder
-is dead or has held it past 30 minutes, polled every ~10 seconds by whoever is
-waiting.
+holder's process exiting rather than by anyone remembering, polled every ~10
+seconds by whoever is waiting.
 
-Every brief already wires this in: a wrapper script is generated into
-`.claude/orchestration/bin/with-ci-slot`, and each verify command in a brief is
-printed *through* it. Your own round-closing CI run and any full-suite check you
-run while judging returned work go through the same wrapper:
+**A holder that is alive is never taken from.** The waiter asks the operating
+system whether the holder's process is still there, and if it is, it keeps
+waiting however long the run takes — a suite that legitimately runs past any
+limit is still running, and starting a second one beside it is the crash this
+whole thing exists to stop. The 30-minute limit applies only where liveness
+cannot be established: a claim from another machine, or one taken by hand, which
+records no process to ask about.
+
+Every brief wires this in: a wrapper script is generated into
+`.claude/orchestration/bin/with-ci-slot`, and **the heavy half** of that brief's
+checks is printed through it. The cheap half is printed bare, to run straight
+away — that is the point of the split, and a linter behind a database suite is
+the waste it was there to remove. Your own round-closing CI run and any
+full-suite check you run while judging returned work go through the same
+wrapper:
 
 ```bash
 .claude/orchestration/bin/with-ci-slot pnpm -C apps/api test
 node $DRV slot status          # who holds it, since when
 ```
 
-Never free the slot by hand while a run may be inside it — `slot free` refuses
-unless the claim is stale, because emptying it under a live run causes the exact
-crash the slot exists to stop.
+Never free a slot with a run inside it: `slot free` refuses a live `slot run`
+claim without `--force`, because emptying it under a live run causes the exact
+crash the slot exists to stop. A claim taken by hand with `slot take` is
+different — the process that took it exited on purpose, so nothing is inside it
+and `slot free ci` frees it plainly, no flag.
+
+One sharp edge is left, and it is worth knowing rather than being surprised by.
+Taking a stale claim away is two steps — judge it stale, then carry it off by
+renaming the whole claim aside. A claim created in the sub-millisecond gap
+between those two is carried off with it. It is recognised and put straight back,
+but putting it back is itself two calls, so for that instant the slot is not
+held by the run that owns it. Nothing here can close that gap; what it means in
+practice is that a "slot freed itself" you cannot account for is possible, and
+worth a `slot status` rather than a shrug.
 
 Log the send-back:
 
@@ -787,8 +965,15 @@ once.
 
 ```bash
 node $DRV wave                                   # the dependency layer in flight
-node $DRV ci --status green --ref gh-run-4471    # or red, or skipped --why "..."
+node $DRV ci --status green --ref gh-run-4471
+node $DRV ci --status red --why "two migration heads on the joined tree"
+node $DRV ci --status skipped --why "the runner is down until Monday"
+node $DRV ci list                                # every checkpoint, oldest first
 ```
+
+`red` and `skipped` both need `--why` and hard-fail without it. What broke is
+the whole point of recording a red, and a missing run is a decision rather than
+an omission.
 
 `ci` records against a fully-landed layer (it refuses to certify one still in
 flight), a landing invalidates any CI result that predates it, and `red` means
@@ -845,7 +1030,11 @@ answer coming, and the agent is still waiting.
   exiting, so a crashed suite still releases it. The failure mode left is a
   human or an agent "helpfully" emptying a live claim — which starts the second
   suite mid-first-suite and causes the crash everyone was queueing to avoid.
-  `slot free` refusing without `--force` is load-bearing.
+  `slot free` refusing without `--force` is load-bearing, and it is that narrow
+  case it is load-bearing for: a `slot run` claim with a command inside it. A
+  claim taken by hand is freed plainly, because there is no run under it to
+  crash — reaching for `--force` out of habit is how you learn to reach for it
+  when it matters.
 - **An agent waiting on the slot looks exactly like an agent working.** The
   wrapper says so on stderr and `slot status` names the holder and the wait —
   check it before diagnosing a "stuck" chip.
@@ -959,9 +1148,23 @@ answer coming, and the agent is still waiting.
 - **`chip` says "would interfere with work that is open right now"**: working as
   intended — `frontier` says when it opens. Do not shrink the task's owns to
   dodge the refusal; the overlap is real.
-- **`slot run` says "still held after 90 min"**: the holder is wedged but its
-  process is alive, so it cannot be auto-stolen. `slot status` names it; talk to
-  that agent, and only then `slot free ci --force`.
+- **`slot run` says "still held after 90 min"**: the holder's process is alive,
+  so the slot is never taken from it — that is deliberate, not a bug, and it is
+  what stops a second suite starting beside a slow one. `slot status` names the
+  holder; talk to that agent, and only once you know its run is gone,
+  `slot free ci --force`.
+- **`chip` says "--id <task_id>"**: it is the first chip for that task and the
+  id is required. Every interference check runs on that call, so passing it is
+  what arms them — `chip <key>` alone is not a smaller version of the same
+  command, it is nothing happening.
+- **`task add` says "claims <path>, which is already owned"**: nothing was
+  saved, including the other items in the batch. Two live tasks may not own one
+  path. Narrow one, or make one wait and split the file — do not widen the other.
+- **`done` says "it has never been handed out"**: the task has no chip, so there
+  is no work behind the report. Create the chip first, with `--id`.
+- **`error: unknown flag --xyz`**: a misspelled flag is refused now rather than
+  ignored, which is what let a whole command run on quietly without it. If the
+  value itself starts with `--`, write it as `--text="--like this"`.
 - **`ci --status green` says "has not all landed yet"**: the run you are pointing
   at predates a merge still to come, so it does not cover the round. Land the
   rest, then run CI again.
@@ -972,7 +1175,9 @@ answer coming, and the agent is still waiting.
   worktree was never recorded. `chip <key> --worktree <path>` fixes it.
 - **`refine done` says "no report at … and nothing on stdin"**: the agent has not
   written its file yet, or wrote it elsewhere. Ask it to write it to the path in
-  its brief. Do not paste the JSON in from the chat.
+  its brief. Do not paste the JSON in from the chat — it will take it, and print
+  `⚠ took the report from stdin`. That warning is the report having come through
+  the one thing that gets compacted.
 - **`board` warns "the record changed after these briefs were written"**: run
   `brief --all`, then message each named agent to re-read its brief.
 - **`refine check` says "no tasks proposed"**: the refining agents returned

@@ -1,0 +1,3164 @@
+{
+  "version": 1,
+  "created": "2026-08-24T18:57:15.620Z",
+  "plans": [
+    {
+      "path": "docs/plans/0.9-watching-the-running-system--not-implemented.…",
+      "lines": 711,
+      "bytes": 51737,
+      "sha": "e5362247bddd",
+      "refined": true,
+      "refinedAt": "2026-08-24T19:48:17.621Z",
+      "refineSummary": "Turned open question 6 into a stated decision (the edge writ…",
+      "builtOn": [
+        {
+          "path": "apps/api/src/barmyar/api/errors.py",
+          "what": "the three installed handlers and the docstring claiming noth…"
+        },
+        {
+          "path": "apps/api/src/barmyar/api/middleware.py",
+          "what": "the middleware whose own docstring says the next thing this …"
+        },
+        {
+          "path": "apps/api/src/barmyar/core/context.py",
+          "what": "the per-request state pattern, and why the request id needs …"
+        },
+        {
+          "path": "apps/api/src/barmyar/api/deps.py",
+          "what": "_source() builds the audit entry's source; the id goes at it…"
+        },
+        {
+          "path": "apps/api/src/barmyar/db/policies.py",
+          "what": "the preparer already accepts exactly the pair this table wan…"
+        },
+        {
+          "path": "apps/api/alembic/helpers.py",
+          "what": "prepare_table() already takes the three flags, so the migrat…"
+        },
+        {
+          "path": "apps/api/src/barmyar/worker.py",
+          "what": "the task base, the dead-letter writer and its Core-insert re…"
+        },
+        {
+          "path": "apps/api/src/barmyar/models/jobs.py",
+          "what": "checked for the brief: job_runs has no finish column and 0.9…"
+        },
+        {
+          "path": "apps/api/src/barmyar/auth/throttle.py",
+          "what": "the Redis pattern the heartbeat copies rather than reinvents"
+        },
+        {
+          "path": "apps/api/src/barmyar/platform/access.py",
+          "what": "the three shipped extra= calls including the already-stable …"
+        },
+        {
+          "path": "apps/api/src/barmyar/db/partitions.py",
+          "what": "the catalogue lookup inside the definer function, the shape …"
+        },
+        {
+          "path": "apps/api/src/barmyar/api/router.py",
+          "what": "the public list and its comment; the readiness door is the s…"
+        },
+        {
+          "path": "apps/api/src/barmyar/core/config.py",
+          "what": "log_level, declared since 0.1 and read by nothing — confirme…"
+        },
+        {
+          "path": "apps/api/tests/test_authorisation.py",
+          "what": "the route walk, its tripwire, and the assertion that the pub…"
+        },
+        {
+          "path": "docker-compose.yml",
+          "what": "forces the platform credential empty on both services, and h…"
+        }
+      ]
+    },
+    {
+      "path": "docs/plans/0.10-backups-and-a-lost-phone--not-implemented.md",
+      "lines": 660,
+      "bytes": 50531,
+      "sha": "4904b7e8f5b9",
+      "refined": true,
+      "refinedAt": "2026-08-24T19:49:08.917Z",
+      "refineSummary": "States as decided the two things settled this session that r…",
+      "builtOn": [
+        {
+          "path": "apps/api/src/barmyar/worker.py",
+          "what": "the schedule nothing runs, and the plain-session pattern the…"
+        },
+        {
+          "path": "apps/api/src/barmyar/db/guard.py",
+          "what": "the startup question, pointed at the restored cluster as dri…"
+        },
+        {
+          "path": "apps/api/src/barmyar/db/policies.py",
+          "what": "every piece of SQL in the project; the fourth shape's SQL go…"
+        },
+        {
+          "path": "apps/api/src/barmyar/db/mixins.py",
+          "what": "the three table bases; the fourth goes here because the cove…"
+        },
+        {
+          "path": "apps/api/tests/test_migrations.py",
+          "what": "the three coverage checks and the person-owned tripwire the …"
+        },
+        {
+          "path": "apps/api/src/barmyar/audit/chain.py",
+          "what": "verify_chain reads through the ordinary policies, so drill c…"
+        },
+        {
+          "path": "packages/offline/src/durability.ts",
+          "what": "room(), built by 0.7 and never called; its first caller, kep…"
+        },
+        {
+          "path": "packages/offline/src/outbox.ts",
+          "what": "pending() already sorts and oldestAge() already exists, so t…"
+        },
+        {
+          "path": "packages/api-client/src/sync.ts",
+          "what": "the sync answer's type lives here, not where the plan said"
+        },
+        {
+          "path": "apps/api/src/barmyar/services/organisations.py",
+          "what": "a root school's org_id is its own id, which is why an unscop…"
+        },
+        {
+          "path": "docker-compose.yml",
+          "what": "four services, the worker started with no scheduler flag — t…"
+        }
+      ]
+    },
+    {
+      "path": "docs/plans/0.11-rate-limiting-and-abuse--not-implemented.md",
+      "lines": 657,
+      "bytes": 47043,
+      "sha": "b2c5f14349b6",
+      "refined": true,
+      "refinedAt": "2026-08-24T19:50:04.984Z",
+      "refineSummary": "No open decisions of its own, so the rewrite is almost entir…",
+      "builtOn": [
+        {
+          "path": "apps/api/src/barmyar/auth/throttle.py",
+          "what": "the whole mechanism at one purpose, moved wholesale; also wh…"
+        },
+        {
+          "path": "apps/api/src/barmyar/auth/service.py",
+          "what": "the three throttle calls at real line numbers, the shape pre…"
+        },
+        {
+          "path": "apps/api/src/barmyar/api/errors.py",
+          "what": "Refusal already carries a name, status, values and headers, …"
+        },
+        {
+          "path": "apps/api/src/barmyar/core/authorisation.py",
+          "what": "the plain-call-in-the-body idiom a limit copies, reading its…"
+        },
+        {
+          "path": "apps/api/src/barmyar/core/principal.py",
+          "what": "org_id and membership_id are literally the two non-address a…"
+        },
+        {
+          "path": "apps/api/src/barmyar/api/v1/auth.py",
+          "what": "the address helper, already refusing forwarding headers with…"
+        },
+        {
+          "path": "apps/api/src/barmyar/api/v1/sync.py",
+          "what": "the stall-a-thread rule, the 500-entry cap and the more flag…"
+        },
+        {
+          "path": "apps/api/src/barmyar/services/invitations.py",
+          "what": "redeem() takes no address today, which is the gap between th…"
+        },
+        {
+          "path": "packages/api-client/src/client.ts",
+          "what": "the one place the name-and-values contract currently stops a…"
+        },
+        {
+          "path": "packages/offline/src/engine.ts",
+          "what": "the catch block whose comment makes a 429 read as no connect…"
+        },
+        {
+          "path": "apps/api/tests/test_throttle.py",
+          "what": "313 lines of behaviour that must survive the move with no as…"
+        },
+        {
+          "path": "apps/api/README.md",
+          "what": "the module table names the file this step deletes — omitted …"
+        }
+      ]
+    },
+    {
+      "path": "docs/plans/0.12-where-the-product-runs--not-implemented.md",
+      "lines": 655,
+      "bytes": 51792,
+      "sha": "7d8ad461e766",
+      "refined": true,
+      "refinedAt": "2026-08-24T19:51:46.869Z",
+      "refineSummary": "Rewritten against the four decisions that reach it: the stac…",
+      "builtOn": [
+        {
+          "path": "apps/api/src/barmyar/core/config.py",
+          "what": "the one settings object; the closed list of four environment…"
+        },
+        {
+          "path": "apps/api/src/barmyar/db/guard.py",
+          "what": "the existing refusal checks the connection the process made;…"
+        },
+        {
+          "path": "apps/api/src/barmyar/auth/tokens.py",
+          "what": "the exact shape the new refusal copies — refuse on the two d…"
+        },
+        {
+          "path": "apps/api/alembic/env.py",
+          "what": "takes the URL from settings with no fallback of its own, so …"
+        },
+        {
+          "path": "apps/api/tests/test_config.py",
+          "what": "the derive-rather-than-list trick the new secret list copies…"
+        },
+        {
+          "path": "infra/postgres/init/00-roles.sql",
+          "what": "creates the bypass role and states only a superuser can hand…"
+        },
+        {
+          "path": "apps/api/Dockerfile",
+          "what": "pins its base by tag, a moving target and therefore a build …"
+        },
+        {
+          "path": "packages/api-client/src/client.ts",
+          "what": "an empty string is not nullish, so an empty base already giv…"
+        },
+        {
+          "path": "apps/student/vite.config.ts",
+          "what": "the service worker claims its origin and updates automatical…"
+        },
+        {
+          "path": "apps/api/src/barmyar/api/router.py",
+          "what": "the health door lives outside /api in shipped code, which ma…"
+        },
+        {
+          "path": "apps/api/src/barmyar/api/deps.py",
+          "what": "both places that refuse a forwarding header, with their reas…"
+        }
+      ]
+    },
+    {
+      "path": "docs/plans/0.13-files-and-video--not-implemented.md",
+      "lines": 767,
+      "bytes": 57747,
+      "sha": "4f52162e7fa3",
+      "refined": true,
+      "refinedAt": "2026-08-24T20:00:25.061Z",
+      "refineSummary": "All six decisions filed against it stated as decisions. New …",
+      "builtOn": [
+        {
+          "path": "apps/api/src/barmyar/models/content.py",
+          "what": "1.2's shipped file model; the thirteen columns land here and…"
+        },
+        {
+          "path": "apps/api/src/barmyar/content/files.py",
+          "what": "the kind list derived into the database constraint; this ste…"
+        },
+        {
+          "path": "apps/api/src/barmyar/worker.py",
+          "what": "everything the two jobs need without inventing it — retries,…"
+        },
+        {
+          "path": "apps/api/src/barmyar/db/guard.py",
+          "what": "the shape the store check copies: ask the running thing rath…"
+        },
+        {
+          "path": "apps/api/src/barmyar/core/permissions.py",
+          "what": "checked rather than assumed: the author role holds the item …"
+        },
+        {
+          "path": "apps/api/src/barmyar/content/untrusted.py",
+          "what": "1.5's guarded reader; the structural half of the scan goes t…"
+        },
+        {
+          "path": "packages/offline/src/durability.ts",
+          "what": "the room reading 0.7 built that nothing calls; the media sto…"
+        },
+        {
+          "path": "apps/api/tests/test_files.py",
+          "what": "the only thing in the repository that writes a file row toda…"
+        },
+        {
+          "path": "docker-compose.yml",
+          "what": "four services today; the shelf and the checker are the fifth…"
+        }
+      ]
+    },
+    {
+      "path": "docs/plans/0.14-the-sweeper--not-implemented.md",
+      "lines": 615,
+      "bytes": 44534,
+      "sha": "60f19eff3625",
+      "refined": true,
+      "refinedAt": "2026-08-24T19:47:14.226Z",
+      "refineSummary": "Rewrote 0.14 so the stuck-run decision is stated as decided:…",
+      "builtOn": [
+        {
+          "path": "apps/api/src/barmyar/db/policies.py",
+          "what": "the one wording of every separation rule; current_identity_f…"
+        },
+        {
+          "path": "apps/api/src/barmyar/models/jobs.py",
+          "what": "0.2's JobRun, the shipped table the one extra column goes on"
+        },
+        {
+          "path": "apps/api/src/barmyar/worker.py",
+          "what": "AppTask, SYSTEM_ACTOR_TASKS and idempotent() which claims th…"
+        },
+        {
+          "path": "apps/api/src/barmyar/api/v1/sync.py",
+          "what": "_claim_the_name() is the only other writer of a job_runs row…"
+        },
+        {
+          "path": "apps/api/src/barmyar/audit/actors.py",
+          "what": "SystemActor, the closed set of six; system:sweeper is the se…"
+        },
+        {
+          "path": "apps/api/src/barmyar/db/rls.py",
+          "what": "org_scope(), the shape rebuilding() copies, with save-and-re…"
+        },
+        {
+          "path": "apps/api/src/barmyar/db/mixins.py",
+          "what": "PersonOwnedTable and owner_writes, the precedent for a decla…"
+        },
+        {
+          "path": "apps/api/alembic/helpers.py",
+          "what": "prepare_person_table() and the accommodation ownership pair …"
+        },
+        {
+          "path": "apps/api/tests/person_owned.py",
+          "what": "the stand-in learner tables built from the same policy strin…"
+        },
+        {
+          "path": "apps/api/tests/test_migrations.py",
+          "what": "the coverage check that derives its expectation from the mod…"
+        },
+        {
+          "path": "apps/api/src/barmyar/wording.py",
+          "what": "how a packages/ directory is resolved by path, and the close…"
+        },
+        {
+          "path": "docker-compose.yml",
+          "what": "build: apps/api for both services — a context that does not …"
+        }
+      ]
+    },
+    {
+      "path": "docs/plans/1.8-what-one-answer-holds--not-implemented.md",
+      "lines": 676,
+      "bytes": 49772,
+      "sha": "b0868490bdf1",
+      "refined": true,
+      "refinedAt": "2026-08-24T19:59:43.181Z",
+      "refineSummary": "Rewritten around the settled seventh source: placement joins…",
+      "builtOn": [
+        {
+          "path": "apps/api/src/barmyar/db/policies.py",
+          "what": "the reused clock-skew trigger so the three tables cannot dis…"
+        },
+        {
+          "path": "apps/api/alembic/helpers.py",
+          "what": "the partitioned-table preparer supplies all four things in o…"
+        },
+        {
+          "path": "apps/api/src/barmyar/models/events.py",
+          "what": "the nearest sibling and the model to copy — two clocks, a co…"
+        },
+        {
+          "path": "apps/api/src/barmyar/sync/writes.py",
+          "what": "the general row path 1.6 promised, and the four places it fa…"
+        },
+        {
+          "path": "apps/api/src/barmyar/api/v1/sync.py",
+          "what": "the per-entry savepoints and the branch a trigger's refusal …"
+        },
+        {
+          "path": "apps/api/src/barmyar/content/shapes.py",
+          "what": "the hint-ladder ceiling, the lower bound the plan had left o…"
+        },
+        {
+          "path": "apps/api/src/barmyar/models/study.py",
+          "what": "the three-constraint array pattern found the hard way in 1.7…"
+        },
+        {
+          "path": "apps/api/alembic/versions/20260822_9a4c17b2e0d5_two_logs_par…",
+          "what": "the template for the migration, and the file that must be fr…"
+        },
+        {
+          "path": "packages/offline/src/idb.ts",
+          "what": "the device store names no table, so a ninth synced table rea…"
+        }
+      ]
+    },
+    {
+      "path": "docs/plans/1.9-first-run-and-consent--not-implemented.md",
+      "lines": 677,
+      "bytes": 46698,
+      "sha": "4b6a99af388d",
+      "refined": true,
+      "refinedAt": "2026-08-24T19:51:02.566Z",
+      "refineSummary": "Both settled decisions stated as decisions: the school agree…",
+      "builtOn": [
+        {
+          "path": "apps/api/src/barmyar/db/policies.py",
+          "what": "the two person-owned policy pairs; the owner-writes one comp…"
+        },
+        {
+          "path": "apps/api/src/barmyar/models/study.py",
+          "what": "1.7's accommodation is the only shipped table of the other s…"
+        },
+        {
+          "path": "apps/api/src/barmyar/services/invitations.py",
+          "what": "the only path that creates an account; the membership write …"
+        },
+        {
+          "path": "apps/api/src/barmyar/db/rls.py",
+          "what": "the scope reads and restores in its own finally, which is wh…"
+        },
+        {
+          "path": "apps/api/src/barmyar/services/study.py",
+          "what": "the four writers first run calls, and the shipped example of…"
+        },
+        {
+          "path": "apps/api/Dockerfile",
+          "what": "the build context and its only copy, so the shared folders a…"
+        },
+        {
+          "path": "apps/api/tests/test_migrations.py",
+          "what": "the coverage check derives its expected policy pair from the…"
+        },
+        {
+          "path": "apps/api/tests/test_event_log.py",
+          "what": "reads both check constraints out of the catalogue and compar…"
+        },
+        {
+          "path": "packages/ui/src/fonts/FontProvider.tsx",
+          "what": "the device-level display choice made before an account exist…"
+        }
+      ]
+    },
+    {
+      "path": "docs/plans/1.10-curriculum-editions-in-practice--not-impleme…",
+      "lines": 653,
+      "bytes": 47601,
+      "sha": "76e5c868fff9",
+      "refined": true,
+      "refinedAt": "2026-08-24T19:52:42.225Z",
+      "refineSummary": "Rewritten against the real tree with a built-on table and a …",
+      "builtOn": [
+        {
+          "path": "apps/api/src/barmyar/services/editions.py",
+          "what": "the whole move as it stands; five of nine pieces of work are…"
+        },
+        {
+          "path": "apps/api/src/barmyar/services/curriculum.py",
+          "what": "the map reader and the withdraw; the retired check is alread…"
+        },
+        {
+          "path": "apps/api/src/barmyar/models/curriculum.py",
+          "what": "the dead published_at at a real line, and the non-partial un…"
+        },
+        {
+          "path": "apps/api/src/barmyar/services/tagging.py",
+          "what": "the pair that writes tag rows with the permission asked abov…"
+        },
+        {
+          "path": "apps/api/src/barmyar/core/permissions.py",
+          "what": "the author holds the action the move asks for today; the dep…"
+        },
+        {
+          "path": "apps/api/src/barmyar/db/policies.py",
+          "what": "where the asymmetry the fourth defect trips over is actually…"
+        },
+        {
+          "path": "docs/conventions.md",
+          "what": "the grill's checklist, enforced by a test; its first rule fo…"
+        },
+        {
+          "path": "apps/api/tests/curriculum_world.py",
+          "what": "the one map three test modules hang off; it builds editions …"
+        }
+      ]
+    }
+  ],
+  "gaps": [
+    {
+      "id": "g01",
+      "plan": "docs/plans/0.9-watching-the-running-system--not-implemented.…",
+      "line": 61,
+      "marker": "cadence",
+      "why": "a rhythm with no period",
+      "hit": "often",
+      "quote": "readers.** \"What is failing and how often\" is a durable coun…",
+      "section": "Why each of those, in one line",
+      "title": "",
+      "scope": "unset",
+      "status": "dropped",
+      "research": [],
+      "question": null,
+      "answer": null
+    },
+    {
+      "id": "g02",
+      "plan": "docs/plans/0.9-watching-the-running-system--not-implemented.…",
+      "line": 147,
+      "marker": "cadence",
+      "why": "a rhythm with no period",
+      "hit": "often",
+      "quote": "enforced in Postgres rather than by habit. An error very oft…",
+      "section": "Why 0.5's audit log must not become the error log",
+      "title": "",
+      "scope": "unset",
+      "status": "dropped",
+      "research": [],
+      "question": null,
+      "answer": null
+    },
+    {
+      "id": "g03",
+      "plan": "docs/plans/0.9-watching-the-running-system--not-implemented.…",
+      "line": 185,
+      "marker": "quantity",
+      "why": "a quantity with no number",
+      "hit": "the window",
+      "quote": "| **Anything else that reached the top** | **`request.failed…",
+      "section": "What is recorded when a request fails",
+      "title": "",
+      "scope": "unset",
+      "status": "dropped",
+      "research": [],
+      "question": null,
+      "answer": null
+    },
+    {
+      "id": "g04",
+      "plan": "docs/plans/0.9-watching-the-running-system--not-implemented.…",
+      "line": 237,
+      "marker": "later",
+      "why": "postponed, never returned to",
+      "hit": "Open question",
+      "quote": "which is 0.14. Open question 2.",
+      "section": "What is recorded when a job fails",
+      "title": "",
+      "scope": "unset",
+      "status": "dropped",
+      "research": [],
+      "question": null,
+      "answer": null
+    },
+    {
+      "id": "g05",
+      "plan": "docs/plans/0.9-watching-the-running-system--not-implemented.…",
+      "line": 265,
+      "marker": "cadence",
+      "why": "a rhythm with no period",
+      "hit": "often",
+      "quote": "a shipper, the table tells you what is failing, where, how o…",
+      "section": "The shared record holds nothing anybody's code wrote",
+      "title": "",
+      "scope": "unset",
+      "status": "dropped",
+      "research": [],
+      "question": null,
+      "answer": null
+    },
+    {
+      "id": "g06",
+      "plan": "docs/plans/0.9-watching-the-running-system--not-implemented.…",
+      "line": 284,
+      "marker": "later",
+      "why": "postponed, never returned to",
+      "hit": "Open question",
+      "quote": "than into the same pile as everything else. Open question 3.",
+      "section": "The shared record holds nothing anybody's code wrote",
+      "title": "",
+      "scope": "unset",
+      "status": "dropped",
+      "research": [],
+      "question": null,
+      "answer": null
+    },
+    {
+      "id": "g07",
+      "plan": "docs/plans/0.9-watching-the-running-system--not-implemented.…",
+      "line": 364,
+      "marker": "cadence",
+      "why": "a rhythm with no period",
+      "hit": "often",
+      "quote": "`(fingerprint, created_at DESC)` for *\"how often, and since …",
+      "section": "The table, and which of the three shapes it takes",
+      "title": "",
+      "scope": "unset",
+      "status": "dropped",
+      "research": [],
+      "question": null,
+      "answer": null
+    },
+    {
+      "id": "g08",
+      "plan": "docs/plans/0.9-watching-the-running-system--not-implemented.…",
+      "line": 371,
+      "marker": "quantity",
+      "why": "a quantity with no number",
+      "hit": "A window",
+      "quote": "**A window, per process, per fingerprint.** The first occurr…",
+      "section": "The table, and which of the three shapes it takes",
+      "title": "",
+      "scope": "unset",
+      "status": "dropped",
+      "research": [],
+      "question": null,
+      "answer": null
+    },
+    {
+      "id": "g09",
+      "plan": "docs/plans/0.9-watching-the-running-system--not-implemented.…",
+      "line": 373,
+      "marker": "quantity",
+      "why": "a quantity with no number",
+      "hit": "the window",
+      "quote": "counter in memory; the next one past the window writes a row…",
+      "section": "The table, and which of the three shapes it takes",
+      "title": "",
+      "scope": "unset",
+      "status": "dropped",
+      "research": [],
+      "question": null,
+      "answer": null
+    },
+    {
+      "id": "g10",
+      "plan": "docs/plans/0.9-watching-the-running-system--not-implemented.…",
+      "line": 387,
+      "marker": "later",
+      "why": "postponed, never returned to",
+      "hit": "left open",
+      "quote": "same question 0.5 already left open for the two logs. Open q…",
+      "section": "The table, and which of the three shapes it takes",
+      "title": "",
+      "scope": "unset",
+      "status": "dropped",
+      "research": [],
+      "question": null,
+      "answer": null
+    },
+    {
+      "id": "g11",
+      "plan": "docs/plans/0.9-watching-the-running-system--not-implemented.…",
+      "line": 534,
+      "marker": "quantity",
+      "why": "a quantity with no number",
+      "hit": "the window",
+      "quote": "6. **The one table this step adds grows without a trim.** Wi…",
+      "section": "Consequences worth knowing before building on this",
+      "title": "",
+      "scope": "unset",
+      "status": "dropped",
+      "research": [],
+      "question": null,
+      "answer": null
+    },
+    {
+      "id": "g12",
+      "plan": "docs/plans/0.9-watching-the-running-system--not-implemented.…",
+      "line": 549,
+      "marker": "quantity",
+      "why": "a quantity with no number",
+      "hit": "the window",
+      "quote": "4. The same failure raised twice inside the window writes on…",
+      "section": "Definition of done",
+      "title": "",
+      "scope": "unset",
+      "status": "dropped",
+      "research": [],
+      "question": null,
+      "answer": null
+    },
+    {
+      "id": "g13",
+      "plan": "docs/plans/0.9-watching-the-running-system--not-implemented.…",
+      "line": 596,
+      "marker": "quantity",
+      "why": "a quantity with no number",
+      "hit": "the window",
+      "quote": "| `apps/api/src/barmyar/watch/errors.py` | `record_error()`,…",
+      "section": "New",
+      "title": "",
+      "scope": "unset",
+      "status": "dropped",
+      "research": [],
+      "question": null,
+      "answer": null
+    },
+    {
+      "id": "g14",
+      "plan": "docs/plans/0.9-watching-the-running-system--not-implemented.…",
+      "line": 600,
+      "marker": "quantity",
+      "why": "a quantity with no number",
+      "hit": "the window",
+      "quote": "| `apps/api/tests/test_error_record.py` | Every claim about …",
+      "section": "New",
+      "title": "",
+      "scope": "unset",
+      "status": "dropped",
+      "research": [],
+      "question": null,
+      "answer": null
+    },
+    {
+      "id": "g15",
+      "plan": "docs/plans/0.9-watching-the-running-system--not-implemented.…",
+      "line": 642,
+      "marker": "quantity",
+      "why": "a quantity with no number",
+      "hit": "the window",
+      "quote": "| F | `record_error()`: the fingerprint, the window, and the…",
+      "section": "Order of work",
+      "title": "",
+      "scope": "unset",
+      "status": "dropped",
+      "research": [],
+      "question": null,
+      "answer": null
+    },
+    {
+      "id": "g16",
+      "plan": "docs/plans/0.9-watching-the-running-system--not-implemented.…",
+      "line": 669,
+      "marker": "later",
+      "why": "postponed, never returned to",
+      "hit": "left open",
+      "quote": "left open for the two logs. It could not be answered cheaply…",
+      "section": "Open questions, if they become blocking",
+      "title": "",
+      "scope": "unset",
+      "status": "dropped",
+      "research": [],
+      "question": null,
+      "answer": null
+    },
+    {
+      "id": "g17",
+      "plan": "docs/plans/0.9-watching-the-running-system--not-implemented.…",
+      "line": 692,
+      "marker": "quantity",
+      "why": "a quantity with no number",
+      "hit": "the window",
+      "quote": "5. **Whether the window should be shared between processes.*…",
+      "section": "Open questions, if they become blocking",
+      "title": "",
+      "scope": "unset",
+      "status": "dropped",
+      "research": [],
+      "question": null,
+      "answer": null
+    },
+    {
+      "id": "g18",
+      "plan": "docs/plans/0.10-backups-and-a-lost-phone--not-implemented.md",
+      "line": 269,
+      "marker": "quantity",
+      "why": "a quantity with no number",
+      "hit": "the window",
+      "quote": "today**, so an erasure promise is only true after the window…",
+      "section": "The two logs, and what partitioning does and does not do to …",
+      "title": "",
+      "scope": "unset",
+      "status": "dropped",
+      "research": [],
+      "question": null,
+      "answer": null
+    },
+    {
+      "id": "g19",
+      "plan": "docs/plans/0.10-backups-and-a-lost-phone--not-implemented.md",
+      "line": 518,
+      "marker": "quantity",
+      "why": "a quantity with no number",
+      "hit": "the window",
+      "quote": "instant inside the window has been performed by hand at leas…",
+      "section": "Definition of done",
+      "title": "",
+      "scope": "unset",
+      "status": "dropped",
+      "research": [],
+      "question": null,
+      "answer": null
+    },
+    {
+      "id": "g20",
+      "plan": "docs/plans/0.10-backups-and-a-lost-phone--not-implemented.md",
+      "line": 521,
+      "marker": "quantity",
+      "why": "a quantity with no number",
+      "hit": "the window",
+      "quote": "2. The drill restores from the **off-machine** copy, to a **…",
+      "section": "Definition of done",
+      "title": "",
+      "scope": "unset",
+      "status": "dropped",
+      "research": [],
+      "question": null,
+      "answer": null
+    },
+    {
+      "id": "g21",
+      "plan": "docs/plans/0.10-backups-and-a-lost-phone--not-implemented.md",
+      "line": 546,
+      "marker": "hedge",
+      "why": "not a commitment",
+      "hit": "likely to",
+      "quote": "product's students are most likely to be using.",
+      "section": "Definition of done",
+      "title": "",
+      "scope": "unset",
+      "status": "dropped",
+      "research": [],
+      "question": null,
+      "answer": null
+    },
+    {
+      "id": "g22",
+      "plan": "docs/plans/0.10-backups-and-a-lost-phone--not-implemented.md",
+      "line": 632,
+      "marker": "later",
+      "why": "postponed, never returned to",
+      "hit": "open question",
+      "quote": "| **7.4** | A table already readable by the platform role, a…",
+      "section": "Hands over",
+      "title": "",
+      "scope": "unset",
+      "status": "dropped",
+      "research": [],
+      "question": null,
+      "answer": null
+    },
+    {
+      "id": "g23",
+      "plan": "docs/plans/0.11-rate-limiting-and-abuse--not-implemented.md",
+      "line": 9,
+      "marker": "quantity",
+      "why": "a quantity with no number",
+      "hit": "a limit",
+      "quote": "exists and for the account a limit is keyed on, [0.6](0.6-pe…",
+      "section": "Implementation plan — Step 0.11, Rate limiting and abuse",
+      "title": "",
+      "scope": "unset",
+      "status": "dropped",
+      "research": [],
+      "question": null,
+      "answer": null
+    },
+    {
+      "id": "g24",
+      "plan": "docs/plans/0.11-rate-limiting-and-abuse--not-implemented.md",
+      "line": 46,
+      "marker": "quantity",
+      "why": "a quantity with no number",
+      "hit": "the window",
+      "quote": "that refills is a closed door for the rest of the window, wh…",
+      "section": "Why each of those, in one line",
+      "title": "",
+      "scope": "unset",
+      "status": "dropped",
+      "research": [],
+      "question": null,
+      "answer": null
+    },
+    {
+      "id": "g25",
+      "plan": "docs/plans/0.11-rate-limiting-and-abuse--not-implemented.md",
+      "line": 60,
+      "marker": "quantity",
+      "why": "a quantity with no number",
+      "hit": "a limit",
+      "quote": "as a plain call in the body — `authorise()` — so a limit ask…",
+      "section": "Why each of those, in one line",
+      "title": "",
+      "scope": "unset",
+      "status": "dropped",
+      "research": [],
+      "question": null,
+      "answer": null
+    },
+    {
+      "id": "g26",
+      "plan": "docs/plans/0.11-rate-limiting-and-abuse--not-implemented.md",
+      "line": 80,
+      "marker": "quantity",
+      "why": "a quantity with no number",
+      "hit": "a limit",
+      "quote": "two shapes a limit may have, given what it is protecting.",
+      "section": "What this step owns, and what it only uses",
+      "title": "",
+      "scope": "unset",
+      "status": "dropped",
+      "research": [],
+      "question": null,
+      "answer": null
+    },
+    {
+      "id": "g27",
+      "plan": "docs/plans/0.11-rate-limiting-and-abuse--not-implemented.md",
+      "line": 89,
+      "marker": "judgement",
+      "why": "an adjective with no test",
+      "hit": "acceptable",
+      "quote": "both on purpose, and neither is acceptable in something deci…",
+      "section": "What this step owns, and what it only uses",
+      "title": "",
+      "scope": "unset",
+      "status": "dropped",
+      "research": [],
+      "question": null,
+      "answer": null
+    },
+    {
+      "id": "g28",
+      "plan": "docs/plans/0.11-rate-limiting-and-abuse--not-implemented.md",
+      "line": 96,
+      "marker": "quantity",
+      "why": "a quantity with no number",
+      "hit": "A limit",
+      "quote": "A limit in this product is a pair of answers, and the regist…",
+      "section": "The two questions every limit answers",
+      "title": "",
+      "scope": "unset",
+      "status": "dropped",
+      "research": [],
+      "question": null,
+      "answer": null
+    },
+    {
+      "id": "g29",
+      "plan": "docs/plans/0.11-rate-limiting-and-abuse--not-implemented.md",
+      "line": 109,
+      "marker": "quantity",
+      "why": "a quantity with no number",
+      "hit": "a ceiling",
+      "quote": "- **A wait that grows to a ceiling.** The first few are free…",
+      "section": "The two questions every limit answers",
+      "title": "",
+      "scope": "unset",
+      "status": "dropped",
+      "research": [],
+      "question": null,
+      "answer": null
+    },
+    {
+      "id": "g30",
+      "plan": "docs/plans/0.11-rate-limiting-and-abuse--not-implemented.md",
+      "line": 113,
+      "marker": "quantity",
+      "why": "a quantity with no number",
+      "hit": "a window",
+      "quote": "- **An allowance that refills.** So many in a window, then *…",
+      "section": "The two questions every limit answers",
+      "title": "",
+      "scope": "unset",
+      "status": "dropped",
+      "research": [],
+      "question": null,
+      "answer": null
+    },
+    {
+      "id": "g31",
+      "plan": "docs/plans/0.11-rate-limiting-and-abuse--not-implemented.md",
+      "line": 123,
+      "marker": "quantity",
+      "why": "a quantity with no number",
+      "hit": "A window",
+      "quote": "**And a fixed window, not a sliding one.** A window is `INCR…",
+      "section": "The two questions every limit answers",
+      "title": "",
+      "scope": "unset",
+      "status": "dropped",
+      "research": [],
+      "question": null,
+      "answer": null
+    },
+    {
+      "id": "g32",
+      "plan": "docs/plans/0.11-rate-limiting-and-abuse--not-implemented.md",
+      "line": 126,
+      "marker": "judgement",
+      "why": "an adjective with no test",
+      "hit": "acceptable",
+      "quote": "That is accepted here and it is only acceptable because thes…",
+      "section": "The two questions every limit answers",
+      "title": "",
+      "scope": "unset",
+      "status": "dropped",
+      "research": [],
+      "question": null,
+      "answer": null
+    },
+    {
+      "id": "g33",
+      "plan": "docs/plans/0.11-rate-limiting-and-abuse--not-implemented.md",
+      "line": 219,
+      "marker": "judgement",
+      "why": "an adjective with no test",
+      "hit": "clean",
+      "quote": "attacker mid-run gets a clean slate. At most a window — an h…",
+      "section": "No table, and the four reasons",
+      "title": "",
+      "scope": "unset",
+      "status": "dropped",
+      "research": [],
+      "question": null,
+      "answer": null
+    },
+    {
+      "id": "g34",
+      "plan": "docs/plans/0.11-rate-limiting-and-abuse--not-implemented.md",
+      "line": 219,
+      "marker": "quantity",
+      "why": "a quantity with no number",
+      "hit": "a window",
+      "quote": "attacker mid-run gets a clean slate. At most a window — an h…",
+      "section": "No table, and the four reasons",
+      "title": "",
+      "scope": "unset",
+      "status": "dropped",
+      "research": [],
+      "question": null,
+      "answer": null
+    },
+    {
+      "id": "g35",
+      "plan": "docs/plans/0.11-rate-limiting-and-abuse--not-implemented.md",
+      "line": 238,
+      "marker": "later",
+      "why": "postponed, never returned to",
+      "hit": "for now",
+      "quote": "for now; come back in `{seconds}`.*",
+      "section": "What a refused request looks like",
+      "title": "",
+      "scope": "unset",
+      "status": "dropped",
+      "research": [],
+      "question": null,
+      "answer": null
+    },
+    {
+      "id": "g36",
+      "plan": "docs/plans/0.11-rate-limiting-and-abuse--not-implemented.md",
+      "line": 283,
+      "marker": "quantity",
+      "why": "a quantity with no number",
+      "hit": "the window",
+      "quote": "lost, and an allowance that refills means an outbox that gro…",
+      "section": "The outbox is not an attacker, and the limiter has to be abl…",
+      "title": "",
+      "scope": "unset",
+      "status": "dropped",
+      "research": [],
+      "question": null,
+      "answer": null
+    },
+    {
+      "id": "g37",
+      "plan": "docs/plans/0.11-rate-limiting-and-abuse--not-implemented.md",
+      "line": 302,
+      "marker": "quantity",
+      "why": "a quantity with no number",
+      "hit": "the limit",
+      "quote": "**Invitation codes — the limit is not the defence and should…",
+      "section": "The three enumeration risks, and why they need three differe…",
+      "title": "",
+      "scope": "unset",
+      "status": "dropped",
+      "research": [],
+      "question": null,
+      "answer": null
+    },
+    {
+      "id": "g38",
+      "plan": "docs/plans/0.11-rate-limiting-and-abuse--not-implemented.md",
+      "line": 304,
+      "marker": "quantity",
+      "why": "a quantity with no number",
+      "hit": "the limit",
+      "quote": "already right that *\"guessing has to be off the table rather…",
+      "section": "The three enumeration risks, and why they need three differe…",
+      "title": "",
+      "scope": "unset",
+      "status": "dropped",
+      "research": [],
+      "question": null,
+      "answer": null
+    },
+    {
+      "id": "g39",
+      "plan": "docs/plans/0.11-rate-limiting-and-abuse--not-implemented.md",
+      "line": 313,
+      "marker": "quantity",
+      "why": "a quantity with no number",
+      "hit": "the limit",
+      "quote": "**Class codes — the limit *is* the defence, and 3.2 gets a r…",
+      "section": "The three enumeration risks, and why they need three differe…",
+      "title": "",
+      "scope": "unset",
+      "status": "dropped",
+      "research": [],
+      "question": null,
+      "answer": null
+    },
+    {
+      "id": "g40",
+      "plan": "docs/plans/0.11-rate-limiting-and-abuse--not-implemented.md",
+      "line": 322,
+      "marker": "quantity",
+      "why": "a quantity with no number",
+      "hit": "A limit",
+      "quote": "3. **A code stops working when its class ends.** A limit slo…",
+      "section": "The three enumeration risks, and why they need three differe…",
+      "title": "",
+      "scope": "unset",
+      "status": "dropped",
+      "research": [],
+      "question": null,
+      "answer": null
+    }
+  ],
+  "orchestrator": "lms-v2-b0",
+  "tasks": [
+    {
+      "key": "0.14a",
+      "title": "the named actor, the third policy, and the derived-table mix…",
+      "plan": "docs/plans/0.14-the-sweeper--not-implemented.md",
+      "needs": [
+        "0.10a"
+      ],
+      "owns": [
+        "apps/api/src/barmyar/audit/actors.py",
+        "apps/api/src/barmyar/db/policies.py",
+        "apps/api/src/barmyar/db/mixins.py",
+        "apps/api/src/barmyar/db/rls.py",
+        "apps/api/alembic/helpers.py",
+        "apps/api/alembic/versions/20260825_d3f5a9c14e27_a_named_acto…",
+        "apps/api/tests/derived.py",
+        "apps/api/tests/test_actor.py",
+        "apps/api/tests/test_sweeper.py"
+      ],
+      "verify": [
+        "TEST_DATABASE_NAME=barmyar_test_0_14a uv --directory apps/ap…",
+        "TEST_DATABASE_NAME=barmyar_test_0_14a uv --directory apps/ap…",
+        "uv --directory apps/api run ruff check ."
+      ],
+      "notes": "",
+      "branch": "step/0.14a",
+      "worktree": "",
+      "chip": "task_8c87745d",
+      "status": "landed",
+      "briefSha": "0b2757ae1116",
+      "briefAt": "2026-08-25T18:59:16.665Z",
+      "briefFile": "/home/aamirhosseinn0/Desktop/LMS_v2/.claude/orchestration/br…",
+      "agent": "nice-wescoff-08b25b-b2",
+      "lastHeard": "2026-08-25T14:19:45.929Z",
+      "landedAt": "2026-08-25T14:25:50.539Z",
+      "landedSha": "81310bc"
+    },
+    {
+      "key": "0.14b",
+      "title": "the one numbered set, read by both languages",
+      "plan": "docs/plans/0.14-the-sweeper--not-implemented.md",
+      "needs": [
+        "0.14a"
+      ],
+      "owns": [
+        "packages/tuning",
+        "apps/api/src/barmyar/tuning.py",
+        "apps/api/tests/test_tuning.py",
+        "pnpm-lock.yaml"
+      ],
+      "verify": [
+        "TEST_DATABASE_NAME=barmyar_test_0_14b ./scripts/test tests/t…",
+        "CI=1 TURBO_FORCE=true pnpm --filter @barmyar/tuning test",
+        "CI=1 TURBO_FORCE=true pnpm typecheck",
+        "CI=1 TURBO_FORCE=true pnpm build"
+      ],
+      "notes": "",
+      "branch": "step/0.14b",
+      "worktree": "",
+      "chip": "task_894a3fa8",
+      "status": "landed",
+      "briefSha": "7b83dc00b9fb",
+      "briefAt": "2026-08-25T18:59:16.725Z",
+      "briefFile": "/home/aamirhosseinn0/Desktop/LMS_v2/.claude/orchestration/br…",
+      "agent": "nostalgic-lamarr-6922de-cc",
+      "lastHeard": "2026-08-25T14:36:42.167Z",
+      "landedAt": "2026-08-25T15:08:30.314Z",
+      "landedSha": "e449f5a"
+    },
+    {
+      "key": "0.14c",
+      "title": "the sweep record, the walk over people, and the command",
+      "plan": "docs/plans/0.14-the-sweeper--not-implemented.md",
+      "needs": [
+        "0.14a",
+        "0.14b",
+        "0.9"
+      ],
+      "owns": [
+        "apps/api/src/barmyar/models/sweeps.py",
+        "apps/api/src/barmyar/sweep",
+        "apps/api/alembic/versions/20260825_e2a9d5c31b67_the_record_o…",
+        "apps/api/src/barmyar/models/__init__.py",
+        "apps/api/tests/conftest.py",
+        "apps/api/src/barmyar/worker.py",
+        "apps/api/tests/test_sweeper.py",
+        "apps/api/src/barmyar/core/config.py",
+        ".env.example"
+      ],
+      "verify": [
+        "TEST_DATABASE_NAME=barmyar_test_0_14c ./scripts/test tests/t…",
+        "TEST_DATABASE_NAME=barmyar_test_0_14c ./scripts/test tests/t…",
+        "uv --directory apps/api run ruff check ."
+      ],
+      "notes": " HELD OUT OF ROUND 4: contended with 0.9 on models/__init__.…",
+      "branch": "step/0.14c",
+      "worktree": "",
+      "chip": "task_a3fa6447",
+      "status": "landed",
+      "briefSha": "3b57ea66172c",
+      "briefAt": "2026-08-25T18:59:16.775Z",
+      "briefFile": "/home/aamirhosseinn0/Desktop/LMS_v2/.claude/orchestration/br…",
+      "agent": "sharp-herschel-c9428f-a4",
+      "lastHeard": "2026-08-25T15:55:30.960Z",
+      "landedAt": "2026-08-25T17:59:06.919Z",
+      "landedSha": "796ba58"
+    },
+    {
+      "key": "0.14d",
+      "title": "when a run ended, and the ones that never did",
+      "plan": "docs/plans/0.14-the-sweeper--not-implemented.md",
+      "needs": [
+        "0.14c",
+        "0.10h",
+        "0.11e"
+      ],
+      "owns": [
+        "apps/api/src/barmyar/models/jobs.py",
+        "apps/api/src/barmyar/sweep/stuck.py",
+        "apps/api/tests/test_stuck_runs.py",
+        "apps/api/alembic/versions/20260826_c9f2d84e13b7_a_run_says_w…",
+        "apps/api/src/barmyar/worker.py",
+        "apps/api/src/barmyar/api/v1/sync.py",
+        "apps/api/src/barmyar/sweep/__main__.py",
+        "apps/api/tests/test_queue.py",
+        "apps/api/tests/test_sweeper.py",
+        "apps/api/tests/test_migrations.py",
+        "apps/api/tests/conftest.py",
+        "apps/api/src/barmyar/sweep/__init__.py"
+      ],
+      "verify": [
+        "TEST_DATABASE_NAME=barmyar_test_0_14d ./scripts/test tests/t…",
+        "TEST_DATABASE_NAME=barmyar_test_0_14d ./scripts/test -q",
+        "uv --directory apps/api run ruff check ."
+      ],
+      "notes": " SERIALISED behind 0.10h (worker.py) and 0.11e (api/v1/sync.…",
+      "branch": "step/0.14d",
+      "worktree": "",
+      "chip": "task_adffb317",
+      "status": "landed",
+      "briefSha": "fc3ce3a82638",
+      "briefAt": "2026-08-26T05:28:15.401Z",
+      "briefFile": "/home/aamirhosseinn0/Desktop/LMS_v2/.claude/orchestration/br…",
+      "serialises": [
+        "alembic-head — VERIFIED, AND THE BRIEFING VALUE IS STALE BY …",
+        "alembic-head is CONTENDED THIS ROUND. Two tasks with a pendi…",
+        "apps/api/src/barmyar/sweep/__main__.py argparse surface — pi…",
+        "apps/api/src/barmyar/worker.py — owned, but shared with 0.9,…",
+        "apps/api/src/barmyar/api/v1/sync.py — owned, but shared with…",
+        "barmyar/watch/logs.py closed lists — NOT moved by this work,…",
+        "tests/conftest.py ALL_TABLES (conftest.py:90-180), tests/tes…",
+        "No metadata-vs-migration autogenerate check exists anywhere …"
+      ],
+      "agent": "suspicious-hamilton-3d6c4a-33",
+      "lastHeard": "2026-08-25T21:14:45.364Z",
+      "landedAt": "2026-08-26T05:48:26.969Z",
+      "landedSha": "79edc32"
+    },
+    {
+      "key": "0.9",
+      "title": "the stream, the error record, the request id, the catch-all,…",
+      "plan": "docs/plans/0.9-watching-the-running-system--not-implemented.…",
+      "needs": [
+        "0.14a",
+        "0.11a",
+        "1.8b",
+        "0.10b",
+        "0.10f"
+      ],
+      "owns": [
+        "apps/api/src/barmyar/watch",
+        "apps/api/src/barmyar/models/errors.py",
+        "apps/api/tests/test_error_record.py",
+        "apps/api/tests/test_logging.py",
+        "apps/api/tests/test_readiness.py",
+        "apps/api/src/barmyar/api/errors.py",
+        "apps/api/src/barmyar/api/middleware.py",
+        "apps/api/src/barmyar/api/deps.py",
+        "apps/api/src/barmyar/api/router.py",
+        "apps/api/src/barmyar/main.py",
+        "apps/api/src/barmyar/db/session.py",
+        "apps/api/src/barmyar/auth/session.py",
+        "apps/api/src/barmyar/platform/access.py",
+        "apps/api/tests/test_authorisation.py",
+        "apps/api/src/barmyar/worker.py",
+        "apps/api/alembic/versions/20260825_c8e1b4a72f95_somewhere_a_…",
+        "apps/api/src/barmyar/models/__init__.py",
+        "apps/api/src/barmyar/core/config.py",
+        "apps/api/src/barmyar/wording.py",
+        "packages/wording/fa.json",
+        "packages/wording/en.json",
+        ".env.example",
+        "apps/api/tests/conftest.py",
+        "apps/api/tests/test_migrations.py"
+      ],
+      "verify": [
+        "TEST_DATABASE_NAME=barmyar_test_0_9 ./scripts/test tests/tes…",
+        "pnpm run api:test",
+        "pnpm run api:lint",
+        "pnpm run check:env"
+      ],
+      "notes": " HELD OUT OF ROUND 3 by lms-v2-71: contends with 1.8b (conft…",
+      "branch": "step/0.9",
+      "worktree": "",
+      "chip": "task_34ea27eb",
+      "status": "landed",
+      "briefSha": "409696cfcb17",
+      "briefAt": "2026-08-25T18:59:16.872Z",
+      "briefFile": "/home/aamirhosseinn0/Desktop/LMS_v2/.claude/orchestration/br…",
+      "agent": "suspicious-rhodes-1327cc-ed",
+      "lastHeard": "2026-08-25T14:46:50.748Z",
+      "landedAt": "2026-08-25T16:53:44.856Z",
+      "landedSha": "ba2bb92"
+    },
+    {
+      "key": "0.10a",
+      "title": "the fourth ownership shape, the drill record, and the four s…",
+      "plan": "docs/plans/0.10-backups-and-a-lost-phone--not-implemented.md",
+      "needs": [],
+      "owns": [
+        "apps/api/src/barmyar/db/mixins.py",
+        "apps/api/src/barmyar/db/policies.py",
+        "apps/api/alembic/helpers.py",
+        "apps/api/src/barmyar/models/backups.py",
+        "apps/api/tests/test_backups.py",
+        "apps/api/alembic/versions/20260825_c7b3e9d20a41_a_restore_th…",
+        "apps/api/src/barmyar/models/__init__.py",
+        "apps/api/tests/conftest.py",
+        "apps/api/tests/test_migrations.py"
+      ],
+      "verify": [
+        "TEST_DATABASE_NAME=barmyar_test_0_10a uv --directory apps/ap…",
+        "uv --directory apps/api run ruff check ."
+      ],
+      "notes": "",
+      "branch": "step/0.10a",
+      "worktree": "",
+      "chip": "",
+      "status": "landed",
+      "agent": "zen-driscoll-cbb5c5-dc",
+      "landedAt": "2026-08-25T08:38:21.184Z",
+      "landedSha": "f3d37a8",
+      "briefSha": "3f1ceccfeb36",
+      "briefAt": "2026-08-25T18:59:16.919Z",
+      "briefFile": "/home/aamirhosseinn0/Desktop/LMS_v2/.claude/orchestration/br…"
+    },
+    {
+      "key": "0.10b",
+      "title": "the backup settings, the runbook, the seven checks and the d…",
+      "plan": "docs/plans/0.10-backups-and-a-lost-phone--not-implemented.md",
+      "needs": [
+        "0.10a",
+        "0.14a",
+        "0.11a"
+      ],
+      "owns": [
+        "infra/backup/README.md",
+        "infra/backup/postgresql.backup.conf",
+        "infra/backup/drill.sh",
+        "apps/api/src/barmyar/db/backups.py",
+        "apps/api/src/barmyar/core/config.py",
+        ".env.example",
+        "apps/api/tests/test_backups.py"
+      ],
+      "verify": [
+        "TEST_DATABASE_NAME=barmyar_test_0_10b ./scripts/test tests/t…",
+        "uv --directory apps/api run ruff check ."
+      ],
+      "notes": " OWED: the refuse-to-start check is built UNWIRED in db/back…",
+      "branch": "step/0.10b",
+      "worktree": "",
+      "chip": "task_24d042d3",
+      "status": "landed",
+      "briefSha": "95e1678971a5",
+      "briefAt": "2026-08-25T18:59:16.964Z",
+      "briefFile": "/home/aamirhosseinn0/Desktop/LMS_v2/.claude/orchestration/br…",
+      "agent": "cool-tesla-b4ebc8-22",
+      "lastHeard": "2026-08-25T14:36:42.424Z",
+      "landedAt": "2026-08-25T15:37:32.684Z",
+      "landedSha": "9bf66c6"
+    },
+    {
+      "key": "0.10c",
+      "title": "the scheduler script, the schedule test, and the daily stale…",
+      "plan": "docs/plans/0.10-backups-and-a-lost-phone--not-implemented.md",
+      "needs": [
+        "0.10a",
+        "0.14a"
+      ],
+      "owns": [
+        "package.json",
+        "apps/api/tests/test_beat.py"
+      ],
+      "verify": [
+        "TEST_DATABASE_NAME=barmyar_test_0_10c ./scripts/test tests/t…",
+        "uv --directory apps/api run ruff check ."
+      ],
+      "notes": " The daily staleness job was removed from this piece: it cal…",
+      "branch": "step/0.10c",
+      "worktree": "",
+      "chip": "task_1423fb79",
+      "status": "landed",
+      "briefSha": "f22955e380f8",
+      "briefAt": "2026-08-25T18:59:17.013Z",
+      "briefFile": "/home/aamirhosseinn0/Desktop/LMS_v2/.claude/orchestration/br…",
+      "agent": "goofy-joliot-f94d58-53",
+      "lastHeard": "2026-08-25T14:36:42.544Z",
+      "landedAt": "2026-08-25T15:01:23.466Z",
+      "landedSha": "9611d65"
+    },
+    {
+      "key": "0.10d",
+      "title": "the scheduler service in both stack files",
+      "plan": "docs/plans/0.10-backups-and-a-lost-phone--not-implemented.md",
+      "needs": [
+        "0.10c",
+        "0.12.B"
+      ],
+      "owns": [
+        "docker-compose.yml",
+        "docker-compose.production.yml"
+      ],
+      "context": [
+        {
+          "path": "apps/api/src/barmyar/worker.py",
+          "what": "the schedule nothing runs, and the plain-session pattern the…"
+        },
+        {
+          "path": "apps/api/tests/test_migrations.py",
+          "what": "the three coverage checks and the person-owned tripwire the …"
+        },
+        {
+          "path": "apps/api/src/barmyar/audit/chain.py",
+          "what": "verify_chain reads through the ordinary policies, so drill c…"
+        },
+        {
+          "path": "packages/offline/src/durability.ts",
+          "what": "room(), built by 0.7 and never called; its first caller, kep…"
+        },
+        {
+          "path": "packages/offline/src/outbox.ts",
+          "what": "pending() already sorts and oldestAge() already exists, so t…"
+        },
+        {
+          "path": "apps/api/src/barmyar/services/organisations.py",
+          "what": "a root school's org_id is its own id, which is why an unscop…"
+        },
+        {
+          "path": "docker-compose.yml",
+          "what": "four services, the worker started with no scheduler flag — t…"
+        },
+        {
+          "path": ".gitignore",
+          "what": "OWED AND UNOWNED: celery beat PersistentScheduler writes a c…"
+        }
+      ],
+      "verify": [
+        "env TEST_DATABASE_NAME=barmyar_test_0_10d ./scripts/test tes…",
+        "docker compose -f docker-compose.yml config --services",
+        "docker compose -f docker-compose.yml config --services | gre…",
+        "env TEST_DATABASE_NAME=barmyar_test_0_10d ./scripts/test tes…"
+      ],
+      "decisions": [
+        "@7cecb46fff69",
+        "@e165abbe4db7",
+        "@7efede29e920",
+        "@3804ba4c30dc",
+        "@0d7947c0691c",
+        "@d3498d41a18a",
+        "@e41d0f1a98ef",
+        "@1e76780ce02b",
+        "@ce335c78e532",
+        "@27f3c1a2d4b4",
+        "@44f241f4687c",
+        "@e4154277f15c",
+        "@379db41f16e5",
+        "@1122b6bfbaf2",
+        "@5f876759cba4",
+        "@ad2f7a0ed556",
+        "@d81e977d49b2",
+        "@ae959a3b0a1f",
+        "@b8c86b304394",
+        "@96c93dffa9ab",
+        "@77dd0556884a",
+        "@1f33730bea66",
+        "@fa19896a3f86",
+        "@184e7bba309c",
+        "@21c3481dde7f",
+        "@481e2200da47",
+        "@a6719534d905",
+        "@681e543160e7",
+        "@80ed278bdca6",
+        "@6e7a99072615",
+        "@c080b755265d"
+      ],
+      "notes": "",
+      "branch": "step/0.10d",
+      "worktree": "",
+      "chip": "",
+      "status": "landed",
+      "reports": [
+        {
+          "commit": "b87e942",
+          "verified": "All four verify-list commands, each through with-ci-slot, on…",
+          "outcome": "passed",
+          "notes": "Two files changed, both mine, nothing else touched: docker-c…",
+          "at": "2026-08-26T13:40:06.266Z"
+        },
+        {
+          "commit": "b87e942",
+          "verified": "tests/test_stack.py 19 passed 4.97s; compose config --servic…",
+          "outcome": "passed",
+          "notes": "SELF-REPORTED GAP: did NOT run its own leave-one-out re-proo…",
+          "at": "2026-08-26T13:42:39.933Z"
+        },
+        {
+          "commit": "f671195",
+          "verified": "Sent back for tests/test_readiness.py::test_the_compose_heal…",
+          "outcome": "passed",
+          "notes": "Two commits on step/0.10d: b87e942 the beat service in both …",
+          "at": "2026-08-26T14:13:27.387Z"
+        },
+        {
+          "commit": "f671195",
+          "verified": "tests/test_stack.py 19 passed; tests/test_deployment.py 28 p…",
+          "outcome": "passed",
+          "notes": "Proved the red on its OWN tree rather than borrowing mine: r…",
+          "at": "2026-08-26T14:14:48.937Z"
+        }
+      ],
+      "briefSha": "43bff31587bd",
+      "briefAt": "2026-08-26T13:59:12.966Z",
+      "briefFile": "/home/aamirhosseinn0/Desktop/LMS_v2/.claude/orchestration/br…",
+      "agent": "blissful-raman-2626d8-92",
+      "lastHeard": "2026-08-26T13:43:09.535Z",
+      "landedAt": "2026-08-26T14:27:52.667Z",
+      "landedSha": "9707f4c"
+    },
+    {
+      "key": "0.10e",
+      "title": "the copy of the uploaded originals, and a restore that ends …",
+      "plan": "docs/plans/0.10-backups-and-a-lost-phone--not-implemented.md",
+      "needs": [
+        "0.10b",
+        "0.13-C",
+        "0.9"
+      ],
+      "owns": [
+        "infra/backup/originals.sh",
+        "apps/api/src/barmyar/platform/access.py",
+        "apps/api/src/barmyar/db/backups.py",
+        "apps/api/tests/test_backups.py",
+        "apps/api/tests/test_platform_access.py",
+        "apps/api/src/barmyar/recovery",
+        "apps/api/tests/test_recovery_command.py"
+      ],
+      "context": [
+        {
+          "path": "apps/api/src/barmyar/worker.py",
+          "what": "the schedule nothing runs, and the plain-session pattern the…"
+        },
+        {
+          "path": "apps/api/tests/test_migrations.py",
+          "what": "the three coverage checks and the person-owned tripwire the …"
+        },
+        {
+          "path": "apps/api/src/barmyar/audit/chain.py",
+          "what": "verify_chain reads through the ordinary policies, so drill c…"
+        },
+        {
+          "path": "packages/offline/src/durability.ts",
+          "what": "room(), built by 0.7 and never called; its first caller, kep…"
+        },
+        {
+          "path": "packages/offline/src/outbox.ts",
+          "what": "pending() already sorts and oldestAge() already exists, so t…"
+        },
+        {
+          "path": "apps/api/src/barmyar/services/organisations.py",
+          "what": "a root school's org_id is its own id, which is why an unscop…"
+        }
+      ],
+      "verify": [
+        "bash -n infra/backup/originals.sh",
+        "env TEST_DATABASE_NAME=barmyar_test_0_10e ./scripts/test tes…"
+      ],
+      "decisions": [
+        "@7cecb46fff69",
+        "@e165abbe4db7",
+        "@7efede29e920",
+        "@3804ba4c30dc",
+        "@0d7947c0691c",
+        "@db93d90126b2",
+        "@5815bf597e53",
+        "@7bf359285148",
+        "@b985f7e09016",
+        "@6651effefde2",
+        "@53e7dad5b076",
+        "@e41d0f1a98ef",
+        "@1e76780ce02b",
+        "@ce335c78e532",
+        "@27f3c1a2d4b4",
+        "@44f241f4687c",
+        "@e4154277f15c",
+        "@379db41f16e5",
+        "@1122b6bfbaf2",
+        "@5f876759cba4",
+        "@ad2f7a0ed556",
+        "@d81e977d49b2",
+        "@ae959a3b0a1f",
+        "@3025525c8b3e",
+        "@728a53f0bbb1",
+        "@50c7f9ad21d1",
+        "@6a3e4ce1263d",
+        "@4c241490cf72"
+      ],
+      "notes": "",
+      "branch": "step/0.10e",
+      "worktree": "",
+      "chip": "",
+      "status": "planned",
+      "reports": [],
+      "briefSha": "70c9dfae75f1",
+      "briefAt": "2026-08-26T15:37:52.392Z",
+      "briefFile": "/home/aamirhosseinn0/Desktop/LMS_v2/.claude/orchestration/br…",
+      "preflight": {
+        "at": "2026-08-26T15:21:34.562Z",
+        "missing": [
+          {
+            "path": "apps/api/src/barmyar/db/backups.py",
+            "why": "FACT ABOUT THE TREE TODAY. The record's owns list is only or…",
+            "evidence": "docs/plans/0.10-backups-and-a-lost-phone--not-implemented.md…",
+            "loadBearing": true
+          },
+          {
+            "path": "apps/api/tests/test_backups.py",
+            "why": "FACT ABOUT THE TREE TODAY. This is the file the task's own s…",
+            "evidence": "apps/api/tests/test_backups.py:1091-1105 (the empty-table co…",
+            "loadBearing": true
+          },
+          {
+            "path": "apps/api/tests/test_platform_access.py",
+            "why": "FACT ABOUT THE TREE TODAY. The plan's Changed table names th…",
+            "evidence": "docs/plans/0.10-backups-and-a-lost-phone--not-implemented.md…",
+            "loadBearing": true
+          },
+          {
+            "path": "apps/api/src/barmyar/recovery/__init__.py, apps/api/src/barm…",
+            "why": "CONTINGENT ON 0.13-C for the two functions it calls; the fil…",
+            "evidence": "infra/backup/README.md:219-222 (the printed command) and :26…",
+            "loadBearing": true
+          },
+          {
+            "path": "apps/api/tests/test_recovery_command.py",
+            "why": "CONTINGENT ON 0.13-C. Named in the plan's Files/New table, a…",
+            "evidence": "docs/plans/0.10-backups-and-a-lost-phone--not-implemented.md…",
+            "loadBearing": true
+          },
+          {
+            "path": "infra/backup/README.md",
+            "why": "FACT ABOUT THE TREE TODAY. Owed item o05 names it, and its w…",
+            "evidence": "infra/backup/README.md:211-215, :263-264, :276; .claude/orch…",
+            "loadBearing": false
+          },
+          {
+            "path": "README.md",
+            "why": "FACT ABOUT THE TREE TODAY, AND A LIVE COLLISION. Owed item o…",
+            "evidence": "README.md:678-690; .claude/orchestration/register.json owed …",
+            "loadBearing": false
+          }
+        ],
+        "verify": [
+          {
+            "command": "bash -n infra/backup/originals.sh",
+            "runnable": true,
+            "why": "Runs here — /usr/bin/bash is present. It fails today only be…"
+          },
+          {
+            "command": "env TEST_DATABASE_NAME=barmyar_test_0_10e ./scripts/test tes…",
+            "runnable": true,
+            "why": "Runs here. scripts/test is executable (-rwxrwxr-x), uv is on…"
+          }
+        ],
+        "notes": "============================================================…"
+      },
+      "serialises": [
+        "watch.logs.EVENT_NAMES — the closed log vocabulary. NOTHING …",
+        "watch.logs.LOG_FIELDS — the closed field list. test_logging.…",
+        "platform_session()'s signature — 12 call sites across 6 file…",
+        "barmyar.db.backups.__all__ — an explicit closed export list …",
+        "NOT MOVED: the alembic head. 0.10e adds no table and no migr…",
+        "NOT MOVED: db/mixins.py, db/policies.py, alembic/helpers.py.…",
+        "NOT A SERIALISATION POINT: scripts/pytest_weights.json. pyte…",
+        "NOT A SERIALISATION POINT: tests/conftest.py truncation orde…"
+      ]
+    },
+    {
+      "key": "0.10f",
+      "title": "the lost phone: the outbox summary, the room reading, the wa…",
+      "plan": "docs/plans/0.10-backups-and-a-lost-phone--not-implemented.md",
+      "needs": [
+        "0.10a",
+        "0.14a"
+      ],
+      "owns": [
+        "packages/offline/src/unsent.ts",
+        "packages/offline/src/unsent.test.ts",
+        "packages/offline/src/engine.ts",
+        "packages/offline/src/index.ts",
+        "packages/api-client/src/sync.ts",
+        "packages/api-client/src/index.ts",
+        "apps/api/src/barmyar/sync/heard.py",
+        "apps/api/tests/test_last_heard.py",
+        "apps/student/src/EngineStatus.tsx",
+        "apps/panel/src/EngineStatus.tsx",
+        "apps/api/src/barmyar/api/v1/sync.py",
+        "apps/api/src/barmyar/models/sync.py",
+        "apps/api/alembic/versions/20260825_b5e8d3f27a41_what_we_last…",
+        "packages/wording/fa.json",
+        "packages/wording/en.json"
+      ],
+      "verify": [
+        "TEST_DATABASE_NAME=barmyar_test_0_10f ./scripts/test tests/t…",
+        "pnpm --filter @barmyar/offline test",
+        "pnpm typecheck",
+        "pnpm build"
+      ],
+      "notes": "",
+      "branch": "step/0.10f",
+      "worktree": "",
+      "chip": "task_57f21c19",
+      "status": "landed",
+      "briefSha": "7a8cd6e39985",
+      "briefAt": "2026-08-25T18:59:17.158Z",
+      "briefFile": "/home/aamirhosseinn0/Desktop/LMS_v2/.claude/orchestration/br…",
+      "agent": "hungry-benz-fc8586-27",
+      "lastHeard": "2026-08-25T14:36:53.400Z",
+      "landedAt": "2026-08-25T15:29:21.145Z",
+      "landedSha": "b152d6a"
+    },
+    {
+      "key": "0.10g",
+      "title": "the README section on what happens if the store is lost",
+      "plan": "docs/plans/0.10-backups-and-a-lost-phone--not-implemented.md",
+      "needs": [
+        "0.10b",
+        "0.10c"
+      ],
+      "owns": [
+        "README.md"
+      ],
+      "verify": [
+        "grep -q 'api:beat' README.md"
+      ],
+      "notes": "",
+      "branch": "step/0.10g",
+      "worktree": "",
+      "chip": "task_ece446e0",
+      "status": "landed",
+      "briefSha": "adeb8b6af4e7",
+      "briefAt": "2026-08-25T18:59:17.209Z",
+      "briefFile": "/home/aamirhosseinn0/Desktop/LMS_v2/.claude/orchestration/br…",
+      "agent": "peaceful-diffie-3cb1fd-dd",
+      "lastHeard": "2026-08-25T15:48:48.010Z",
+      "landedAt": "2026-08-25T16:06:13.409Z",
+      "landedSha": "92c447d"
+    },
+    {
+      "key": "0.11a",
+      "title": "fix the two defects in the shipped throttle, before anything…",
+      "plan": "docs/plans/0.11-rate-limiting-and-abuse--not-implemented.md",
+      "needs": [],
+      "owns": [
+        "apps/api/src/barmyar/auth/throttle.py",
+        "docs/important-findings-roadmap-implementation.md",
+        "apps/api/src/barmyar/core/config.py",
+        ".env.example"
+      ],
+      "verify": [
+        "TEST_DATABASE_NAME=barmyar_test_0_11a uv --directory apps/ap…",
+        "uv --directory apps/api run ruff check ."
+      ],
+      "notes": "",
+      "branch": "step/0.11a",
+      "worktree": "",
+      "chip": "",
+      "status": "landed",
+      "agent": "mystifying-khayyam-1ea2e8-52",
+      "landedAt": "2026-08-25T08:38:20.814Z",
+      "landedSha": "f9d88b0",
+      "briefSha": "b8d27181acda",
+      "briefAt": "2026-08-25T18:59:17.257Z",
+      "briefFile": "/home/aamirhosseinn0/Desktop/LMS_v2/.claude/orchestration/br…"
+    },
+    {
+      "key": "0.11b",
+      "title": "the nine purposes, the registry and its invariants, and the …",
+      "plan": "docs/plans/0.11-rate-limiting-and-abuse--not-implemented.md",
+      "needs": [
+        "0.11a"
+      ],
+      "owns": [
+        "apps/api/src/barmyar/core/limits.py",
+        "apps/api/src/barmyar/auth/service.py",
+        "apps/api/src/barmyar/auth/throttle.py",
+        "apps/api/src/barmyar/api/v1/auth.py",
+        "apps/api/tests/conftest.py",
+        "apps/api/tests/test_limits.py",
+        "apps/api/tests/test_throttle.py",
+        "apps/api/README.md",
+        "apps/api/src/barmyar/core/config.py",
+        ".env.example",
+        "apps/api/src/barmyar/wording.py",
+        "packages/wording/fa.json",
+        "packages/wording/en.json",
+        "docs/important-findings-roadmap-implementation.md"
+      ],
+      "verify": [
+        "TEST_DATABASE_NAME=barmyar_test_0_11b uv --directory apps/ap…",
+        "uv --directory apps/api run ruff check ."
+      ],
+      "notes": "",
+      "branch": "step/0.11b",
+      "worktree": "",
+      "chip": "task_08d9bbb0",
+      "status": "landed",
+      "briefSha": "c7f5342a3d5d",
+      "briefAt": "2026-08-25T18:59:17.308Z",
+      "briefFile": "/home/aamirhosseinn0/Desktop/LMS_v2/.claude/orchestration/br…",
+      "agent": "zealous-driscoll-a76070-28",
+      "lastHeard": "2026-08-25T13:28:55.033Z",
+      "landedAt": "2026-08-25T14:29:30.142Z",
+      "landedSha": "cc2b37e"
+    },
+    {
+      "key": "0.11c",
+      "title": "the refusal's shape and the three names in both wording file…",
+      "plan": "docs/plans/0.11-rate-limiting-and-abuse--not-implemented.md",
+      "needs": [
+        "0.11b",
+        "0.9"
+      ],
+      "owns": [
+        "apps/api/src/barmyar/api/errors.py",
+        "apps/api/src/barmyar/wording.py",
+        "packages/wording/fa.json",
+        "packages/wording/en.json"
+      ],
+      "verify": [
+        "TEST_DATABASE_NAME=barmyar_test_0_11c ./scripts/test tests/t…",
+        "uv --directory apps/api run ruff check ."
+      ],
+      "notes": "",
+      "branch": "step/0.11c",
+      "worktree": "",
+      "chip": "task_684d3e22",
+      "status": "landed",
+      "briefSha": "3212c36cfc04",
+      "briefAt": "2026-08-25T18:59:17.355Z",
+      "briefFile": "/home/aamirhosseinn0/Desktop/LMS_v2/.claude/orchestration/br…",
+      "agent": "nifty-aryabhata-8294f2-30",
+      "lastHeard": "2026-08-25T17:01:15.564Z",
+      "landedAt": "2026-08-25T17:29:43.800Z",
+      "landedSha": "8f16a7b"
+    },
+    {
+      "key": "0.11d",
+      "title": "the client carries the named refusal and the engine learns t…",
+      "plan": "docs/plans/0.11-rate-limiting-and-abuse--not-implemented.md",
+      "needs": [
+        "0.10f"
+      ],
+      "owns": [
+        "packages/api-client/src/client.ts",
+        "packages/api-client/src/sync.ts",
+        "packages/api-client/src/index.ts",
+        "packages/offline/src/engine.ts",
+        "packages/offline/src/engine.test.ts"
+      ],
+      "verify": [
+        "TURBO_FORCE=true CI=1 pnpm typecheck",
+        "TURBO_FORCE=true CI=1 pnpm test",
+        "TURBO_FORCE=true CI=1 pnpm build"
+      ],
+      "notes": " OWED: there is no sync.state.holding_off wording key. word(…",
+      "branch": "step/0.11d",
+      "worktree": "",
+      "chip": "task_e36ab569",
+      "status": "landed",
+      "briefSha": "f5516765897f",
+      "briefAt": "2026-08-25T18:59:17.401Z",
+      "briefFile": "/home/aamirhosseinn0/Desktop/LMS_v2/.claude/orchestration/br…",
+      "agent": "sweet-swanson-793796-43",
+      "lastHeard": "2026-08-25T15:55:31.173Z",
+      "landedAt": "2026-08-25T16:12:16.869Z",
+      "landedSha": "e033a1b"
+    },
+    {
+      "key": "0.11e",
+      "title": "the sync endpoint: the guard, the two exemptions, and the bo…",
+      "plan": "docs/plans/0.11-rate-limiting-and-abuse--not-implemented.md",
+      "needs": [
+        "0.11b",
+        "0.11c"
+      ],
+      "owns": [
+        "apps/api/src/barmyar/api/v1/sync.py",
+        "apps/api/tests/test_sync.py",
+        "apps/api/tests/test_notes.py",
+        "apps/api/tests/test_last_heard.py"
+      ],
+      "verify": [
+        "TEST_DATABASE_NAME=barmyar_test_0_11e ./scripts/test tests/t…",
+        "uv --directory apps/api run ruff check ."
+      ],
+      "notes": "",
+      "branch": "step/0.11e",
+      "worktree": "",
+      "chip": "task_66aaf262",
+      "status": "landed",
+      "briefSha": "f5baaf1e8008",
+      "briefAt": "2026-08-25T19:29:34.006Z",
+      "briefFile": "/home/aamirhosseinn0/Desktop/LMS_v2/.claude/orchestration/br…",
+      "agent": "hungry-wu-20238f-3c",
+      "lastHeard": "2026-08-25T19:07:05.141Z",
+      "landedAt": "2026-08-25T19:38:33.798Z",
+      "landedSha": "ed73df3"
+    },
+    {
+      "key": "0.11f",
+      "title": "the three service call sites, the import byte ceiling, and t…",
+      "plan": "docs/plans/0.11-rate-limiting-and-abuse--not-implemented.md",
+      "needs": [
+        "0.11b",
+        "0.11c"
+      ],
+      "owns": [
+        "apps/api/src/barmyar/services/invitations.py",
+        "apps/api/src/barmyar/services/people.py",
+        "apps/api/src/barmyar/services/porting.py",
+        "apps/api/src/barmyar/api/v1/auth.py",
+        "apps/api/tests/test_invitations.py",
+        "apps/api/tests/test_importing.py"
+      ],
+      "verify": [
+        "TEST_DATABASE_NAME=barmyar_test_0_11f ./scripts/test tests/t…",
+        "uv --directory apps/api run ruff check ."
+      ],
+      "notes": "",
+      "branch": "step/0.11f",
+      "worktree": "",
+      "chip": "task_17a1fca7",
+      "status": "landed",
+      "briefSha": "94b994ac29f4",
+      "briefAt": "2026-08-25T19:21:49.812Z",
+      "briefFile": "/home/aamirhosseinn0/Desktop/LMS_v2/.claude/orchestration/br…",
+      "agent": "focused-jones-21ef88-9e",
+      "lastHeard": "2026-08-25T19:00:54.022Z",
+      "landedAt": "2026-08-25T19:27:28.990Z",
+      "landedSha": "f534911"
+    },
+    {
+      "key": "0.11g",
+      "title": "the remaining client-building fixtures widened, and the 429 …",
+      "plan": "docs/plans/0.11-rate-limiting-and-abuse--not-implemented.md",
+      "needs": [
+        "0.11b",
+        "0.11c",
+        "0.9",
+        "0.11f"
+      ],
+      "owns": [
+        "apps/api/tests/test_sign_in.py",
+        "apps/api/tests/test_context.py",
+        "apps/api/tests/test_authorisation.py",
+        "apps/api/tests/test_readiness.py"
+      ],
+      "verify": [
+        "TEST_DATABASE_NAME=barmyar_test_0_11g ./scripts/test tests/t…",
+        "TEST_DATABASE_NAME=barmyar_test_0_11g ./scripts/test",
+        "uv --directory apps/api run ruff check ."
+      ],
+      "notes": " SERIALISED behind 0.11f for api/v1/auth.py.",
+      "branch": "step/0.11g",
+      "worktree": "",
+      "chip": "task_890594da",
+      "status": "landed",
+      "briefSha": "051df4051aa4",
+      "briefAt": "2026-08-26T05:22:37.097Z",
+      "briefFile": "/home/aamirhosseinn0/Desktop/LMS_v2/.claude/orchestration/br…",
+      "serialises": [
+        "barmyar:limit key namespace"
+      ],
+      "agent": "ecstatic-tharp-5b252c-7a",
+      "lastHeard": "2026-08-25T20:58:14.731Z",
+      "landedAt": "2026-08-26T05:27:33.860Z",
+      "landedSha": "351e3b9"
+    },
+    {
+      "key": "1.9a",
+      "title": "the two stand-in documents, and the registry that proves the…",
+      "plan": "docs/plans/1.9-first-run-and-consent--not-implemented.md",
+      "needs": [],
+      "owns": [
+        "apps/api/src/barmyar/legal.py",
+        "packages/legal",
+        "apps/api/tests/test_legal.py",
+        "pnpm-lock.yaml"
+      ],
+      "verify": [
+        "TEST_DATABASE_NAME=barmyar_test_1_9a uv --directory apps/api…",
+        "uv --directory apps/api run ruff check .",
+        "CI=1 pnpm typecheck"
+      ],
+      "notes": "",
+      "branch": "step/1.9a",
+      "worktree": "",
+      "chip": "",
+      "status": "landed",
+      "agent": "gracious-blackwell-c1f34f-dc",
+      "landedAt": "2026-08-25T08:38:21.063Z",
+      "landedSha": "d774e29",
+      "briefSha": "5f063d2f757f",
+      "briefAt": "2026-08-25T18:59:17.569Z",
+      "briefFile": "/home/aamirhosseinn0/Desktop/LMS_v2/.claude/orchestration/br…"
+    }
+  ],
+  "notes": [
+    "FULL CI CHECK-SET on the merged tree at 849b999 (main), 2026…",
+    "THE DECISIONS DOC HEADER WARNING IS NOT GENERATED. docs/deci…"
+  ],
+  "owed": [
+    {
+      "id": "o01",
+      "what": "README.md: add the packages/tuning row to the Layout table, …",
+      "why": "0.14b added the packages/tuning workspace package in round 3…",
+      "window": "any time; 0.12.H owns README.md and closes the documentation",
+      "to": "0.12.H",
+      "loadBearing": false,
+      "status": "open",
+      "at": "2026-08-25T19:41:05.945Z"
+    },
+    {
+      "id": "o02",
+      "what": "README.md: add an infra/backup row to the Layout table",
+      "why": "infra/backup landed in round 3 and 0.10g's new section links…",
+      "window": "any time; found by 0.10g, which did not add it because Layou…",
+      "to": "0.12.H",
+      "loadBearing": false,
+      "status": "open",
+      "at": "2026-08-25T19:41:06.096Z"
+    },
+    {
+      "id": "o03",
+      "what": "README.md: strike bullet 2 of 'Which half of this is standin…",
+      "why": "FALSE as of 0.10h, which landed the daily job and its beat e…",
+      "window": "any time; 0.12.H is the live owner of README.md",
+      "to": "0.12.H",
+      "loadBearing": false,
+      "status": "open",
+      "at": "2026-08-25T19:41:06.248Z"
+    },
+    {
+      "id": "o04",
+      "what": "Roadmap.md: the summary's count of six shared folders become…",
+      "why": "0.14b added packages/tuning. Roadmap.md is owned by NO task …",
+      "window": "before the build closes",
+      "to": "0.12.H",
+      "loadBearing": false,
+      "status": "open",
+      "at": "2026-08-25T19:41:06.393Z"
+    },
+    {
+      "id": "o05",
+      "what": "README.md: strike bullet 1 of 'Which half of this is standin…",
+      "why": "both go stale the moment 0.10e lands the originals work they…",
+      "window": "in 0.10e's own commit — the moment it goes stale is the only…",
+      "to": "0.10e",
+      "loadBearing": false,
+      "status": "open",
+      "at": "2026-08-25T19:41:06.549Z"
+    },
+    {
+      "id": "o06",
+      "what": "README.md: strike bullet 4 of 'Which half of this is standin…",
+      "why": "they say the stack starts no scheduler and nothing checks be…",
+      "window": "in 0.10d's own commit",
+      "to": "0.12.H",
+      "loadBearing": false,
+      "status": "open",
+      "at": "2026-08-25T19:41:06.694Z"
+    },
+    {
+      "id": "o07",
+      "what": "The plan says FOUR client-building suites and there are FIVE…",
+      "why": "test_last_heard.py landed with 0.10f in round 3, after the p…",
+      "window": "0.11g holds test_sign_in.py and test_context.py — do not tru…",
+      "to": "0.11g",
+      "loadBearing": false,
+      "status": "done",
+      "at": "2026-08-25T19:41:06.846Z",
+      "doneAt": "2026-08-26T05:53:06.537Z"
+    },
+    {
+      "id": "o08",
+      "what": "Row G is genuinely unbuilt: nothing in the committed suite a…",
+      "why": "0.11f proved it from a scratch file it deleted, because test…",
+      "window": "0.11g owns test_sign_in.py",
+      "to": "0.11g",
+      "loadBearing": true,
+      "status": "done",
+      "at": "2026-08-25T19:41:06.995Z",
+      "doneAt": "2026-08-26T05:53:06.700Z"
+    },
+    {
+      "id": "o09",
+      "what": "1.9's order-of-work row B is 'the append_only flag on the pe…",
+      "why": "1.9b built and proved the flag but was granted no migration …",
+      "window": "1.9e's consents migration is the first thing in the repo tha…",
+      "to": "1.9e",
+      "loadBearing": true,
+      "status": "open",
+      "at": "2026-08-25T19:41:07.138Z"
+    },
+    {
+      "id": "o10",
+      "what": "models/__init__.py: re-export TopicResolution, RESOLUTION_FA…",
+      "why": "0.14c could not — the table did not exist in its tree, so th…",
+      "window": "any piece that holds both files after 1.10a landed",
+      "to": "1.10c",
+      "loadBearing": false,
+      "status": "open",
+      "at": "2026-08-25T19:41:07.285Z"
+    },
+    {
+      "id": "o11",
+      "what": "tests/test_answers.py:520 says 'keeping AnswerExtras's own r…",
+      "why": "1.8c retired AnswerExtras in round 5. Its siblings at models…",
+      "window": "1.8f holds that file",
+      "to": "1.8f",
+      "loadBearing": false,
+      "status": "done",
+      "at": "2026-08-25T19:41:07.513Z",
+      "doneAt": "2026-08-26T14:01:36.807Z"
+    },
+    {
+      "id": "o12",
+      "what": "worker.py lines 627-629, inside sweep_batch_task's docstring…",
+      "why": "0.10h added barmyar.check_restore_drill in round 6 and left …",
+      "window": "in 0.14d's own commit — it is your part of the file. NOTE 0.…",
+      "to": "0.14d",
+      "loadBearing": false,
+      "status": "done",
+      "at": "2026-08-25T19:41:07.711Z",
+      "doneAt": "2026-08-26T05:53:06.850Z"
+    },
+    {
+      "id": "o13",
+      "what": "scripts/test and scripts/testdb are committed mode 100644 — …",
+      "why": "package.json's api:test runs ./scripts/test, which shells ou…",
+      "window": "0.12.A owns scripts/",
+      "to": "0.12.A",
+      "loadBearing": false,
+      "status": "done",
+      "at": "2026-08-25T19:41:07.924Z",
+      "doneAt": "2026-08-26T09:10:10.644Z"
+    },
+    {
+      "id": "o14",
+      "what": "THE CODE HAS LANDED AND NOBODY HAS WATCHED IT WORK. scripts/…",
+      "why": "Original finding: the 1GB tmpfs is undersized because max_wa…",
+      "window": "A QUIET BOX. Needs `docker rm -f barmyar-testdb` (or scripts…",
+      "to": null,
+      "loadBearing": false,
+      "status": "open",
+      "at": "2026-08-25T19:41:08.481Z"
+    },
+    {
+      "id": "o15",
+      "what": "@barmyar/api-client had no test runner; 0.12.E gave it one, …",
+      "why": "0.11d put two wire cases in engine.test.ts because api-clien…",
+      "window": "whoever next holds packages/offline/src/engine.test.ts",
+      "to": "1.8e",
+      "loadBearing": false,
+      "status": "done",
+      "at": "2026-08-25T19:41:08.948Z",
+      "doneAt": "2026-08-26T09:51:32.292Z"
+    },
+    {
+      "id": "o16",
+      "what": "0.3 designs a shared question bank as items rows with org_id…",
+      "why": "Two settled, landed steps that cannot both be satisfied. 0.3…",
+      "window": "AUTHOR DECISION - not assignable to a task until it is settl…",
+      "to": "sweep-a",
+      "loadBearing": false,
+      "status": "done",
+      "at": "2026-08-25T19:49:33.347Z",
+      "doneAt": "2026-08-26T12:12:53.865Z"
+    },
+    {
+      "id": "o17",
+      "what": "DoD 7's second bullet, 8, and the unresolved() halves of 9 a…",
+      "why": "All four need adopt_shared_concept(), and the plan refuses a…",
+      "window": "1.10c, after 1.10b lands",
+      "to": "1.10c",
+      "loadBearing": false,
+      "status": "open",
+      "at": "2026-08-25T19:49:33.690Z"
+    },
+    {
+      "id": "o18",
+      "what": "Nothing in the suite asserts the alembic chain has exactly o…",
+      "why": "Found by 0.14d's pre-flight. The only thing that catches a f…",
+      "window": "any piece that owns tests/test_migrations.py",
+      "to": "0.14d",
+      "loadBearing": false,
+      "status": "done",
+      "at": "2026-08-25T19:55:42.650Z",
+      "doneAt": "2026-08-26T05:48:27.124Z"
+    },
+    {
+      "id": "o19",
+      "what": "The client-building suites are SIX, but only THREE genuinely…",
+      "why": "SIX build their own TestClient: test_notes.py, test_sign_in.…",
+      "window": "whoever next holds tests/test_readiness.py",
+      "to": "0.11g",
+      "loadBearing": false,
+      "status": "done",
+      "at": "2026-08-25T19:55:42.824Z",
+      "doneAt": "2026-08-26T05:53:07.005Z"
+    },
+    {
+      "id": "o20",
+      "what": "docker-compose.yml sets DATABASE_MIGRATE_URL on BOTH api and…",
+      "why": "The plan's compose row (0.12 plan line ~1012) forces only DA…",
+      "window": "0.12.B, before any staging stack is brought up (order-of-wor…",
+      "to": "0.12.B",
+      "loadBearing": true,
+      "status": "done",
+      "at": "2026-08-26T08:47:07.566Z",
+      "doneAt": "2026-08-26T14:01:37.067Z"
+    },
+    {
+      "id": "o21",
+      "what": "Definition-of-done 11, the store's TimeZone: assert it again…",
+      "why": "0.12.A was given DoD 11 but its only reachable database is b…",
+      "window": "0.12.B, with the rest of the two-compose-file comparison",
+      "to": "0.12.B",
+      "loadBearing": false,
+      "status": "done",
+      "at": "2026-08-26T08:47:07.752Z",
+      "doneAt": "2026-08-26T14:01:37.391Z"
+    },
+    {
+      "id": "o22",
+      "what": "The 0.12 plan's 'Where the secrets are' paragraph enumerates…",
+      "why": "A counted list in prose goes stale the moment the list grows…",
+      "window": "0.12.H, the documentation step",
+      "to": "0.12.H",
+      "loadBearing": false,
+      "status": "open",
+      "at": "2026-08-26T08:47:07.953Z"
+    },
+    {
+      "id": "o23",
+      "what": "apps/api/tests/test_config.py:93 — `assert Settings(_env_fil…",
+      "why": "PROVED, not recalled: with DATABASE_MIGRATE_URL exported, Se…",
+      "window": "any time. NOBODY IN THE REGISTER OWNS tests/test_config.py —…",
+      "to": "0.12.C",
+      "loadBearing": false,
+      "status": "open",
+      "at": "2026-08-26T09:08:02.139Z",
+      "windowShutAt": "2026-08-26T16:26:39.722Z"
+    },
+    {
+      "id": "o24",
+      "what": "packages/ui/src/accessibility.test.tsx — the test 'the share…",
+      "why": "OBSERVED RED, not predicted: in the joined run for 0.12.A it…",
+      "window": "before the next push to GitHub, ideally. NOBODY IN THE REGIS…",
+      "to": "sweep-a",
+      "loadBearing": false,
+      "status": "done",
+      "at": "2026-08-26T09:15:53.189Z",
+      "doneAt": "2026-08-26T14:01:37.670Z"
+    },
+    {
+      "id": "o25",
+      "what": "SECRET_SETTINGS HAS NO READER. 0.12.A's definition-of-done 5…",
+      "why": "0.12.A said this itself rather than letting the tick stand —…",
+      "window": "0.12.B, with the two-compose-file comparison",
+      "to": "0.12.B",
+      "loadBearing": false,
+      "status": "done",
+      "at": "2026-08-26T09:35:03.223Z",
+      "doneAt": "2026-08-26T14:01:37.969Z"
+    },
+    {
+      "id": "o26",
+      "what": "apps/api/src/barmyar/worker.py — the refusal docstring impli…",
+      "why": "VERIFIED by reading the installed billiard/celery, not recal…",
+      "window": "any time. NOBODY IN THE REGISTER OWNS worker.py — 0.9, 0.10h…",
+      "to": "sweep-a",
+      "loadBearing": false,
+      "status": "done",
+      "at": "2026-08-26T09:35:03.393Z",
+      "doneAt": "2026-08-26T14:01:38.276Z"
+    },
+    {
+      "id": "o27",
+      "what": "README.md:290 says the event vocabulary is 'twenty-six kinds…",
+      "why": "1.9's plan line 1487 assigns the count correction to 1.9c, b…",
+      "window": "0.12.H, with the other four README corrections it already ca…",
+      "to": "0.12.H",
+      "loadBearing": false,
+      "status": "open",
+      "at": "2026-08-26T11:33:17.275Z"
+    },
+    {
+      "id": "o28",
+      "what": "README.md:14 and :40-41 both state the compose file's conten…",
+      "why": "No test reads them so it cannot go red, but README.md belong…",
+      "window": "0.12.H, with the five README corrections it already carries",
+      "to": "0.12.H",
+      "loadBearing": false,
+      "status": "open",
+      "at": "2026-08-26T11:52:39.175Z"
+    },
+    {
+      "id": "o29",
+      "what": "docs/important-findings-roadmap-implementation.md section 2.…",
+      "why": "The user settled it on 2026-08-26 by choosing to keep the sh…",
+      "window": "0.12.H, with the six other documentation corrections it carr…",
+      "to": "0.12.H",
+      "loadBearing": false,
+      "status": "open",
+      "at": "2026-08-26T12:15:45.236Z"
+    },
+    {
+      "id": "o30",
+      "what": "packages/tuning/src/tuning.test.ts has the SAME unscoped-tim…",
+      "why": "o24 as written named only packages/ui/src/accessibility.test…",
+      "window": "before the next push that runs the JavaScript job under load…",
+      "to": "sweep-c",
+      "loadBearing": true,
+      "status": "done",
+      "at": "2026-08-26T12:24:42.742Z",
+      "doneAt": "2026-08-26T14:01:38.515Z"
+    },
+    {
+      "id": "o31",
+      "what": "apps/api/src/barmyar/events/__init__.py's docstring says kin…",
+      "why": "The plan's Files section required TOPIC_LEVELS be read from …",
+      "window": "any piece holding events/__init__.py; its only owner 1.8c ha…",
+      "to": "sweep-c",
+      "loadBearing": false,
+      "status": "done",
+      "at": "2026-08-26T12:24:42.944Z",
+      "doneAt": "2026-08-26T14:01:38.788Z"
+    },
+    {
+      "id": "o32",
+      "what": "THE OVERLAY INHERITS THE BASE'S ./infra/postgres/init BIND M…",
+      "why": "Found by 0.12.B while building the overlay. It does not own …",
+      "window": "0.12.G, which owns both release.sh and infra/deploy/README.m…",
+      "to": "0.12.F",
+      "loadBearing": true,
+      "status": "open",
+      "at": "2026-08-26T12:42:57.029Z",
+      "movedFrom": "0.12.G"
+    },
+    {
+      "id": "o33",
+      "what": "infra/deploy/README.md must list the SIX required environmen…",
+      "why": "That refusal is the mechanism settled in answer to 0.12.B's …",
+      "window": "0.12.G, which owns infra/deploy/README.md",
+      "to": "0.12.F",
+      "loadBearing": false,
+      "status": "open",
+      "at": "2026-08-26T12:42:57.437Z",
+      "movedFrom": "0.12.G"
+    },
+    {
+      "id": "o34",
+      "what": "o28's README work must also name the new parts by name — she…",
+      "why": "Extends o28 rather than replacing it. Found by 0.12.B, which…",
+      "window": "0.12.H, with the six other README corrections it carries",
+      "to": "0.12.H",
+      "loadBearing": false,
+      "status": "open",
+      "at": "2026-08-26T12:46:31.627Z"
+    },
+    {
+      "id": "o35",
+      "what": "No healthcheck on the shelf or the scanner. 0.12.B deliberat…",
+      "why": "Recorded because a deliberate omission that is never written…",
+      "window": "0.13-C when it proves the store adapter against a running sh…",
+      "to": "0.13-C",
+      "loadBearing": false,
+      "status": "open",
+      "at": "2026-08-26T12:48:19.983Z"
+    },
+    {
+      "id": "o36",
+      "what": "THE CLAMAV VERSION IS AN UNDECIDED PIN, NOT A SETTLED ONE. d…",
+      "why": "0.12.B offered to change it and re-verify; taking its own re…",
+      "window": "0.13-C or 0.13-D, whichever first brings the scanner up and …",
+      "to": "0.13-C",
+      "loadBearing": false,
+      "status": "open",
+      "at": "2026-08-26T12:55:08.133Z"
+    },
+    {
+      "id": "o37",
+      "what": "sync/slice.py still needs first_answered_at on the study_pro…",
+      "why": "Found and routed by 1.9d, which owns the model and the migra…",
+      "window": "1.9e, at the same time as its own slice work",
+      "to": "1.9e",
+      "loadBearing": true,
+      "status": "open",
+      "at": "2026-08-26T13:09:23.175Z"
+    },
+    {
+      "id": "o38",
+      "what": "CORRECTION TO o06's RANGE, which is one sentence too wide. o…",
+      "why": "Found by 0.10d's pre-flight while establishing whether o06 w…",
+      "window": "0.12.H, at the same time as o06 itself",
+      "to": "0.12.H",
+      "loadBearing": false,
+      "status": "open",
+      "at": "2026-08-26T13:13:51.340Z"
+    },
+    {
+      "id": "o39",
+      "what": "apps/api/src/barmyar/events/schemas.py still ends its docstr…",
+      "why": "Flagged by sweep-c, which owned events/__init__.py and corre…",
+      "window": "any piece that comes to hold events/schemas.py or tests/test…",
+      "to": "sweep-d",
+      "loadBearing": false,
+      "status": "open",
+      "at": "2026-08-26T13:21:18.025Z",
+      "windowShutAt": "2026-08-26T16:26:39.486Z"
+    },
+    {
+      "id": "o40",
+      "what": "scripts/plan-status.mjs: reject an unrecognised argv instead…",
+      "why": "It bit the orchestrator: 'node scripts/plan-status.mjs --hel…",
+      "window": "needs an owner — a small piece, or the author's hand",
+      "to": "sweep-d",
+      "loadBearing": true,
+      "status": "open",
+      "at": "2026-08-26T13:23:38.826Z",
+      "windowShutAt": "2026-08-26T16:26:39.486Z"
+    },
+    {
+      "id": "o41",
+      "what": "1.8 is finished — six of six landed — so its plan should be …",
+      "why": "Deferred rather than done because two pieces were building w…",
+      "window": "the next pause when no chip is open",
+      "to": "sweep-e",
+      "loadBearing": false,
+      "status": "open",
+      "at": "2026-08-26T13:38:23.183Z"
+    },
+    {
+      "id": "o42",
+      "what": ".gitignore has no entry for celerybeat-schedule, the shelve …",
+      "why": "Found and flagged by 0.10d, which owns only the two compose …",
+      "window": "any piece granted .gitignore; needs an owner",
+      "to": "sweep-d",
+      "loadBearing": false,
+      "status": "open",
+      "at": "2026-08-26T13:43:09.242Z",
+      "windowShutAt": "2026-08-26T16:26:39.486Z"
+    },
+    {
+      "id": "o43",
+      "what": "PRECISION ON o42, from 0.10d after it landed the beat servic…",
+      "why": "0.10d volunteered this after its own work was done, unprompt…",
+      "window": "with o42 itself",
+      "to": "sweep-d",
+      "loadBearing": false,
+      "status": "open",
+      "at": "2026-08-26T13:44:37.805Z",
+      "windowShutAt": "2026-08-26T16:26:39.486Z"
+    },
+    {
+      "id": "o44",
+      "what": "1.9e's plan needs TWO migrations and its owns list has NONE.…",
+      "why": "Flagged by 1.9d as it finished, from inside the same family …",
+      "window": "1.9e's pre-flight, before its chip opens",
+      "to": "1.9e",
+      "loadBearing": true,
+      "status": "open",
+      "at": "2026-08-26T13:48:25.806Z"
+    },
+    {
+      "id": "o45",
+      "what": "Prove DoD 18's LIVE half: that a body one byte over the ceil…",
+      "why": "0.12.C proved only the STATIC half in test_stack.py — each c…",
+      "window": "0.12.F is the first and only remaining piece that brings a s…",
+      "to": "0.12.F",
+      "loadBearing": true,
+      "status": "open",
+      "at": "2026-08-26T15:16:49.566Z"
+    },
+    {
+      "id": "o46",
+      "what": "Wire a credential into the shelf in BOTH compose files, usin…",
+      "why": "It is 0.12.B's leftover and it blocks a definition of done i…",
+      "window": "0.12.D and 0.12.F are the only remaining tasks that own the …",
+      "to": "0.12.D",
+      "loadBearing": true,
+      "status": "open",
+      "at": "2026-08-26T15:20:50.519Z"
+    },
+    {
+      "id": "o47",
+      "what": "docs/plans/1.9-first-run-and-consent--not-implemented.md say…",
+      "why": "The row redeem() has to write needs more than documents and …",
+      "window": "sweep-e is the last task in the build and the only remaining…",
+      "to": "sweep-e",
+      "loadBearing": false,
+      "status": "open",
+      "at": "2026-08-26T15:44:47.354Z"
+    },
+    {
+      "id": "o48",
+      "what": "Wire assert_store_is_usable() into startup. It is defined at…",
+      "why": "Until it is called it is real code that never runs on a real…",
+      "window": "0.13-C and 0.10e are the only remaining tasks that own main.…",
+      "to": "0.13-C",
+      "loadBearing": true,
+      "status": "open",
+      "at": "2026-08-26T16:32:44.185Z"
+    },
+    {
+      "id": "o49",
+      "what": "docs/plans/1.9-first-run-and-consent--not-implemented.md:676…",
+      "why": "sync/slice.py:350-353 registers  with claim=ClaimKind.PERSON…",
+      "window": "sweep-e is the last task in the build and the only remaining…",
+      "to": "sweep-e",
+      "loadBearing": false,
+      "status": "open",
+      "at": "2026-08-26T16:51:15.618Z"
+    }
+  ],
+  "decisionTexts": {
+    "115aaa1b6beb": "Give each school its own copy of a shared question — a quest…",
+    "a9eff889321b": "The design saying an ownerless row is how sharing works is n…",
+    "e3402f262b52": "Scope the slow accessibility check's own ceiling to that one…",
+    "7d04ce6818a5": "The worker's refusal is a burst of dying children, not one c…",
+    "e165abbe4db7": "THE THREE FORMERLY-RED TESTS NOW PASS — EXPECT ZERO FAILURES…",
+    "7efede29e920": "A number nobody has chosen is one named constant in one plac…",
+    "3804ba4c30dc": "The full record of what was settled is docs/decisions-stage-…",
+    "0d7947c0691c": "TWO DECISION RECORDS, BOTH NUMBERING FROM ONE. docs/decision…",
+    "8f8bf2667b0d": "THE SUPPORT PATH NOW HAS A SECOND LEGITIMATE HOLDER. The pla…",
+    "d65c666bcb00": "YOUR OWN DATABASE, AND IT IS NOT SHARED. Every check you run…",
+    "e41d0f1a98ef": "COPY THE ENVIRONMENT FILE INTO YOUR WORKTREE BEFORE YOU RUN …",
+    "1e76780ce02b": "NEVER START THE STACK. The database and cache are already ru…",
+    "ce335c78e532": "ONE VARIABLE IS ENOUGH — do NOT also override the platform U…",
+    "27f3c1a2d4b4": "THE STACK IS ALREADY UP AND STARTING IT IS DESTRUCTIVE. `pnp…",
+    "44f241f4687c": "PROVE YOUR BASE BEFORE YOU WRITE A LINE. Your copy of the re…",
+    "e4154277f15c": "HOW YOUR WORK WILL BE JUDGED: all seven steps of .github/wor…",
+    "379db41f16e5": "NAME THE CONSTRAINT A REFUSAL TEST EXPECTS, never just \"an e…",
+    "1122b6bfbaf2": "AND THE STEP THAT MAKES IT STICK, from 1.8d after it applied…",
+    "5f876759cba4": "DO NOT RUN `ruff format` ON A DIRECTORY HERE. From 1.8c, 202…",
+    "383b8a476817": "request.too_large REFUSES WITH 413, NOT 400. Settled 2026-08…",
+    "ad2f7a0ed556": "AN INEFFECTIVE MUTATION AND A NON-DISCRIMINATING TEST LOOK I…",
+    "d81e977d49b2": "THE OPERATIONAL FORM, from 0.11f: BEFORE BELIEVING A GREEN M…",
+    "ae959a3b0a1f": "A FIX WHOSE REMOVAL CHANGES NOTHING IS A FIX FOR NOTHING. Fr…",
+    "1f6fd4d97306": "THE PLAN'S ORDERING NOTE IS STALE AND THE REGISTER IS RIGHT …",
+    "a160f587f856": "o20 IS YOURS AND IT IS LOAD-BEARING — A STAGING STACK WILL N…",
+    "3446e61f1411": "YOU ARE WRITING SECRET_SETTINGS' FIRST READER, NOT A SECOND …",
+    "24ffd95df057": "DO NOT widen the API build context here. The plan asks for b…",
+    "70d5e481b0b4": "pyyaml moves to the dev group here, as the plan says. It arr…",
+    "5645d06b89f6": "A plain compose override does NOT remove a key. PROBED on th…",
+    "131c4abfe7c1": "If a new service needs a ${VAR} substitution, give it an inl…",
+    "375044762b85": "docker manifest inspect times out on this box even though cu…",
+    "e01892933f21": "The part-list step in .github/workflows/ci.yml is written by…",
+    "07425960e1c7": "THE CODE IS SAFE IN THREE PLACES ONLY WHEN THE DOOR IS OPEN.…",
+    "9bd04e3b9e3d": "YOUR OWN DATABASE, AND IT IS NOT SHARED. Every check you run…",
+    "2a4adcedbb65": "THE API BUILD-CONTEXT WIDENING IS YOURS, ALL OF IT, IN ONE C…",
+    "705e87a98bea": "NOTHING IN CI BUILDS AN IMAGE, so a broken widening goes gre…",
+    "7cecb46fff69": "PROVE YOUR BASE AGAINST THE MAIN CHECKOUT, NOT AGAINST THE S…",
+    "d3498d41a18a": "YOUR OWN DATABASE, AND IT IS NOT SHARED. Every check you run…",
+    "db93d90126b2": "YOU CHANGE platform/access.py AFTER 0.9 DOES. It owns that f…",
+    "5815bf597e53": "THE MACHINE'S NAME IS 0.9's TO SPELL, NOT YOURS. You build t…",
+    "7bf359285148": "THE CONSTANT ACTOR IS NOT WHAT TELLS THEM APART. The nightly…",
+    "b985f7e09016": "IT IS A LOG NAME AND NEVER AN AUDIT SUBJECT. The read-audit …",
+    "6651effefde2": "WHOSE RETENTION THE MACHINE'S STATEMENT LINES GET IS UNANSWE…",
+    "53e7dad5b076": "YOUR OWN DATABASE, AND IT IS NOT SHARED. Every check you run…",
+    "e32ff57b1ea0": "YOUR OWN DATABASE, AND IT IS NOT SHARED. Every check you run…",
+    "22458334ce88": "THREE TRAPS from 1.9b, which was fourth in the fixed order o…",
+    "996bef907216": "YOUR OWN DATABASE, AND IT IS NOT SHARED. Every check you run…",
+    "a852076a337d": "THE TEST PINNING THE CLAIM VOCABULARY WALKS A HARDCODED TUPL…",
+    "5f4d9f79a186": "WIDENING THE VOCABULARY TEST CREATES A RULE NOBODY DECIDED. …",
+    "a45dd409a3cf": "NOTHING PINS 'NOBODY CAN WITHDRAW'. The person's own record …",
+    "ca2350739572": "YOUR OWN DATABASE, AND IT IS NOT SHARED. Every check you run…",
+    "8301c5f63993": "0.13-A's constraint counts are BOTH right and they disagree …",
+    "0d8068f210ec": "`files.original_name` was added NOT NULL with NO server defa…",
+    "0cfdab4e4416": "A SECOND SCHOOL CAN RE-STAND A WITHDRAWN AGREEMENT. The gate…",
+    "c0935b3d6f04": "YOUR OWN DATABASE, AND IT IS NOT SHARED. Every check you run…",
+    "ffbae98ce3f8": "YOUR OWN DATABASE, AND IT IS NOT SHARED. Every check you run…",
+    "91cc0658166e": "YOUR OWN DATABASE, AND IT IS NOT SHARED. Every check you run…",
+    "accb01f5c222": "YOUR OWN DATABASE, AND IT IS NOT SHARED. Every check you run…",
+    "277c4b04f85d": "YOUR OWN DATABASE, AND IT IS NOT SHARED. Every check you run…",
+    "b88930a7b097": "YOUR OWN DATABASE, AND IT IS NOT SHARED. Every check you run…",
+    "fb3e479add9e": "YOUR OWN DATABASE, AND IT IS NOT SHARED. Every check you run…",
+    "204d3387ea63": "YOUR OWN DATABASE, AND IT IS NOT SHARED. Every check you run…",
+    "2de1fc3b4e1c": "You own .github/workflows/ci.yml. Two plans claimed it and n…",
+    "3c79e828722f": "PROVE, DO NOT ASSUME, THAT THE SHELF TAKES THE TWO BUCKET RU…",
+    "086cdb39fc98": "ALSO PROVE: whether the API and the browser reach the shelf …",
+    "df0471b7b4c6": "YOUR OWN DATABASE, AND IT IS NOT SHARED. Every check you run…",
+    "05666a9433cb": "`.github/workflows/ci.yml` ALREADY CHANGED under you TWICE, …",
+    "6407a55d626d": "YOUR OWN DATABASE, AND IT IS NOT SHARED. Every check you run…",
+    "b049c056f319": "0.13-A left this for you, and it is still true at main 849b9…",
+    "f4445263ea91": "YOUR OWN DATABASE, AND IT IS NOT SHARED. Every check you run…",
+    "99c1c4ab181c": "YOUR OWN DATABASE, AND IT IS NOT SHARED. Every check you run…",
+    "3d918bdcd617": "CLEARING A CLAIM IS A SOFT DELETE, NOT A HARD ONE. This plan…",
+    "77b1282cd4e9": "THE OPERATOR COMMAND IS 0.10's, NOT YOURS. You build the two…",
+    "abfdba6b0ffa": "A SHARED ORIGINAL CANNOT BE REACHED BY ANY PER-SCHOOL PASS. …",
+    "bb2be75cccb4": "A RESTORE IS NOT DONE WHEN THE FILES ARE BACK. It is done wh…",
+    "91c0b7e58772": "YOUR OWN DATABASE, AND IT IS NOT SHARED. Every check you run…",
+    "28f10f5196a1": "THE SHARED-BANK ITEM HAS BEEN TAKEN OFF THIS TASK and is bac…",
+    "b3f3bce30805": "NOTHING IN THE SUITE ASSERTS DOCSTRING TEXT, so no Python te…",
+    "200a4434d73c": "ANSWER TO Q1 — THE edge SERVICE IS YOURS, IN BOTH FILES. You…",
+    "9b456ba04855": "TRAP INSIDE Q1 — CHECK IT BEFORE YOU BELIEVE YOUR OWN GREEN.…",
+    "21d2cd6e0e72": "ANSWER TO Q2 — USE THE REQUIRED-VARIABLE FORM, AND YES THAT …",
+    "7cbdaf577111": "AND PROVE BOTH DIRECTIONS OF IT, because a check that only e…",
+    "9f22fb4fc874": "YOUR OWN VERIFY LINE 2 IS NOW YOURS TO RESTATE. It was writt…",
+    "777e64918f54": "THE TOOL ALREADY INTENDS TO HANDLE THIS. planOf() at :40 der…",
+    "a8cef9308b63": "DO NOT make the tool read task.plan instead. sweep-a and swe…",
+    "3c5e1833cb42": "SAY WHAT IT SKIPPED. A tool that silently drops a task from …",
+    "7777a9520170": "PROVE THE RED. Revert your own fix and require the crash bac…",
+    "0392559d1baf": "SCOPE THE CEILING TO THE ONE SLOW TEST, never a blanket test…",
+    "f8f2e71819b7": "PROVE THE CEILING BITES, the way sweep-a did: run the file w…",
+    "877eb0478d30": "THE DOCSTRING SENTENCE IS NARROWLY WRONG, SO NARROW THE SENT…",
+    "6feafaa7109c": "NOTHING IN THE SUITE ASSERTS DOCSTRING TEXT. ruff is the com…",
+    "c9f2494223e6": "YOUR EXIT CODE CANNOT PROVE YOUR FIX, so do not let it. `--c…",
+    "f4d0c0529caf": "NEVER RUN THE TOOL WITHOUT `--check`. Write mode rewrites do…",
+    "e157a227a56d": "YOU NEED A TEST AND THERE IS NONE — apps/api/tests/test_plan…",
+    "2b83402c23cd": "THE SUMMARY SENTENCE'S COUNT IS DEAD CODE — its regex at :18…",
+    "8aba0c0e9d72": "HANDED OVER BY sweep-a, WHICH DID THIS ONE FILE OVER: the --…",
+    "2296fe6ca1b4": "sweep-a does not know whether that wrinkle appears in packag…",
+    "46b4f776d9dd": "packages/tuning HAVING NO VITEST CONFIG IS AN ARGUMENT FOR T…",
+    "84e8d3c37580": "YOUR VERIFY LIST NOW CARRIES typecheck AS WELL AS test, and …",
+    "5c4df35a21c9": "ANSWER TO YOUR SCOPE QUESTION — TAKE (b), NAME THE ORPHANED …",
+    "ccfd75a18c19": "WHY THIS ONE IS WORTH THE THREE LINES: the owed ledger exist…",
+    "704d998fc146": "AND YOU WERE RIGHT TO ASK RATHER THAN TREAT IT AS COVERED. T…",
+    "ee1946561660": "apps/api/tests/test_stack.py IS NOW YOURS, and it was not be…",
+    "d06acec58f3c": "0.12.B'S TESTS ARE RELATIONAL, NOT LITERAL — they assert the…",
+    "4613a24d8e0a": "READ THE TWO FILES, NOT THE RESOLVED CONFIG, when asserting …",
+    "b8c86b304394": "HANDED OVER BY 0.12.B, WHICH OWNED THESE FILES BEFORE YOU: a…",
+    "96c93dffa9ab": "YOU NEED TO EDIT NOTHING IN test_stack.py. Every assertion t…",
+    "77dd0556884a": "A COMPOSE OVERRIDE DOES NOT REMOVE A KEY. Probed on the inst…",
+    "6aab4b796743": "YOUR OWNS LIST GREW FROM ONE FILE TO FIVE, because three of …",
+    "103115943e2d": "THE PLAN'S STATUS BLOCK IS NOT YOURS AND MUST NOT BE HAND-ED…",
+    "b13870294161": "THE TWO FINDINGS ARE REAL AND THE FIXES ARE GENUINELY IN THE…",
+    "d4936ecb5111": "o11 UNDER-COUNTS BY ONE, CHECKED IN THE TREE RATHER THAN REC…",
+    "20c81efd9cea": "DO NOT TOUCH apps/api/src/barmyar/events/__init__.py. It car…",
+    "fd726cc06871": "YOUR VERIFY LIST NO LONGER RUNS THE WHOLE SUITE. It was `./s…",
+    "550f41385976": "docs/conventions.md:31-32 USES THIS PLAN'S OWN SENTENCE as i…",
+    "b7d3425da928": "YOU NEED A MIGRATION AND IT WAS MISSING FROM YOUR OWNS LIST …",
+    "cf319b89f605": "THE `<new>` IN YOUR OWNS LIST IS A PLACEHOLDER YOU FILL IN, …",
+    "cba41d88549e": "READ THE CURRENT HEAD, DO NOT COPY IT FROM HERE. Your migrat…",
+    "98d610691e91": "THE TOOL WILL NOT GIVE YOU THE FILENAME THE RECORD EXPECTS. …",
+    "5090e5cc4f90": "DO NOT ACCEPT AUTOGENERATE'S OFFER TO DROP AN INDEX. The wor…",
+    "cf088cdad13d": "THE NEGATIVE CONTROL IN YOUR EARLIER BRIEF WAS WRONG AND HAS…",
+    "37efed11c8d0": "USE A BEFORE-AND-AFTER ON THE TARGET INSTEAD. The target is …",
+    "96e96dfe25f1": "DO NOT COPY A MEASURED NUMBER FROM sweep-a. The record holds…",
+    "d5a86e47b970": "THE TARGET IS ONE TEST AND 0.12.A NAMED IT VERBATIM — the mi…",
+    "d4dfd12da0cb": "IF packages/tuning/node_modules IS MISSING in your copy — it…",
+    "7dafac717dd9": "o31 IS DISCHARGEABLE IN events/__init__.py ALONE — checked, …",
+    "5938094c3100": "YES — apps/api/tests/test_study_profile.py IS YOURS. It was …",
+    "daaf13b55bc4": "YOUR ARGUMENT IS THE REASON, AND IT IS THE RIGHT ONE. All si…",
+    "9e85be4d3aaa": "WRITE EXACTLY THE FIVE YOU LISTED AND NOTHING ELSE IN THAT F…",
+    "069306dc7412": "MUTATION-TESTING A MIGRATION NEEDS A DATABASE NAME THAT HAS …",
+    "85bf78a05ca0": "IF YOU HAD NOT ASKED, THE RIGHT ANSWER WAS THE ONE YOU NAMED…",
+    "1f33730bea66": "THE HANDOVER YOU WERE GIVEN WAS INCOMPLETE AND HAS BEEN REPL…",
+    "fa19896a3f86": "THE OVERLAY ENTRY NEEDS: build: !reset null · an image: with…",
+    "184e7bba309c": "ADDING BEAT TO THE BASE ALONE FAILS TWO TESTS, NOT ONE. The …",
+    "21c3481dde7f": "apps/api/tests/test_stack.py NEEDS NO EDIT — verified by RUN…",
+    "481e2200da47": "YOUR VERIFY LIST WAS EFFECTIVELY BLIND AND HAS BEEN WIDENED.…",
+    "a6719534d905": "o06 IS NOT DISCHARGEABLE BY YOU AND ITS RANGE IS ONE SENTENC…",
+    "681e543160e7": "WHAT ALREADY EXISTS, so you do not rebuild it: the scheduler…",
+    "2d82ccf18903": "YOU NOW WRITE THE SHARED LOG-LINE HELPER, AND IT IS A SETTLE…",
+    "7eff781cd643": "WHY THE HELPER EXISTS AT ALL: decision 20 says one machine-r…",
+    "335369f2d0cb": "THE FIELD NAMES ARE SETTLED AND THE CLOSED LIST IS WIDENED, …",
+    "3ba1134a685b": "AND THE PLAN'S SENTENCE IS NOW FALSE. The 0.12 plan says the…",
+    "c248692ae18e": "THE STEADY NAME IS ALREADY FIXED — DO NOT INVENT IT. 0.9 lan…",
+    "be88b92ce52d": "YOUR BUILD CONTEXT IS WRONG IN THE TREE AND YOU NOW OWN THE …",
+    "576d767a36af": "KEEP THE EDGE BEHIND ITS PROFILE. Settled, with a checked re…",
+    "bd772c0e1cf7": "YOUR VERIFY LIST COULD NOT RUN AND HAS BEEN FIXED. The docke…",
+    "9237f987b152": "TWO CORRECTIONS TO WHAT 0.12.B REPORTED, both checked by you…",
+    "b2d625ac41e9": "HOW THE DAILY LINE RUNS IS SETTLED: A SMALL PART OF ITS OWN,…",
+    "abc922d5af6b": "SO THE RENTED CHECKER IMAGE IS NOT TOUCHED. It stays exactly…",
+    "2d4d751449c8": "YOU NOW OWN BOTH COMPOSE FILES AND YOU WAIT FOR 0.12.C. Thre…",
+    "2c353e54b902": "USE 0.12.C's SHARED HELPER AT infra/lib/log-line.sh — DO NOT…",
+    "2e11b7d997e3": "YOUR FIELD NAMES COME FROM THE CLOSED LIST AND 0.12.C HAS AL…",
+    "f81bce597bce": "THE STEADY NAME IS ALREADY FIXED — DO NOT INVENT IT. 0.9 lan…",
+    "356fadeb38b0": "CHECK THE INTERPRETER BEFORE YOU WRITE A SHEBANG. The checke…",
+    "d36f2e425eaf": "THERE IS NO SCHEDULER ANYWHERE IN THIS REPOSITORY for 'daily…",
+    "36047c7f4643": "YOU NOW WAIT FOR 0.12.D AS WELL. Four pieces need docker-com…",
+    "7695f88bdd1e": "YOU NOW WAIT FOR 0.12.C AS WELL. You are told to build on do…",
+    "ed0f59f583c8": "THE PLAN-STATUS FIX IS WRITE-BY-DEFAULT, NOT A MISSING HELP …",
+    "0546fdce9436": "THIS BIT THE ORCHESTRATOR, WHICH IS WHY IT IS LOAD-BEARING. …",
+    "f00caf70c4a8": "YOU ALREADY HAVE A TEST FILE FOR THIS AND IT IS YOURS. The p…",
+    "8227987c518c": "THAT TEST FILE HAS A FIXTURE THAT FINGERPRINTS THE REAL PLAN…",
+    "93ef0850ae85": "THE IGNORE ENTRY IS AN IGNORE ENTRY, NOT A RELOCATION. The s…",
+    "08cbab5e9046": "THE DOCSTRING ITEM IS A JUDGEMENT, NOT A FIX. events/schemas…",
+    "750b5163f8af": "NOTHING IN THE SUITE ASSERTS DOCSTRING TEXT. So no test can …",
+    "80ed278bdca6": "tests/test_readiness.py IS NOW IN YOUR VERIFY LIST AND SHOUL…",
+    "6e7a99072615": "THE RED IS A COMMENT, NOT A CONFIGURATION. test_the_compose_…",
+    "c080b755265d": "CONSIDER WHETHER THE COMMENT NEEDS TO QUOTE THE PATH AT ALL.…",
+    "ff8e9ad637e5": "apps/api/tests/test_config.py IS NOW YOURS, AND IT CARRIES o…",
+    "e502c9a73e4a": "WHAT o23 IS: the assertion reading Settings with the env-fil…",
+    "16846efb68c6": "THE DANGER IS SPECIFIC AND NARROW. A test that reads a field…",
+    "3025525c8b3e": "YOUR DEPENDENCY WAS REPOINTED, NOT CHANGED. You waited on 0.…",
+    "53178e32f035": "YOUR EMBEDDED PRE-FLIGHT IS PARTLY HISTORY NOW — READ THESE …",
+    "aa85a21ee945": "CORRECTION 1 — 0.10d HAS LANDED, at 9707f4c, and is on main …",
+    "50d0566d2e6a": "CORRECTION 2 — THE SENTENCE \"0.12.C owns none of it\" ABOUT d…",
+    "fa4eda4da2ac": "CORRECTION 3 — NOTHING ELSE WILL TOUCH EITHER COMPOSE FILE W…",
+    "0e46cced15e5": "CORRECTION 4 — THE SUITE TOTAL ON main IS 2331 COLLECTED as …",
+    "6c146c8f5830": "d07 IS BROADER THAN THE RECORD SAID, AND YOUR PRE-FLIGHT PRO…",
+    "c234756220e2": "THE SHAPE OF THE REPAIR IS SETTLED: AN ALLOW-LIST, WITH FOUR…",
+    "e16454d23bd3": "BARE ARGV MUST STAY THE WRITE PATH — DO NOT MAKE THE TOOL DE…",
+    "d55746351283": "YOUR TEST MUST ASSERT BYTE-IDENTITY OF THE PLAN DOCUMENTS, N…",
+    "4c810075239d": "PROVE THE RED BY PUTTING LINE 27 BACK. Mutate your new argv …",
+    "0bca68ef41dd": "DO NOT SEPARATE CRASH FROM STALENESS IN THE EXIT CODE. This …",
+    "12047edea4cd": "THE .gitignore REPAIR HAS TWO PARTS AND BOTH ARE COUNTER-INT…",
+    "b36c39e600a2": "THE events/schemas.py REPAIR IS THAT THE FILE CONTRADICTS IT…",
+    "fb98ef1dcda2": "TWO COMMANDS IN YOUR OWN VERIFY LIST WERE BROKEN AND ARE NOW…",
+    "75c525ee1fc3": "YOUR NEW ARGV BLOCK MUST BE ONE CONTIGUOUS, UNIQUELY-OCCURRI…",
+    "7a3bbe595efd": "NOTE WHICH WAY YOUR MUTATION RUNS — IT IS THE OPPOSITE OF TH…",
+    "47a11b9059e3": "EIGHT LINES OF EXISTING OUTPUT MUST SURVIVE YOUR REPAIR UNCH…",
+    "54fbe05f8669": "TWO TRAPS IN YOUR OWN WORKTREE, BOTH OF WHICH MAKE A CHECK L…",
+    "9df7faa8bd3c": "YOUR WAIT ON 0.12.C AND 0.12.D IS GONE, AND A PRE-FLIGHT PRO…",
+    "b5057148a8d3": "DO NOT WRITE docker-compose.yml OR docker-compose.production…",
+    "6ab67ccae08a": "PROVE THE STORE AGAINST A SHELF YOU START YOURSELF, ON ITS O…",
+    "023c04904c02": "THE SHELF IN THE COMPOSE FILE HAS NO CREDENTIAL, AND THAT IS…",
+    "d7019a66ec5a": "THERE IS NO S3 CLIENT IN THIS REPOSITORY AT ALL — no boto3, …",
+    "9394d7b5a439": "YOU OWN core/config.py AND .env.example, AND THE SECOND IS N…",
+    "4aa9033e45b1": "THE CHEAP RUFF LINE IN YOUR BRIEF IS BROKEN AS WRITTEN, and …",
+    "97d812362544": "o44 IS SETTLED AND IT UNDERCOUNTED: YOU NEED THREE NEW ALEMB…",
+    "76c480b27284": "A MIGRATION MUTATION ON AN EXISTING DATABASE IS A NO-OP THAT…",
+    "890d9b7ae4f2": "THE GATE BREAKS A TEST FILE THAT NO VERIFY COMMAND RAN. test…",
+    "7af96798c0fb": "FOUR CLOSED LISTS MUST GAIN ENTRIES, AND ONE IS ASSERTED AS …",
+    "5734d990fff5": "FOUR MORE CLOSED LISTS WERE CHECKED AND NEED NOTHING — do no…",
+    "af1c1f21741a": "TWO FILES TO KEEP YOUR HANDS OFF, AND ONE OF THEM CHANGES WH…",
+    "0612c9deaf13": "o37 IS CONFIRMED STILL OPEN AND IT IS YOURS. sync/slice.py:3…",
+    "5aa3e205c661": "1.10c WAITS FOR YOU AND NEEDS THE SAME TWO WORDING FILES. It…",
+    "3d1f019bad50": "YOU NOW ALSO WAIT FOR 0.13-B, AND IT COSTS YOU NOTHING — you…",
+    "de3a071facc1": "THE SHELF IN BOTH COMPOSE FILES HAS NO CREDENTIAL AND IT IS …",
+    "b0df48914f1a": "YOU NOW OWN THE 0.12 PLAN DOCUMENT, FOR ONE REASON: YOUR NIN…",
+    "294e4728201f": "0.12.C ASKED TO SOLVE ITS OWN DAILY LINE A DIFFERENT WAY, AN…",
+    "71f1aa1ea74a": "THREE MORE FILES ARE YOURS, AND THEY ARE THE 1.9f HALF OF YO…",
+    "70fe407bb441": "WATCH THE ONE TRUNCATE. conftest.py:560 is the single cascad…",
+    "4b2f2a81f69e": "A PATH CORRECTION IN YOUR OWN FILE LIST, MINE NOT YOURS: I w…",
+    "d995563276c8": "YOU CARRY TWELVE OWED ITEMS, NOT THE FIVE THE RECORD SHOWED:…",
+    "f71bd1d474da": "TWO OF THEM ARE WRONG AS WRITTEN, AND DOING WHAT THEY SAY WO…",
+    "d44692bf3088": "WHY o06 KEEPS ITS THIRD SENTENCE, CHECKED ON THREE INDEPENDE…",
+    "363b40c3ddb3": "THREE MORE DEFECTS IN README.md THAT NO OWED ITEM COVERS, FO…",
+    "629a7873170a": "o04 NEEDS Roadmap.md AND IT IS NOW YOURS. It was not in your…",
+    "0621dca9f17e": "o41 IS NOT YOURS AND HAS BEEN MOVED OFF YOU — DO NOT ATTEMPT…",
+    "3ca757c44688": "A NAMING TRAP, SO YOU DO NOT GO LOOKING FOR THE WRONG SECTIO…",
+    "1ec40a5d3465": "NOTHING IN CI BUILDS A DOCKER IMAGE, SO NOTHING YOU BUILD IS…",
+    "7907fe4f3f36": "THE API IMAGE CANNOT IMPORT THE APPLICATION TODAY, AND THE B…",
+    "c7806c989e4b": "FOUR MORE FACTS ABOUT THAT DOCKERFILE, ALL CHECKED. Line 7 h…",
+    "8abdeb776a2f": "TWO FILES THE PLAN NAMES HAD NO OWNER AT ALL AND ARE NOW YOU…",
+    "bd907736dd39": "o32 AND o33 ARE BOTH STILL TRUE, verified against the files …",
+    "6d7af722ab22": "YOUR VERIFY LIST RUNS NO PYTEST OVER docker-compose.yml, WHI…",
+    "3af261a2aa9a": "sync/slice.py IS THE ONLY REASON YOU WAIT FOR 1.8d AND 1.9e,…",
+    "255ec8e391c4": "docs/plans/1.1-knowledge-map--completed.md CARRIES NO GENERA…",
+    "4904ac95e6dd": "THE -q ON YOUR FULL RUN COSTS SIX MINUTES FOR NOTHING AND IS…",
+    "68763f4ac166": "THE WORDING FILES ARE 1.9e's FIRST AND YOURS AFTER. You need…",
+    "60dd62dfbfda": "YOU MOVE NO MIGRATION, AND THAT IS THE FINDING RATHER THAN A…",
+    "0b2a038b6986": "FIVE CLOSED LISTS YOU DO MOVE, each asserted exactly. Action…",
+    "4792a29a34aa": "SIX CLOSED LISTS YOU MUST NOT MOVE, EACH FOR A STATED REASON…",
+    "9d7cd347c6b9": "AN ORG-SCOPED JOB NEEDS **_ IN ITS SIGNATURE OR IT CANNOT BE…",
+    "d5b45294b3ff": "YOU NOW OWN THE FILES 0.13-B LANDS FIRST — config.py, .env.e…",
+    "a478b6ee3e2a": "THE LOCKFILE IS A SERIALISATION POINT AND BOTH CI JOBS RUN A…",
+    "f5276e0da179": "THIS TASK EXISTS BECAUSE o41 HAD NO HOME IT COULD ACTUALLY B…",
+    "d016b6140f1c": "o41 IS THE WHOLE JOB: rename 1.8's plan from the not-impleme…",
+    "b7d8392f0625": "YOU RUN LAST, WHEN NOTHING ELSE IS LIVE, and that is deliber…",
+    "09078d76ae0b": "DO NOT HAND-EDIT ANY GENERATED STATUS BLOCK. In each plan do…",
+    "728a53f0bbb1": "YOUR FILE LIST WAS TWO FILES AND THE WORK IS SEVEN. Added, a…",
+    "50c7f9ad21d1": "THE SELECTOR THAT JOINS YOU TO 0.13 IS NOW NAMED, BECAUSE IT…",
+    "6a3e4ce1263d": "THE COPY IS DRIVEN BY THE ROWS, NEVER BY LISTING THE BUCKET.…",
+    "1a28e86ffb35": "YOU WRITE THE SELECTOR 0.10e CALLS, AND IT NOW HAS A NAME. Y…",
+    "6edfe8e6dac9": "THE OTHER TWO THINGS YOU OWE 0.10 ARE IN THE SAME PLACE, pla…",
+    "4c241490cf72": "A CORRECTION TO THE STANDING NOTE ABOUT THE DATABASE CONTAIN…",
+    "5fa0920a8b84": "sync/kinds.py IS YOURS — YOU WERE RIGHT TO ASK AND RIGHT NOT…",
+    "bd967217fb3f": "YOU NOW OWN .github/workflows/ci.yml, AND THE SCANNER SERVIC…",
+    "bfc8570ca09d": "0.13-B PROVED THE SERVICE-CONTAINER ROUTE WORKS AND YOU SHOU…",
+    "33afbdf0138f": "AND COPY THE CONTROL, NOT JUST THE SETUP. 0.13-B did not acc…",
+    "9ad9c14eaa61": "YOU NOW OWN .github/workflows/ci.yml, BECAUSE THE PART-LIST …",
+    "135d5a32655d": "THE PLAN SAYS ONE STEP AND THAT MAY NOT BE LITERALLY POSSIBL…",
+    "674f152bd189": "THE ASYMMETRY THAT WOULD MAKE A GOOD BUILD LOOK BROKEN, AND …",
+    "0f34e16bb193": "BOTH OF YOUR QUESTIONS ARE ANSWERED THE WAY YOU LEANED, AND …",
+    "0eb936ad9bb2": "A FIFTH PART LIST EXISTS NOW AND NOBODY COULD HAVE TOLD YOU …",
+    "740c323bd8c6": "WHY IT WAS UNAVOIDABLE, so you do not try to remove it as ti…",
+    "1a5180831b14": "o33 IS WRONG BY THREE AND YOU SHOULD NOT DO WHAT IT SAYS LIT…",
+    "b1d06add4c36": "THE SHELF SETTINGS ARE LANDED AND THERE ARE EIGHT — YOU NEED…",
+    "fb054f623f0e": "THE TWO ENDPOINTS ARE NOT INTERCHANGEABLE AND GETTING IT BAC…",
+    "46b85ee30cca": "THE STORE TESTS SKIP WITHOUT A SHELF, AND A SKIP IS NOT A PA…",
+    "ba48fc4ecf73": "EIGHT SHELF SETTINGS ARE LANDED AND YOU READ ALL OF THEM. ST…",
+    "2d000f5c2ac8": "THE SHELF LIES ABOUT WHICH HEADER IT REFUSED. A SHA-256 chec…",
+    "e48a9a2b9b9e": "o49's STORED TEXT IS DAMAGED — a shell quoting mistake of mi…",
+    "fa2e2639a939": "WHY `notes` IS A REAL EXCEPTION AND NOT A GRANDFATHERED SLIP…"
+  },
+  "checkpoints": [
+    {
+      "id": "c01",
+      "status": "green",
+      "ref": "gh-run-32963997262",
+      "why": "all seven steps of ci.yml on GitHub at d3d987d: ruff, 8 shar…",
+      "covers": [
+        "0.14a",
+        "0.11b",
+        "0.13-A"
+      ],
+      "mainSha": "",
+      "at": "2026-08-26T11:37:14.766Z"
+    },
+    {
+      "id": "c02",
+      "status": "green",
+      "ref": "gh-run-32963997262",
+      "why": "the same GitHub run at d3d987d; every landing in this layer …",
+      "covers": [
+        "0.14b",
+        "0.10b",
+        "0.10c",
+        "0.10f",
+        "1.8b",
+        "0.13-F"
+      ],
+      "mainSha": "",
+      "at": "2026-08-26T11:37:31.863Z"
+    },
+    {
+      "id": "c03",
+      "status": "green",
+      "ref": "gh-run-32963997262",
+      "why": "the same GitHub run at d3d987d; every landing in this layer …",
+      "covers": [
+        "0.9",
+        "0.10g",
+        "0.11d",
+        "1.9b"
+      ],
+      "mainSha": "",
+      "at": "2026-08-26T11:37:32.149Z"
+    },
+    {
+      "id": "c04",
+      "status": "green",
+      "ref": "gh-run-32963997262",
+      "why": "the same GitHub run at d3d987d; every landing in this layer …",
+      "covers": [
+        "0.14c",
+        "0.11c",
+        "0.12.E",
+        "1.10a",
+        "1.8c",
+        "1.8d"
+      ],
+      "mainSha": "",
+      "at": "2026-08-26T11:37:32.434Z"
+    },
+    {
+      "id": "c05",
+      "status": "green",
+      "ref": "gh-run-32963997262",
+      "why": "the same GitHub run at d3d987d; every landing in this layer …",
+      "covers": [
+        "0.11e",
+        "0.11f",
+        "1.10b",
+        "0.10h"
+      ],
+      "mainSha": "",
+      "at": "2026-08-26T11:37:32.734Z"
+    },
+    {
+      "id": "c06",
+      "status": "green",
+      "ref": "gh-run-32963997262",
+      "why": "the same GitHub run at d3d987d; every landing in this layer …",
+      "covers": [
+        "0.14d",
+        "0.11g"
+      ],
+      "mainSha": "",
+      "at": "2026-08-26T11:37:33.018Z"
+    },
+    {
+      "id": "c07",
+      "status": "green",
+      "ref": "gh-run-32963997262",
+      "why": "the same GitHub run at d3d987d; every landing in this layer …",
+      "covers": [
+        "0.12.A",
+        "1.8e"
+      ],
+      "mainSha": "",
+      "at": "2026-08-26T11:37:33.297Z"
+    },
+    {
+      "id": "c08",
+      "status": "green",
+      "ref": "gh-run-32971121474",
+      "why": "all seven steps of ci.yml on GitHub at 2896558 (join 0.12.B)…",
+      "covers": [
+        "1.9c",
+        "0.12.B"
+      ],
+      "mainSha": "",
+      "at": "2026-08-26T13:04:14.363Z"
+    },
+    {
+      "id": "c09",
+      "status": "green",
+      "ref": "gh-run-32975322469",
+      "why": "all seven steps of ci.yml on GitHub at 51d4c71, 1m22s, inclu…",
+      "covers": [
+        "0.10a",
+        "0.11a",
+        "1.9a",
+        "1.8a",
+        "sweep-a",
+        "sweep-b"
+      ],
+      "mainSha": "",
+      "at": "2026-08-26T13:40:08.685Z"
+    },
+    {
+      "id": "l01",
+      "status": "green",
+      "ref": "f3d37a8",
+      "why": "[imported from round 1; the tasks it covered were never reco…",
+      "covers": [],
+      "legacy": true,
+      "mainSha": "",
+      "at": "2026-08-25T10:00:38.037Z"
+    },
+    {
+      "id": "l02",
+      "status": "green",
+      "ref": "32860146478",
+      "why": "[imported from round 2; the tasks it covered were never reco…",
+      "covers": [],
+      "legacy": true,
+      "mainSha": "",
+      "at": "2026-08-25T14:34:18.964Z"
+    },
+    {
+      "id": "l03",
+      "status": "green",
+      "ref": "32866977869",
+      "why": "[imported from round 3; the tasks it covered were never reco…",
+      "covers": [],
+      "legacy": true,
+      "mainSha": "",
+      "at": "2026-08-25T15:39:40.238Z"
+    },
+    {
+      "id": "l04",
+      "status": "green",
+      "ref": "32874674649",
+      "why": "[imported from round 4; the tasks it covered were never reco…",
+      "covers": [],
+      "legacy": true,
+      "mainSha": "",
+      "at": "2026-08-25T16:55:38.298Z"
+    },
+    {
+      "id": "l05",
+      "status": "green",
+      "ref": "32883236704",
+      "why": "[imported from round 5; the tasks it covered were never reco…",
+      "covers": [],
+      "legacy": true,
+      "mainSha": "",
+      "at": "2026-08-25T18:23:05.022Z"
+    },
+    {
+      "id": "l06",
+      "status": "green",
+      "ref": "32894548741",
+      "why": "[imported from round 6; the tasks it covered were never reco…",
+      "covers": [],
+      "legacy": true,
+      "mainSha": "",
+      "at": "2026-08-25T20:20:04.232Z"
+    },
+    {
+      "id": "l07",
+      "status": "green",
+      "ref": "32935568851",
+      "why": "[imported from round 7; the tasks it covered were never reco…",
+      "covers": [],
+      "legacy": true,
+      "mainSha": "",
+      "at": "2026-08-26T05:51:32.773Z"
+    },
+    {
+      "id": "l08",
+      "status": "green",
+      "ref": "9d7b76b",
+      "why": "[imported from round 8; the tasks it covered were never reco…",
+      "covers": [],
+      "legacy": true,
+      "mainSha": "",
+      "at": "2026-08-26T09:51:48.110Z"
+    },
+    {
+      "id": "c10",
+      "status": "green",
+      "ref": "gh-run-32980446975",
+      "why": "all seven steps of ci.yml on GitHub at 9707f4c, including th…",
+      "covers": [
+        "0.10d",
+        "1.9d",
+        "1.8f",
+        "sweep-c"
+      ],
+      "mainSha": "",
+      "at": "2026-08-26T14:30:00.049Z"
+    }
+  ],
+  "defects": [
+    {
+      "id": "d01",
+      "task": "0.12.B",
+      "kind": "bug",
+      "what": "Every verify command starting with an environment assignment…",
+      "evidence": "driver.mjs:1846 quotes each argument; bash -c \"'FOO=1' /usr/…",
+      "blocking": true,
+      "status": "fixed",
+      "at": "2026-08-26T11:51:42.134Z",
+      "resolvedAt": "2026-08-26T11:57:01.574Z"
+    },
+    {
+      "id": "d02",
+      "task": "0.12.B",
+      "kind": "bug",
+      "what": "The generated base check in every brief asserts 'git merge-b…",
+      "evidence": "briefs/0.12.B.md:38 and briefs/1.9c.md:37 both name fa0b3fe;…",
+      "blocking": true,
+      "status": "fixed",
+      "at": "2026-08-26T11:56:31.392Z",
+      "resolvedAt": "2026-08-26T11:57:01.835Z"
+    },
+    {
+      "id": "d03",
+      "task": "sweep-a",
+      "kind": "bug",
+      "what": "THE PREMISE OF o16 IS FALSE, AND THE QUESTION PUT TO THE USE…",
+      "evidence": "tests/test_content_tables.py:672 test_the_shared_question_ba…",
+      "blocking": true,
+      "status": "fixed",
+      "at": "2026-08-26T12:03:44.247Z",
+      "resolvedAt": "2026-08-26T12:12:53.651Z"
+    },
+    {
+      "id": "d04",
+      "task": "sweep-a",
+      "kind": "bug",
+      "what": "scripts/plan-status.mjs crashes on any task key outside the …",
+      "evidence": "node scripts/plan-status.mjs --check -> TypeError: Cannot re…",
+      "blocking": true,
+      "status": "fixed",
+      "at": "2026-08-26T12:18:10.852Z",
+      "resolvedAt": "2026-08-26T13:39:46.792Z"
+    },
+    {
+      "id": "d05",
+      "task": "1.9c",
+      "kind": "guard",
+      "what": "1 file(s) changed outside what 1.9c owns",
+      "evidence": "apps/api/alembic/versions/20260826_86b4cde53d7c_saying_where…",
+      "blocking": true,
+      "status": "fixed",
+      "at": "2026-08-26T12:20:44.671Z",
+      "resolvedAt": "2026-08-26T12:21:15.487Z"
+    },
+    {
+      "id": "d06",
+      "task": "sweep-c",
+      "kind": "bug",
+      "what": "A brief's generated verify list for a JavaScript-package cha…",
+      "evidence": "ci.yml:279 runs pnpm exec turbo run typecheck test build. sw…",
+      "blocking": true,
+      "status": "fixed",
+      "at": "2026-08-26T12:36:50.521Z",
+      "resolvedAt": "2026-08-26T12:40:36.308Z"
+    },
+    {
+      "id": "d07",
+      "task": "sweep-b",
+      "kind": "bug",
+      "what": "scripts/plan-status.mjs IS WRITE-BY-DEFAULT, not merely miss…",
+      "evidence": "CONFIRMED BY IT BITING ME: I ran 'node scripts/plan-status.m…",
+      "blocking": true,
+      "status": "fixed",
+      "at": "2026-08-26T13:23:38.577Z",
+      "resolvedAt": "2026-08-26T16:26:39.955Z"
+    },
+    {
+      "id": "d08",
+      "task": "0.10d",
+      "kind": "sendback",
+      "what": "tests/test_readiness.py::test_the_compose_healthcheck_still_…",
+      "evidence": "Re-ran shard 7 alone on the joined tree at 8902573 through t…",
+      "blocking": true,
+      "status": "fixed",
+      "at": "2026-08-26T13:58:30.454Z",
+      "resolvedAt": "2026-08-26T14:27:52.850Z"
+    },
+    {
+      "id": "d09",
+      "task": "0.10d",
+      "kind": "sendback",
+      "what": "Shard 7 red on the joined tree: test_readiness.py::test_the_…",
+      "evidence": "",
+      "blocking": true,
+      "status": "fixed",
+      "at": "2026-08-26T13:59:13.503Z",
+      "resolvedAt": "2026-08-26T14:31:35.324Z"
+    }
+  ]
+}

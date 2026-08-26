@@ -9,15 +9,40 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { execSync, spawnSync } from 'node:child_process';
+import { execSync, execFileSync, spawnSync } from 'node:child_process';
 import os from 'node:os';
 
 const CWD = process.cwd();
 const CMDLINE = process.argv.slice(2).join(' ').slice(0, 200);
+// The resolved subcommand — `refine done`, `defect add`, `iam` — filled in by the
+// dispatch at the bottom. The raw argv is kept alongside it, but argv is not what
+// belongs in a narrow column: an invocation that leads with `--register <abs path>`
+// pushes the command itself off the end of the line, and the log then reads as
+// hundreds of rows that name no command at all.
+let CMDNAME = '';
 let REG_PATH = path.join(CWD, '.claude', 'orchestration', 'register.json');
 
 const die = (m) => { console.error('error: ' + m); process.exit(2); };
 const now = () => new Date().toISOString();
+
+// Every flag that carries words an agent wrote goes through here. Checking only
+// truthiness let a boolean `true` through and recorded it as the agent's words —
+// a success message over a message that no longer existed.
+function strFlag(flags, name, why) {
+  const v = flags[name];
+  if (typeof v !== 'string' || !v.trim()) die(why);
+  return v;
+}
+// Same for the numeric ones: Number(true) is 1 and Number('bogus') is NaN, and
+// both used to sail into a filter that silently matched nothing.
+function numFlag(flags, name, { min = 0, max = Infinity, what } = {}) {
+  if (flags[name] === undefined) return undefined;
+  const n = Number(flags[name]);
+  if (!Number.isFinite(n) || !Number.isInteger(n) || n < min || n > max)
+    die('--' + name + ' needs ' + (what || 'a whole number from ' + min +
+        (max === Infinity ? ' up' : ' to ' + max)) + ' — got "' + flags[name] + '"');
+  return n;
+}
 
 function readReg() {          // for read-modify-write: holds the lock until exit
   // Ask whether there is anything to read BEFORE taking the lock. Locking first
@@ -82,6 +107,12 @@ function lockIsDead() {
 }
 
 function writeReg(r) {
+  // Nothing writes the register without holding the lock. `rebuild`, `verify` and
+  // `log reseed` used to call straight in here and land on the same
+  // `register.json.tmp` a locked writer was using, so a chip's concurrent `done`
+  // was overwritten without a word. The commands take the lock themselves, and
+  // this is the backstop that makes "no unlocked writer" true by construction.
+  if (!HAS_LOCK) acquireLock();
   fs.mkdirSync(path.dirname(REG_PATH), { recursive: true });
   const next = JSON.stringify(r, null, 2) + '\n';
   let prev = null;
@@ -180,10 +211,23 @@ function applyOps(state, ops) {
 // the source of truth, not a message ledger.
 function readEvents({ tolerateTail = true } = {}) {
   const f = eventsPath();
-  if (!fs.existsSync(f)) return { events: [], problems: [], bytesGood: 0 };
-  const raw = fs.readFileSync(f, 'utf8');
+  if (!fs.existsSync(f)) return { events: [], problems: [], bytesGood: 0, ends: [] };
+  // A record that is a directory, or that this user cannot read, is bad input like
+  // any other bad input. It used to come out as a raw Node stack trace from every
+  // single command, which tells the person nothing about what to do next.
+  let raw;
+  try {
+    const st = fs.statSync(f);
+    if (!st.isFile())
+      die('the record at ' + rel(f) + ' is a ' + (st.isDirectory() ? 'directory' : 'special file') +
+          ', not a file — one JSON event per line is what belongs there.');
+    raw = fs.readFileSync(f, 'utf8');
+  } catch (e) {
+    die('cannot read the record at ' + rel(f) + ': ' + ((e && e.code) || 'unreadable') + '.\n' +
+        '       Fix its permissions, or recover it from .claude/orchestration/backups/.');
+  }
   const lines = raw.split('\n');
-  const events = [], problems = [];
+  const events = [], problems = [], ends = [];
   let bytesGood = 0;
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
@@ -201,8 +245,26 @@ function readEvents({ tolerateTail = true } = {}) {
     }
     events.push(e);
     bytesGood += Buffer.byteLength(line) + 1;
+    ends.push(bytesGood);   // where this event's line ends — what `--to` truncates at
   }
-  return { events, problems, bytesGood };
+  return { events, problems, bytesGood, ends };
+}
+
+// A final line with no trailing newline is not corruption yet, but the next append
+// concatenates onto it and turns two good events into one unparseable one — which
+// the reader then drops as a torn tail, losing both, while `verify` goes green on
+// the loss because the register was never told. Close the line before appending.
+function sealLastLine(f) {
+  let st;
+  try { st = fs.statSync(f); } catch { return; }
+  if (!st.isFile() || st.size === 0) return;
+  let last = null;
+  try {
+    const fd = fs.openSync(f, 'r');
+    const b = Buffer.alloc(1);
+    try { if (fs.readSync(fd, b, 0, 1, st.size - 1) === 1) last = b[0]; } finally { fs.closeSync(fd); }
+  } catch { return; }
+  if (last !== null && last !== 0x0a) fs.appendFileSync(f, '\n');
 }
 
 function replay(events) {
@@ -226,9 +288,15 @@ function commit(r, why) {
   const f = eventsPath();
   let before = {};
   try { before = JSON.parse(fs.readFileSync(path.resolve(CWD, REG_PATH), 'utf8')); } catch { /* first write */ }
-  const ops = diffOps(before, r);
-  if (!ops.length) return writeReg(r);          // no-op: burns no backup, records nothing
   const { events, problems, bytesGood } = readEvents();
+  // A register with content sitting on top of an empty log is a hole in the
+  // history, and appending only the delta to it is the worst of both worlds: the
+  // one line that results claims to be the whole record, so the next `rebuild`
+  // replays it over the register and everything the register still held is gone.
+  // Seed the whole state instead, exactly as `log reseed` does, and say why.
+  const lost = !events.length && before && typeof before === 'object' && Object.keys(before).length > 0;
+  const ops = lost ? [{ p: [], v: r }] : diffOps(before, r);
+  if (!ops.length) return writeReg(r);          // no-op: burns no backup, records nothing
   const fatal = problems.find((x) => x.fatal);
   if (fatal) die('the record at ' + rel(f) + ' is damaged at line ' + fatal.line + '.\n' +
     '       Refusing to append to a log with a hole in it — a partial record is worse than none.\n' +
@@ -240,17 +308,34 @@ function commit(r, why) {
   }
   const seq = (events.length ? Math.max(...events.map((e) => e.seq || 0)) : 0) + 1;
   fs.mkdirSync(path.dirname(f), { recursive: true });
-  fs.appendFileSync(f, JSON.stringify({ seq, at: now(), cmd: why || CMDLINE, ops }) + '\n');
+  sealLastLine(f);
+  const rec = { seq, at: now(), cmd: why || CMDNAME || CMDLINE, argv: CMDLINE, ops };
+  if (lost) {
+    rec.reseed = true;
+    rec.why = 'the record at ' + rel(f) + ' was missing or empty while the register still held ' +
+      Object.keys(before).length + ' top-level field(s); seeded from the register as it stood, ' +
+      'so everything before this point is lost history.';
+    console.error('· the record at ' + rel(f) + ' was missing or empty, and the register was not.');
+    console.error('  Seeded a fresh record from the register as it stands, marked as a hole in the history.');
+  }
+  fs.appendFileSync(f, JSON.stringify(rec) + '\n');
   return writeReg(r);
 }
 
 function cmdRebuild(flags) {
-  const { events, problems } = readEvents();
+  // Both of these read the register and the record and compare them, so both need
+  // the pair to be a single moment. `verify` locks for the same reason it reads
+  // twice; `rebuild` locks because it writes.
+  acquireLock();
+  const { events, problems, ends } = readEvents();
   const fatal = problems.find((x) => x.fatal);
   if (fatal) die('the record is damaged at line ' + fatal.line + ' — ' + fatal.why + '.\n' +
     '       Not rebuilding from a log with a hole in it.');
   if (!events.length) die('no record at ' + rel(eventsPath()) + ' — nothing to rebuild from.');
-  const upto = flags.to !== undefined ? Number(flags.to) : Infinity;
+  const maxSeq = events.reduce((m, e) => Math.max(m, e.seq || 0), 0);
+  const to = numFlag(flags, 'to', { min: 1, max: maxSeq,
+    what: 'a sequence number from 1 to ' + maxSeq + ' (the record ends there)' });
+  const upto = to === undefined ? Infinity : to;
   const use = events.filter((e) => (e.seq || 0) <= upto);
   const { state, problems: rp, lastSeq } = replay(use);
   for (const x of problems) console.error('· ' + x.why);
@@ -271,18 +356,66 @@ function cmdRebuild(flags) {
   writeReg(state);
   console.log('rebuilt ' + rel(REG_PATH) + ' from ' + use.length + ' event(s) (seq ' + lastSeq + ').');
   console.log('The previous file was kept in backups/ — nothing was thrown away.');
+  // Rewinding the register while leaving the record at full length leaves the run
+  // permanently drifted: the register says seq N, the log says seq maxSeq, and
+  // every `verify` from then on reports the difference as damage. The two halves
+  // move together or not at all — so cut the log to the same point, keeping the
+  // full original beside it so the rewind is still reversible.
+  if (to !== undefined) {
+    const f = eventsPath();
+    const cutIdx = events.reduce((m, e, i) => ((e.seq || 0) <= upto ? i : m), -1);
+    const cut = cutIdx >= 0 ? ends[cutIdx] : 0;
+    let size = 0;
+    try { size = fs.statSync(f).size; } catch { /* gone */ }
+    if (cut < size) {
+      const keep = f + '.before-rewind-' + now().replace(/[:.]/g, '-');
+      fs.copyFileSync(f, keep);
+      fs.truncateSync(f, cut);
+      console.log('The record was cut to the same point, so the two stay in step.');
+      console.log('The full record as it was is kept at ' + rel(keep) + ' — ' +
+        (events.length - use.length) + ' event(s) beyond seq ' + lastSeq + ' are only there now.');
+    }
+  }
+}
+
+// Events written before the command was recorded by name hold the raw argv, and
+// an argv that leads with `--register <abs path>` fills the whole column with the
+// path. Nothing can be done about what was written, but the column can drop the
+// flags nobody reads and show the words that actually name the command.
+function cmdLabel(e) {
+  const raw = String(e.cmd || '');
+  if (e.argv === undefined) {          // an old row: raw argv, flags and all
+    const words = [];
+    const parts = raw.split(/\s+/).filter(Boolean);
+    for (let i = 0; i < parts.length && words.length < 3; i++) {
+      const p = parts[i];
+      if (p === '--') break;
+      if (p.startsWith('--')) {
+        // Once the command's own words have started, a flag ends them. Reading on
+        // past it picks up the loose words of a long `--why "..."` and renders
+        // them as if they were the command.
+        if (words.length) break;
+        if (!p.includes('=') && parts[i + 1] && !parts[i + 1].startsWith('--')) i++;
+        continue;
+      }
+      words.push(p);
+    }
+    return words.join(' ') || raw;
+  }
+  return raw;
 }
 
 function cmdEvents(flags) {
   const { events, problems } = readEvents();
   for (const x of problems) console.error('· ' + x.why);
   let show = events;
-  if (flags.since !== undefined) show = show.filter((e) => (e.seq || 0) > Number(flags.since));
-  if (typeof flags.task === 'string') show = show.filter((e) => JSON.stringify(e.ops).includes('"' + flags.task + '"') || String(e.cmd).includes(flags.task));
+  const since = numFlag(flags, 'since', { min: 0 });
+  if (since !== undefined) show = show.filter((e) => (e.seq || 0) > since);
+  if (typeof flags.task === 'string') show = show.filter((e) => JSON.stringify(e.ops).includes('"' + flags.task + '"') || cmdLabel(e).includes(flags.task));
   if (typeof flags.grep === 'string') show = show.filter((e) => JSON.stringify(e).includes(flags.grep));
-  const n = flags.n ? Number(flags.n) : 40;
+  const n = numFlag(flags, 'n', { min: 1 }) ?? 40;
   for (const e of show.slice(-n)) {
-    console.log(String(e.seq).padStart(5) + '  ' + String(e.at).slice(0, 19).replace('T', ' ') + '  ' + String(e.cmd || '').slice(0, 46));
+    console.log(String(e.seq).padStart(5) + '  ' + String(e.at).slice(0, 19).replace('T', ' ') + '  ' + cmdLabel(e).slice(0, 46));
     for (const o of e.ops.slice(0, 4))
       console.log('        ' + (o.d ? '- ' : '  ') + o.p.join('.') + (o.d ? '' : ' → ' + JSON.stringify(o.v).slice(0, 60)));
     if (e.ops.length > 4) console.log('        …' + (e.ops.length - 4) + ' more change(s)');
@@ -291,7 +424,10 @@ function cmdEvents(flags) {
 }
 
 function cmdLogReseed(flags) {
-  if (!flags.why) die('log reseed --why "..." — say what happened to the old record; this marks a hole in the history');
+  strFlag(flags, 'why', 'log reseed --why "..." — say what happened to the old record; this marks a hole in the history');
+  // Replaces the record wholesale from the register; a concurrent writer changing
+  // the register underneath that would be baked into the seed and then lost.
+  acquireLock();
   let cur = {};
   try { cur = JSON.parse(fs.readFileSync(path.resolve(CWD, REG_PATH), 'utf8')); } catch { die('no register to reseed from'); }
   const f = eventsPath();
@@ -309,26 +445,80 @@ function cmdLogReseed(flags) {
 
 // ---------------------------------------------------------------- resolving
 
+// Every plan file under a directory, deepest last, dot-dirs and node_modules
+// skipped.
+function walkPlans(root) {
+  const out = [];
+  (function walk(d) {
+    let entries = [];
+    try { entries = fs.readdirSync(d, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      if (e.name.startsWith('.') || e.name === 'node_modules') continue;
+      const p = path.join(d, e.name);
+      if (e.isDirectory()) walk(p);
+      else if (/\.(md|markdown|txt|rst)$/i.test(e.name)) out.push(p);
+    }
+  })(root);
+  return out.sort();
+}
+
+// A wildcard was only ever read in the last segment, so `docs/*/plan.md` looked
+// in a directory literally named "*" and reported "no files matched"; and a
+// wildcard that matched a directory handed that directory to readFileSync,
+// which threw EISDIR. Both are fixed by matching segment by segment: `*` inside
+// one name, `**` across any depth, and a directory that survives the match is
+// walked for plans rather than read as one.
+function globPlans(arg) {
+  const abs = path.resolve(CWD, arg);
+  const parts = abs.split(path.sep).filter(Boolean);
+  const seg = (s) => new RegExp('^' + s.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '[^/]*') + '$');
+  let here = [path.sep];
+  for (let i = 0; i < parts.length; i++) {
+    const part = parts[i];
+    const next = [];
+    if (part === '**') {
+      // any depth, this level included
+      for (const d of here) {
+        next.push(d);
+        for (const sub of (function all(x, acc) {
+          let es = [];
+          try { es = fs.readdirSync(x, { withFileTypes: true }); } catch { return acc; }
+          for (const e of es) {
+            if (!e.isDirectory() || e.name.startsWith('.') || e.name === 'node_modules') continue;
+            const p = path.join(x, e.name); acc.push(p); all(p, acc);
+          }
+          return acc;
+        })(d, [])) next.push(sub);
+      }
+    } else if (part.includes('*')) {
+      const re = seg(part);
+      for (const d of here) {
+        let es = [];
+        try { es = fs.readdirSync(d); } catch { continue; }
+        for (const e of es) if (re.test(e)) next.push(path.join(d, e));
+      }
+    } else {
+      for (const d of here) {
+        const p = path.join(d, part);
+        if (fs.existsSync(p)) next.push(p);
+      }
+    }
+    here = [...new Set(next)];
+    if (!here.length) return [];
+  }
+  const out = [];
+  for (const p of here) {
+    let st; try { st = fs.statSync(p); } catch { continue; }
+    if (st.isDirectory()) out.push(...walkPlans(p));
+    else out.push(p);
+  }
+  return [...new Set(out)].sort();
+}
+
 function expand(arg) {
   const abs = path.resolve(CWD, arg);
-  if (fs.existsSync(abs) && fs.statSync(abs).isDirectory()) {
-    const out = [];
-    (function walk(d) {
-      for (const e of fs.readdirSync(d, { withFileTypes: true })) {
-        if (e.name.startsWith('.') || e.name === 'node_modules') continue;
-        const p = path.join(d, e.name);
-        if (e.isDirectory()) walk(p);
-        else if (/\.(md|markdown|txt|rst)$/i.test(e.name)) out.push(p);
-      }
-    })(abs);
-    return out.sort();
-  }
-  if (arg.includes('*')) {
-    const dir = path.dirname(abs), base = path.basename(abs);
-    if (!fs.existsSync(dir)) return [];
-    const re = new RegExp('^' + base.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*') + '$');
-    return fs.readdirSync(dir).filter((f) => re.test(f)).map((f) => path.join(dir, f)).sort();
-  }
+  if (arg.includes('*')) return globPlans(arg);
+  if (fs.existsSync(abs) && fs.statSync(abs).isDirectory()) return walkPlans(abs);
   return fs.existsSync(abs) ? [abs] : [];
 }
 
@@ -349,16 +539,43 @@ const LEX = [
   { id: 'tuning',   why: 'a number somebody has to pick', re: /\b(configurable|tunable|tuned|adjustable|to taste|per deployment|environment[- ]specific)\b/i },
 ];
 
-const SETTLED_HEADING = /(settled|do not relitigate|already decided|decisions \(|resolved|answered)/i;
+// Whole words only, and never the negation of one. Unanchored, "resolved" sits
+// inside "unresolved" and "answered" inside "unanswered", so a section headed
+// "Unresolved questions" turned suppression ON and every gap under it was
+// dropped without a word — the sections most likely to hold undecided things
+// were exactly the ones skipped, and `check` then went green. The boundaries
+// stop the run-together forms; the lookbehind stops "un-resolved" and
+// "un answered", which a boundary alone lets through.
+const SETTLED_HEADING = /(?<!\bun[- ])\b(settled|do not relitigate|already decided|resolved|answered)\b|\bdecisions \(/i;
 const FENCE = /^\s*(```|~~~)/;
 
+// Which lines sit inside a code fence. Toggling a flag line by line meant a
+// plan with an odd number of fence lines left the fence open for ever, so
+// every line after the last ``` was treated as code and never scanned. An
+// unterminated fence is a typo in the plan, not an instruction to stop reading
+// it: the unmatched opener is ignored, the rest is scanned as prose, and the
+// operator is told the plan needs fixing.
+function fencedLines(lines) {
+  const marks = [];
+  lines.forEach((l, i) => { if (FENCE.test(l)) marks.push(i); });
+  let unterminated = false;
+  if (marks.length % 2 === 1) { marks.pop(); unterminated = true; }
+  const inFence = new Array(lines.length).fill(false);
+  for (let k = 0; k + 1 < marks.length; k += 2)
+    for (let i = marks[k]; i <= marks[k + 1]; i++) inFence[i] = true;
+  return { inFence, unterminated };
+}
+
 function scanFile(p) {
-  const lines = fs.readFileSync(p, 'utf8').split('\n');
+  const lines = readPlan(p).split('\n');
   const hits = [];
-  let fenced = false, heading = '', settled = false;
+  const { inFence, unterminated } = fencedLines(lines);
+  if (unterminated)
+    console.error('note: ' + rel(p) + ' has an odd number of code fence lines — the last one is ' +
+                  'never closed. Reading past it as prose; fix the fence in the plan.');
+  let heading = '', settled = false;
   lines.forEach((line, i) => {
-    if (FENCE.test(line)) { fenced = !fenced; return; }
-    if (fenced) return;
+    if (inFence[i]) return;
     const h = line.match(/^\s{0,3}(#{1,6})\s+(.*)$/);
     if (h) { heading = h[2].trim(); settled = SETTLED_HEADING.test(heading); return; }
     if (settled) return;
@@ -373,20 +590,53 @@ function scanFile(p) {
 
 // A plan can also be silent. If a whole category of question is never
 // mentioned anywhere in the document, that is a gap nobody wrote down.
+//
+// Each word below is matched as a WORD, not as a run of letters. Matched as
+// bare substrings, "deliberate" and "separate" both read as *rate*, "download"
+// read as *load*, "against" as *again* and "capture" as *cap* — so a plan that
+// says nothing at all about limits or growth was recorded as covering both, and
+// on the real corpus 11 of 14 genuine silences went unreported. A trailing `*`
+// means "this word and anything grown from it" (migrat* → migrate, migration,
+// migrating); without it the whole word must stand alone.
 const CATEGORIES = [
-  { id: 'failure',    ask: 'what happens when it fails',        words: ['fail', 'error', 'crash', 'retry', 'timeout', 'rollback', 'roll back', 'exception', 'goes wrong'] },
-  { id: 'limits',     ask: 'how much is too much',              words: ['limit', 'quota', 'cap', 'maximum', 'max ', 'rate', 'throttle', 'too many', 'size'] },
-  { id: 'permission', ask: 'who is allowed to do it',           words: ['who can', 'allowed', 'permission', 'role', 'actor', 'access', 'may not', 'forbidden'] },
-  { id: 'repeat',     ask: 'what happens if it runs twice',     words: ['twice', 'duplicate', 'idempot', 'replay', 'again', 'already', 'repeat', 're-run', 'rerun'] },
-  { id: 'existing',   ask: 'what happens to what already exists',words: ['migrat', 'backfill', 'existing', 'already stored', 'upgrade', 'old rows', 'historic'] },
-  { id: 'proof',      ask: 'how anyone knows it works',         words: ['test', 'fixture', 'golden', 'verify', 'prove', 'assert', 'check that', 'acceptance'] },
-  { id: 'undo',       ask: 'how it is undone or deleted',       words: ['undo', 'delete', 'remove', 'revert', 'erase', 'retention', 'purge', 'cancel'] },
-  { id: 'growth',     ask: 'what it looks like at ten times the size', words: ['scale', 'grow', 'volume', 'load', 'how many', 'per second', 'concurren', 'thousand'] },
+  { id: 'failure',    ask: 'what happens when it fails',        words: ['fail*', 'error*', 'crash*', 'retry*', 'timeout*', 'rollback*', 'roll back', 'exception*', 'goes wrong'] },
+  { id: 'limits',     ask: 'how much is too much',              words: ['limit*', 'quota*', 'cap', 'caps', 'maximum', 'max', 'rate', 'rates', 'rate-limit*', 'throttl*', 'too many', 'size*'] },
+  { id: 'permission', ask: 'who is allowed to do it',           words: ['who can', 'allow*', 'permission*', 'role', 'roles', 'actor*', 'access*', 'may not', 'forbidden'] },
+  { id: 'repeat',     ask: 'what happens if it runs twice',     words: ['twice', 'duplicat*', 'idempot*', 'replay*', 'again', 'already', 'repeat*', 're-run', 'rerun*'] },
+  { id: 'existing',   ask: 'what happens to what already exists',words: ['migrat*', 'backfill*', 'existing', 'already stored', 'upgrade*', 'old rows', 'historic*'] },
+  { id: 'proof',      ask: 'how anyone knows it works',         words: ['test*', 'fixture*', 'golden', 'verif*', 'prove*', 'proof', 'assert*', 'check that', 'acceptance'] },
+  { id: 'undo',       ask: 'how it is undone or deleted',       words: ['undo', 'undone', 'delete*', 'remove*', 'removal', 'revert*', 'erase*', 'erasure', 'retention', 'purge*', 'cancel*'] },
+  { id: 'growth',     ask: 'what it looks like at ten times the size', words: ['scale*', 'scaling', 'grow*', 'growth', 'volume*', 'load', 'loads', 'how many', 'per second', 'concurren*', 'thousand*'] },
 ];
 
+// `foo*` → the word and anything grown from it; `foo` → that word alone.
+// Built once, because `silence` runs this over every plan in the register.
+const CATEGORY_RE = new Map(CATEGORIES.map((c) => [c.id, new RegExp(
+  c.words.map((w) => {
+    const stem = w.endsWith('*') ? w.slice(0, -1) : w;
+    const src = stem.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/[ -]/g, '[ -]');
+    return '\\b' + src + (w.endsWith('*') ? '[a-z]*' : '\\b');
+  }).join('|'), 'i')]));
+
 function silenceFile(p) {
-  const text = fs.readFileSync(p, 'utf8').toLowerCase();
-  return CATEGORIES.filter((c) => !c.words.some((w) => text.includes(w)));
+  const text = readPlan(p);
+  return CATEGORIES.filter((c) => !CATEGORY_RE.get(c.id).test(text));
+}
+
+// Every read of a plan file goes through here. A plan that has been renamed or
+// moved since `load` used to come back as a raw ENOENT stack trace, which says
+// nothing about what to do; this names the file and the way out.
+function readPlan(p) {
+  try {
+    return fs.readFileSync(p, 'utf8');
+  } catch (e) {
+    if (e && e.code === 'ENOENT')
+      die('the plan ' + rel(p) + ' is on the register but not on disk — it has been renamed,\n' +
+          '       moved or deleted since `load`. Re-run `load` with its new path, or restore it.');
+    if (e && e.code === 'EISDIR') die(rel(p) + ' is a directory, not a plan file.');
+    if (e && e.code === 'EACCES') die('cannot read the plan ' + rel(p) + ' — permission denied.');
+    throw e;
+  }
 }
 
 // ------------------------------------------------------------------ commands
@@ -433,6 +683,9 @@ function cmdScan() {
       added++;
     }
   }
+  // So `check` can tell "everything was judged" from "nothing was ever looked
+  // at". An empty gap list means both, and only this says which.
+  reg.scannedAt = now();
   commit(reg);
   const byPlan = {};
   for (const g of reg.gaps.filter((x) => x.status === 'candidate')) (byPlan[g.plan] ||= []).push(g);
@@ -545,6 +798,17 @@ const JARGON = ['idempoten', 'schema', 'endpoint', 'api', 'rls', 'jwt', 'oauth',
   'algorithm', 'implementation', 'architecture', 'infrastructure', 'configuration', 'authenticat',
   'authoris', 'authoriz', 'provision', 'orchestrat', 'instantiat', 'parameteris', 'parameteriz'];
 
+// Each entry above is a STEM, and a stem only counts where a word starts. Held
+// as bare substrings they matched inside ordinary English — "orm" sits in
+// normal, format, information, performance and platform, "api" in rapid — so
+// the linter refused plain words and, naming only the stem, never said which
+// word of the question it had objected to. Anchored to a word start and run on
+// to the end of that word, it catches the growths a stem is there for
+// ("schema" in schemas, "authoris" in authorisation) and reports the word the
+// writer actually used.
+const JARGON_RE = new RegExp(
+  '\\b(?:' + JARGON.map((j) => j.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|') + ')[a-z]*', 'i');
+
 const PATHY = /(^|\s|\()[\w.\-/]*\/[\w.\-/]+|\b\w+\.(md|ts|tsx|js|mjs|py|json|sql|toml|yaml|yml|sh|rs|go|java|rb)\b|`[^`]+`/i;
 
 function words(s) { return s.trim().split(/\s+/).filter(Boolean); }
@@ -555,8 +819,8 @@ function lintText(label, s, maxWords) {
   const w = words(s);
   if (w.length > maxWords) p.push(label + ' is ' + w.length + ' words, max ' + maxWords);
   if (PATHY.test(s)) p.push(label + ' names a file or path — say what it does instead');
-  const low = ' ' + s.toLowerCase() + ' ';
-  for (const j of JARGON) if (low.includes(j)) { p.push(label + ' uses "' + j + '" — plainer word needed'); break; }
+  const j = s.match(JARGON_RE);
+  if (j) p.push(label + ' uses "' + j[0] + '" — say what it does instead (see reference/plain-words.md)');
   // Measure each unhyphenated run: "multiply-the-gap" is plain English,
   // "implementation" is not.
   const long = w.flatMap((x) => x.split(/[-\u2013\u2014/]/)).find((x) => x.replace(/[^a-z]/gi, '').length >= 14);
@@ -668,17 +932,40 @@ function cmdStatus() {
   } else console.log('\nnothing in scope is unanswered.');
 }
 
+// The gate before the record gets written. It used to read status strings and
+// nothing else, which made it a formality: an empty gap list satisfied every
+// condition, and `set <id> status=answered` walked straight past it without an
+// answer ever being recorded — after which `render` died with a raw TypeError
+// on the very register `check` had just blessed. It now asks whether the work
+// was actually done, not whether a word says so.
 function cmdCheck() {
   const reg = readReg();
   const cand = reg.gaps.filter((g) => g.status === 'candidate');
   const unset = reg.gaps.filter((g) => g.scope === 'unset' && !['dropped', 'candidate'].includes(g.status));
   const open = reg.gaps.filter((g) => g.scope === 'in' && !['answered', 'dropped'].includes(g.status));
+  // "answered" with nothing recorded under it is the state `render` cannot
+  // read. A status is a claim; the answer is the evidence for it.
+  const hollow = reg.gaps.filter((g) => g.status === 'answered' &&
+    !(g.answer && typeof g.answer.choice === 'string' && g.answer.choice.trim()));
   let fail = false;
+  if (!reg.plans.length) { console.error('✗ no plans loaded — nothing has been read, so nothing can be finished. Run `load`.'); fail = true; }
+  else if (!reg.scannedAt) {
+    console.error('✗ no scan has been run against these plans, so there is nothing to have judged.');
+    console.error('  Read every plan in full, then run `scan` (and `silence`).');
+    fail = true;
+  }
   if (cand.length) { console.error('✗ ' + cand.length + ' candidate(s) never judged — keep or drop each one'); fail = true; }
   if (unset.length) { console.error('✗ ' + unset.length + ' gap(s) with no scope — in or out?'); fail = true; }
   if (open.length) { console.error('✗ ' + open.length + ' in-scope gap(s) unanswered:'); for (const g of open) console.error('    ' + g.id + '  ' + (g.title || g.quote.slice(0, 60))); fail = true; }
+  if (hollow.length) {
+    console.error('✗ ' + hollow.length + ' gap(s) marked answered with no answer recorded — a status is not a decision:');
+    for (const g of hollow) console.error('    ' + g.id + '  ' + (g.title || g.quote.slice(0, 60)) + '   — run `answer ' + g.id + '`');
+    fail = true;
+  }
   if (fail) { console.error('\nnot finished. Do not report this session as done.'); process.exit(1); }
-  console.log('✓ every candidate judged, every in-scope gap answered. Safe to write the record.');
+  const answered = reg.gaps.filter((g) => g.status === 'answered').length;
+  console.log('✓ every candidate judged, every in-scope gap answered, ' + answered +
+              ' answer(s) on record. Safe to write the record.');
 }
 
 // ------------------------------------------------------------------- render
@@ -687,6 +974,12 @@ function cmdRender(flags) {
   const reg = readReg();
   const done = reg.gaps.filter((g) => g.status === 'answered');
   if (!done.length) die('nothing answered yet');
+  // Belt as well as braces: `check` refuses these now, but `render` can be run
+  // without it, and a raw TypeError deep in the writer says nothing useful.
+  const hollow = done.filter((g) => !(g.answer && typeof g.answer.choice === 'string' && g.answer.choice.trim()));
+  if (hollow.length)
+    die(hollow.length + ' gap(s) are marked answered with no answer recorded: ' +
+        hollow.map((g) => g.id).join(', ') + '\n       Record each with `answer <id>`, or set it back to gap.');
   if (flags.plan) {
     const gs = done.filter((g) => g.plan.includes(flags.plan));
     if (!gs.length) { console.log('(nothing was decided for ' + flags.plan + ' — leave that plan alone)'); return; }
@@ -1016,6 +1309,26 @@ function overlap(t1, t2) {
   return out;
 }
 
+// A serialisation point is a shared invariant named in prose by whoever wrote
+// the task — "docker-compose.yml", "docker compose file", "Docker-Compose.yml".
+// Comparing those by exact string equality is a check that can only ever fire
+// when two authors typed the same characters, and on a real run it never fired
+// once: a pre-flight found a docker-compose.yml collision this reported clean.
+// Normalise before comparing; keep both spellings when reporting so the
+// mismatch is visible and can be tidied.
+function normPoint(s) { return String(s).trim().toLowerCase().replace(/\s+/g, ' '); }
+function sharedPoints(t1, t2) {
+  const theirs = new Map();
+  for (const y of t2.serialises || []) theirs.set(normPoint(y), y);
+  const out = [];
+  for (const x of t1.serialises || []) {
+    const y = theirs.get(normPoint(x));
+    if (y === undefined) continue;
+    out.push(y === x ? x : x + ' ≈ ' + y);
+  }
+  return out;
+}
+
 function waves(r) {
   const ts = tasks(r).filter((t) => t.status !== 'cancelled');
   const placed = new Map(); const out = [];
@@ -1074,7 +1387,32 @@ function cmdTaskAdd() {
     const probs = taskProblems(it, at < 0);
     const label = 'item ' + (i + 1) + (it && it.key ? ' ("' + it.key + '")' : '');
     if (probs.length) { for (const x of probs) errs.push(label + ' ' + x); continue; }
-    plans.push({ it, at });
+    plans.push({ it, at, label });
+  }
+  // "two tasks may not touch one file" was asserted in the message above and
+  // then never checked against another task. A path claimed twice is the one
+  // failure this whole arrangement exists to prevent, so a NEW task claiming a
+  // path some still-open task already owns is refused here, at the only moment
+  // it is cheap to fix. Existing state is not re-judged — `doctor` reports that
+  // — because a register with the collision already in it must stay usable.
+  const contender = (t) => !['landed', 'cancelled'].includes(t.status);
+  for (let n = 0; n < plans.length; n++) {
+    const { it, at, label } = plans[n];
+    if (at >= 0) continue;                       // an update, not a new claim
+    for (const own of it.owns || []) {
+      const clashes = [];
+      for (const other of tasks(r)) {
+        if (other.key === it.key || !contender(other)) continue;
+        for (const b of other.owns || []) if (collides(own, b)) clashes.push(other.key + ' owns ' + b);
+      }
+      for (let m = 0; m < plans.length; m++) {
+        if (m === n || plans[m].it.key === it.key) continue;
+        for (const b of plans[m].it.owns || []) if (collides(own, b)) clashes.push(plans[m].it.key + ' (same batch) owns ' + b);
+      }
+      if (clashes.length)
+        errs.push(label + ' claims ' + own + ', which is already owned: ' + [...new Set(clashes)].join('; ') +
+          ' — two tasks may not touch one file. Narrow one of them, or make one wait for the other and split the file.');
+    }
   }
   if (errs.length) die('nothing was saved:\n       ' + errs.join('\n       '));
   const said = [];
@@ -1108,7 +1446,8 @@ function cmdTaskAdd() {
 function cmdGraph() {
   const r = readReg(); const ws = waves(r);
   if (!ws.length) die('no tasks yet');
-  let bad = 0;
+  let bad = 0, pairs = 0, skipped = 0;
+  const history = [];
   const lines = [];
   lines.push('## The work, and what can run side by side');
   lines.push('');
@@ -1141,7 +1480,16 @@ function cmdGraph() {
     // is merged work, not a contender, so it collides with nobody
     for (let i = 0; i < w.tasks.length; i++) for (let j = i + 1; j < w.tasks.length; j++) {
       const a = w.tasks[i], b = w.tasks[j];
-      if (a.status === 'landed' || b.status === 'landed') continue;
+      if (a.status === 'landed' || b.status === 'landed') {
+        // Still worth naming: the pair is not a gating decision, but "these two
+        // did share a file" is exactly the thing somebody reads this to find out.
+        skipped++;
+        const o = overlap(a, b), s = sharedPoints(a, b);
+        if (o.length) history.push('Round ' + (w.wave + 1) + ': ' + a.key + ' ↔ ' + b.key + ' share ' + o.join('; '));
+        if (s.length) history.push('Round ' + (w.wave + 1) + ': ' + a.key + ' ↔ ' + b.key + ' share serialisation point ' + s.join(', '));
+        continue;
+      }
+      pairs++;
       const o = overlap(a, b);
       if (o.length) {
         bad++;
@@ -1151,7 +1499,7 @@ function cmdGraph() {
       // A shared file is the easy case. A shared invariant — a migration chain
       // head, a lockfile, a closed list some test asserts exact equality over —
       // collides in CI with zero file overlap.
-      const shared = (a.serialises || []).filter((x) => (b.serialises || []).includes(x));
+      const shared = sharedPoints(a, b);
       if (shared.length) {
         bad++;
         lines.push('  ⚠ **' + a.key + '** and **' + b.key + '** both move the same serialisation point: ' + shared.join(', '));
@@ -1185,8 +1533,22 @@ function cmdGraph() {
     }
   }
   console.log(lines.join('\n'));
-  if (bad) { console.error('\n' + bad + ' problem(s) — fix the plan before creating any chip.'); process.exit(1); }
-  console.log('\nNothing clashes. Every round above can run side by side.');
+  // The all-clear used to be "Nothing clashes. Every round above can run side by
+  // side." — an absolute sentence about a check that is anything but. Pairs
+  // where either side has landed are skipped on purpose (merged work is not a
+  // contender), so the same register says "nothing clashes" today and would
+  // have said "these two collide" yesterday. Say what was actually looked at.
+  if (history.length) {
+    console.log('\nAlready merged, so not a gate — but it is what happened:');
+    for (const h of history) console.log('  · ' + h);
+  }
+  const scope = pairs + ' pair(s) of tasks that could still collide were checked for shared files\n' +
+    'and shared serialisation points' +
+    (skipped ? ('; ' + skipped + ' pair(s) were skipped because one side has already landed.') : '.');
+  if (bad) { console.error('\n' + bad + ' problem(s) — fix the plan before creating any chip.\n' + scope); process.exit(1); }
+  console.log('\n✓ ' + scope);
+  console.log('Nothing among them clashes, so every round above can run side by side.');
+  if (skipped) console.log('That is not a statement about the run as a whole — a landed task is not re-judged.');
 }
 
 
@@ -1197,11 +1559,18 @@ function cmdGraph() {
 // actually breaks parallel work.
 function interference(t, other) {
   const files = overlap(t, other);
-  const points = (t.serialises || []).filter((x) => (other.serialises || []).includes(x));
+  const points = sharedPoints(t, other);
   return files.length || points.length ? { files, points } : null;
 }
+// A task is open — its files are in somebody's hands — from the moment it is
+// handed out until it lands. This used to be keyed off `x.chip`, the chip id,
+// which is bookkeeping and which the documented invocation never passes. The
+// effect was that every gate reading this went dark: `frontier` saw nothing
+// open, `chip` refused nothing, and two tasks owning one file both went ready
+// with no complaint. Status is what actually says whether work is out there.
+const OPEN_STATUSES = ['held', 'ready', 'reported'];
 function openTasks(r, except) {
-  return tasks(r).filter((x) => x.key !== except && x.chip && !['landed', 'cancelled'].includes(x.status));
+  return tasks(r).filter((x) => x.key !== except && OPEN_STATUSES.includes(x.status));
 }
 
 
@@ -1292,11 +1661,40 @@ function cmdBundle(sub, rest, flags) {
   host.decisions = uniq(members.flatMap((m) => m.decisions || []));
   host.context = uniq(members.flatMap((m) => (m.context || []).map((c) => JSON.stringify(c)))).map((x) => JSON.parse(x));
   host.needs = uniq(members.flatMap((m) => m.needs || []).filter((n) => !keys.includes(n)));
-  host.bundled = uniq([...(host.bundled || []), ...members.map((m) => ({ key: m.key, title: m.title }))
-    .filter((x) => x.key !== into).map((x) => JSON.stringify(x))]).map((x) => JSON.parse(x));
+  // Bundling twice into the same host used to throw SyntaxError out of the
+  // driver: the entries already on `host.bundled` are objects, and they were fed
+  // to JSON.parse alongside the freshly stringified new ones.
+  host.bundled = uniq([...(host.bundled || []), ...others.map((m) => ({ key: m.key, title: m.title }))]
+    .map((x) => JSON.stringify(x))).map((x) => JSON.parse(x));
   host.title = host.title + ' (+ ' + others.map((m) => m.key).join(', ') + ')';
   // the absorbed tasks are cancelled, not deleted — the record keeps them
   for (const m of others) { m.status = 'cancelled'; m.bundledInto = into; }
+  // A member's key still appears in OTHER tasks' `needs`, and nothing used to
+  // repoint them. `waves` drops a cancelled task, so a dependent was never
+  // placed and `graph` exited 1 for ever; `heldNeeds` reads a cancelled dep as
+  // not-landed, so its chip could never open. The work did not disappear — it
+  // moved to the host — so the dependency moves with it.
+  const absorbed = new Set(others.map((m) => m.key));
+  const repointed = [];
+  for (const t of tasks(r)) {
+    if (absorbed.has(t.key) || !(t.needs || []).some((n) => absorbed.has(n))) continue;
+    t.needs = uniq(t.needs.map((n) => (absorbed.has(n) ? into : n))).filter((n) => n !== t.key);
+    repointed.push(t.key);
+  }
+  // A pre-flight gap belongs to the files, not to the key that happened to own
+  // them. Left behind on a cancelled member it stops being read, and `preflight
+  // check` — which skips cancelled tasks — flipped from red to green because
+  // the work was renamed rather than done.
+  const pfs = members.map((m) => m.preflight).filter(Boolean);
+  const neverFlown = members.filter((m) => !m.preflight).map((m) => m.key);
+  if (pfs.length) {
+    host.preflight = {
+      at: now(),
+      missing: uniq(pfs.flatMap((p) => p.missing || []).map((x) => JSON.stringify(x))).map((x) => JSON.parse(x)),
+      verify: uniq(pfs.flatMap((p) => p.verify || []).map((x) => JSON.stringify(x))).map((x) => JSON.parse(x)),
+      notes: pfs.map((p) => p.notes).filter(Boolean).join('\n'),
+    };
+  }
   // Everything else about a member moved to the host; its open problems and its
   // owed items have to move too, or they stay filed against a key nobody is
   // building. The brief is written from the host's record, so an unmoved defect
@@ -1316,6 +1714,14 @@ function cmdBundle(sub, rest, flags) {
   console.log('  ' + others.length + ' task(s) marked cancelled and recorded as absorbed — nothing was deleted.');
   if (moved.defects.length) console.log('  moved to ' + into + ': open defect(s) ' + moved.defects.join(' ') + ' — they are that agent\'s to fix now.');
   if (moved.owed.length) console.log('  moved to ' + into + ': owed item(s) ' + moved.owed.join(' ') + ' — put them in the brief.');
+  if (repointed.length) console.log('  repointed at ' + into + ': ' + repointed.join(', ') +
+    ' waited on an absorbed key. Without this they wait for ever on a cancelled task.');
+  const openGaps = (host.preflight?.missing || []).filter((m) => m.loadBearing &&
+    !(host.owns || []).some((o) => coveredBy(o, m.path)));
+  if (pfs.length) console.log('  carried across: ' + (host.preflight.missing || []).length +
+    ' pre-flight gap(s)' + (openGaps.length ? ', ' + openGaps.length + ' of them load-bearing and still outside `owns`' : ''));
+  if (neverFlown.length) console.log('  ⚠ never pre-flighted: ' + neverFlown.join(', ') +
+    ' — the host now owns their files on nobody\'s word. Run `preflight brief ' + into + '`.');
   console.log('\nRe-run `graph` and `preflight brief ' + into + '` — the brief now covers all of it.');
 }
 
@@ -1406,8 +1812,15 @@ function ensureSlotWrapper() {
 // behind each other for no reason.
 const HEAVY = /\b(pytest|jest|vitest|mocha|test|e2e|playwright|cypress|migrate|alembic|docker|compose|build|bundle|webpack|vite build|tsc --build|gradle|mvn|cargo (test|build)|make)\b/i;
 const LIGHT = /\b(ruff|eslint|prettier|black|isort|flake8|mypy|pyright|tsc --noEmit|typecheck|fmt|lint|shellcheck|actionlint)\b/i;
+// Installing dependencies is as heavy as anything here — it saturates the network,
+// rewrites a shared store and can churn gigabytes of disk — and none of the words
+// above appear in it, so `pnpm install` used to read as LIGHT and every agent was
+// told to run one bare and in parallel. That is precisely the stampede the slot
+// exists to stop, so installs are named outright and they outrank LIGHT.
+const INSTALL = /\b(?:pnpm|npm|yarn|bun)\s+(?:ci|install|add|i)\b|\bpip3?\s+install\b|\bpoetry\s+(?:install|lock|sync)\b|\buv\s+(?:sync|lock|pip\s+install)\b|\bbundle\s+install\b|\bcargo\s+(?:fetch|vendor)\b|\bgo\s+mod\s+download\b|\bcomposer\s+install\b/i;
 function needsSlot(cmd) {
   const c = String(cmd);
+  if (INSTALL.test(c)) return true;
   if (LIGHT.test(c) && !HEAVY.test(c)) return false;
   return HEAVY.test(c) || /\bpnpm (run )?(test|build)\b|\bnpm (run )?(test|build)\b/.test(c);
 }
@@ -1415,13 +1828,40 @@ function needsSlot(cmd) {
 // plainly takes paths, narrow it to what this task actually owns — the same idea
 // as a path filter on a CI job.
 const PATHABLE = /\b(ruff|eslint|prettier|black|isort|flake8|mypy|shellcheck)\b/;
+// ...but only the files that tool can actually read. A task's `owns` list is
+// whatever it touches — README.md, .env.example, package.json, a lockfile, a .sh —
+// and handing those to ruff makes it parse them as Python and fail on line 1.
+const TOOL_EXTS = [
+  [/\b(?:ruff|black|isort|flake8|mypy)\b/, /\.pyi?$/],
+  [/\beslint\b/,     /\.[cm]?[jt]sx?$/],
+  [/\bshellcheck\b/, /\.(?:sh|bash|ksh|zsh)$/],
+  [/\bprettier\b/,   /\.(?:[cm]?[jt]sx?|json|ya?ml|md|css|s[ac]ss|html)$/],
+];
+// And the tool's cwd is not always the repo root. `uv --directory apps/api run ruff
+// check .` puts ruff in apps/api, while `owns` is repo-relative — so the paths have
+// to be re-based onto that directory, and anything outside it dropped, or the tool
+// is handed names that do not exist and reports a clean run over nothing.
+const CWD_PREFIX = [/--directory[= ]([^\s]+)/, /--prefix[= ]([^\s]+)/, /\bcd\s+([^\s;&|]+)\s*&&/, /\s-C\s+([^\s]+)/];
+const shPathArg = (p) => /^[\w@./+-]+$/.test(p) ? p : "'" + p.replace(/'/g, "'\\''") + "'";
 function scopeToOwned(cmd, owns) {
   const c = String(cmd).trim();
   if (!PATHABLE.test(c)) return c;                     // not a tool that takes paths
   if (!/\s\.\s*$/.test(c)) return c;                    // only rewrite an explicit whole-tree "."
-  const paths = (owns || []).filter((o) => o && !o.includes('*'));
+  let paths = (owns || []).filter((o) => o && !o.includes('*'));
+  const ext = (TOOL_EXTS.find(([tool]) => tool.test(c)) || [])[1];
+  if (ext) paths = paths.filter((p) => ext.test(p));
+  for (const re of CWD_PREFIX) {
+    const m = re.exec(c);
+    if (!m) continue;
+    const base = m[1].replace(/^\.\//, '').replace(/\/+$/, '') + '/';
+    if (base === '/' || base === './') break;
+    paths = paths.filter((p) => p.startsWith(base)).map((p) => p.slice(base.length));
+    break;
+  }
+  // Nothing of ours that this tool can read: leave the whole-tree check alone
+  // rather than narrow it down to an empty argument list that passes vacuously.
   if (!paths.length) return c;
-  return c.replace(/\s\.\s*$/, ' ' + paths.join(' '));
+  return c.replace(/\s\.\s*$/, ' ' + paths.map(shPathArg).join(' '));
 }
 
 function depOf(r, key) { return tasks(r).find((x) => x.key === key) || null; }
@@ -1760,7 +2200,10 @@ function cmdPreflightCheck(flags) {
   if (n === undefined) {
     // the round you are about to open: first one holding a task with no chip yet
     const ws = waves(r).filter((w) => w.wave >= 0);
-    const cand = ws.find((w) => w.tasks.some((t) => !t.chip && !['landed', 'cancelled'].includes(t.status)));
+    // "not handed out yet" is a status, not the presence of a chip id — the id
+    // is optional bookkeeping, and reading it here picked the wrong round
+    // whenever one had not been passed.
+    const cand = ws.find((w) => w.tasks.some((t) => t.status === 'planned'));
     n = cand ? cand.wave : currentWave(r);
   }
   const st = waveState(r, n);
@@ -1881,6 +2324,48 @@ function cmdDoctor() {
     console.log('✗ ' + t.key);
     for (const x of probs) console.log('    ' + x);
   }
+  // `task add` refuses a new claim on a path some other open task already owns.
+  // Nothing ever looked at what was already on record, and on a real run 52 of
+  // 203 owned paths turned out to be claimed twice, one of them seven times.
+  // This is the only place that says so.
+  const open = tasks(r).filter((t) => !['landed', 'cancelled'].includes(t.status));
+  const dup = [];
+  for (let i = 0; i < open.length; i++) for (let j = i + 1; j < open.length; j++) {
+    const o = overlap(open[i], open[j]);
+    if (o.length) dup.push(open[i].key + ' ↔ ' + open[j].key + '   ' + o.join('; '));
+  }
+  if (dup.length) {
+    bad += dup.length;
+    console.log('✗ ' + dup.length + ' pair(s) of open tasks claim the same path:');
+    for (const x of dup.slice(0, 40)) console.log('    ' + x);
+    if (dup.length > 40) console.log('    … and ' + (dup.length - 40) + ' more.');
+    console.log('    Ownership is the rule everything else rests on. Narrow one side of each pair,');
+    console.log('    or make one wait for the other — they cannot both be handed out.');
+  }
+  // Duplicates where one side has already merged are history, not a gate — but
+  // the count says how often the rule was broken while nothing was checking.
+  const everything = tasks(r).filter((t) => t.status !== 'cancelled');
+  let past = 0;
+  for (let i = 0; i < everything.length; i++) for (let j = i + 1; j < everything.length; j++)
+    if ((everything[i].status === 'landed' || everything[j].status === 'landed') &&
+        overlap(everything[i], everything[j]).length) past++;
+  if (past) console.log('· ' + past + ' further pair(s) share a path with work that has already landed — history, not a gate.');
+  // A serialisation point is a claim about something two tasks share. One named
+  // by a single task is either a typo for somebody else's spelling, or a note
+  // that gates nothing — and it reads, wrongly, like a live constraint.
+  const byPoint = new Map();
+  for (const t of open) for (const s of t.serialises || []) {
+    const e = byPoint.get(normPoint(s)) || { keys: new Set(), spellings: new Set() };
+    e.keys.add(t.key); e.spellings.add(s);
+    byPoint.set(normPoint(s), e);
+  }
+  const lone = [...byPoint.entries()].filter(([, e]) => e.keys.size === 1);
+  if (lone.length) {
+    console.log('· ' + lone.length + ' serialisation point(s) only one task names:');
+    for (const [, e] of lone) console.log('    ' + [...e.spellings][0] + '   (' + [...e.keys][0] + ' alone)');
+    console.log('    A point nobody else claims gates nothing. Either another task should be naming');
+    console.log('    it — check the spelling against theirs — or it does not belong in `serialises`.');
+  }
   // An owed item outlives the task it was assigned to, and nothing else looks.
   const shut = allShutWindows(r);
   if (shut.length) {
@@ -1955,12 +2440,13 @@ function openDefects(r, key) {
 function cmdDefect(sub, rest, flags) {
   const r = readReg();
   if (sub === 'add') {
-    if (typeof flags.what !== 'string' || !flags.what.trim()) die('defect add --task <key> --kind <' + DEFECT_KINDS.join('|') + '> --what "..." [--evidence "..."] [--not-blocking]');
+    const what = strFlag(flags, 'what', 'defect add --task <key> --kind <' + DEFECT_KINDS.join('|') + '> --what "..." [--evidence "..."] [--not-blocking]');
     const kind = flags.kind || 'bug';
     if (!DEFECT_KINDS.includes(kind)) die('--kind must be one of: ' + DEFECT_KINDS.join(', '));
     if (flags.task !== undefined) { if (typeof flags.task !== 'string') die('--task needs a key'); getTask(r, flags.task); }
-    const d = recordDefect(r, { task: flags.task || '', kind, what: flags.what,
-                                evidence: typeof flags.evidence === 'string' ? flags.evidence : '',
+    const d = recordDefect(r, { task: flags.task || '', kind, what,
+                                evidence: flags.evidence === undefined ? ''
+                                  : strFlag(flags, 'evidence', '--evidence was given with nothing in it — leave it off, or say what you saw'),
                                 blocking: !flags['not-blocking'] });
     commit(r);
     console.log(d.id + '  ' + d.kind + (d.task ? '  ' + d.task : '') + (d.blocking ? '  (blocking)' : ''));
@@ -2006,7 +2492,14 @@ function cmdOwed(sub, rest, flags) {
   } else if (sub === 'assign') {
     const o = owedList(r).find((x) => x.id === rest[0]); if (!o) die('no owed item ' + rest[0]);
     if (!flags.to) die('need --to <task key>');
-    getTask(r, flags.to); o.to = flags.to; commit(r);
+    // Assigning to work that is over is how an item is lost while looking
+    // settled: `owed list` shows it SHUT again the moment it is written, and the
+    // advice printed here — put it in that task's brief — cannot be followed.
+    const carrier = getTask(r, flags.to);
+    if (['landed', 'cancelled'].includes(carrier.status))
+      die(flags.to + ' is ' + carrier.status + ' — its window is already shut, so it cannot carry ' +
+        o.id + '.\n       Assign it to work that is still open (`frontier` says which), or settle it: owed done ' + o.id);
+    o.to = flags.to; commit(r);
     console.log(o.id + ' → ' + flags.to + '. Put it in that task\'s brief — an assignment the agent never sees is not one.');
   } else if (sub === 'done') {
     const o = owedList(r).find((x) => x.id === rest[0]); if (!o) die('no owed item ' + rest[0]);
@@ -2042,39 +2535,127 @@ function cmdOwed(sub, rest, flags) {
 function slotLockPath(name) {
   const d = path.join(path.dirname(REG_PATH), 'slots');
   fs.mkdirSync(d, { recursive: true });
+  // A steal that is killed between the rename and the delete leaves the carried-off
+  // claim behind. It holds nothing and nothing reads it, so sweep the old ones.
+  try {
+    for (const f of fs.readdirSync(d)) {
+      if (!f.includes('.evicted.')) continue;
+      const p = path.join(d, f);
+      if (Date.now() - fs.statSync(p).mtimeMs > 600000) fs.rmSync(p, { recursive: true, force: true });
+    }
+  } catch { /* best effort */ }
   return path.join(d, slug(name) + '.lock');
 }
 function slotHolder(lock) {
   try { return JSON.parse(fs.readFileSync(path.join(lock, 'holder.json'), 'utf8')); } catch { return null; }
 }
-function slotTryTake(name, task) {
+// Every claim carries a token nobody else can guess. It is what makes "free this
+// slot" mean "free the claim I took" rather than "delete whatever is at that path"
+// — the difference between a process tidying up after itself and an evicted one
+// wiping out the run that replaced it.
+function slotToken() {
+  return crypto.randomBytes(9).toString('hex') + '-' + process.pid;
+}
+// `manual` marks a claim taken by `slot take`, where the process that wrote the
+// claim exits immediately by design. Judging such a claim by whether its pid is
+// still alive declares it dead a moment after it is made, which is no exclusion
+// at all — so a manual take records no pid to check and lives on the time limit.
+function slotTryTake(name, task, { manual = false } = {}) {
   const lock = slotLockPath(name);
   try { fs.mkdirSync(lock, { recursive: false }); } catch { return null; }
-  fs.writeFileSync(path.join(lock, 'holder.json'), JSON.stringify({
-    pid: process.pid, host: os.hostname(), task: task || '', since: now(),
-  }, null, 2) + '\n');
-  return lock;
+  const claim = {
+    token: slotToken(), manual: !!manual, pid: manual ? null : process.pid,
+    host: os.hostname(), task: task || '', since: now(),
+  };
+  // Written by rename so a waiter never reads a half-written claim and mistakes
+  // it for the "holder unknown" leftover case.
+  const tmp = path.join(lock, 'holder.json.tmp');
+  fs.writeFileSync(tmp, JSON.stringify(claim, null, 2) + '\n');
+  fs.renameSync(tmp, path.join(lock, 'holder.json'));
+  return { lock, token: claim.token };
 }
+// Never steal from a holder we can prove is alive. A suite that legitimately runs
+// past the time limit is still running: taking its slot away starts a second one
+// beside it, which is the crash this whole mechanism exists to prevent. So the
+// liveness question is asked FIRST, and the time limit applies only to a holder
+// whose liveness cannot be established — a different host, or no pid to check.
 function slotIsStale(lock, staleMs) {
   const h = slotHolder(lock);
   if (!h) { try { return Date.now() - fs.statSync(lock).mtimeMs > 10000; } catch { return false; } }
-  if (Date.now() - Date.parse(h.since || 0) > staleMs) return true;
-  if (h.host === os.hostname() && h.pid) {
+  if (h.pid && h.host === os.hostname()) {
     try { process.kill(h.pid, 0); return false; } catch (e) { return e.code === 'ESRCH'; }
+    // EPERM means the process is there and owned by someone else: alive, not ours to judge.
   }
-  return false;
+  return Date.now() - Date.parse(h.since || 0) > staleMs;
+}
+// Take a stale claim away by renaming the whole lock directory out of the path.
+// Rename is atomic and only one racer can win it, so two waiters cannot both
+// conclude they evicted the holder and both proceed — which check-then-rmSync let
+// them do. The token we judged is checked against what we actually carried off;
+// if a fresh claim slipped in between the judgement and the rename, it is put
+// straight back and we go on waiting.
+function slotSteal(lock, judgedToken) {
+  const carried = lock + '.evicted.' + process.pid + '.' + Date.now();
+  try { fs.renameSync(lock, carried); } catch { return false; }   // someone else got there first
+  const got = slotHolder(carried);
+  if (got && judgedToken && got.token !== judgedToken) {
+    try {                                       // not the claim we judged — hand it back
+      fs.mkdirSync(lock, { recursive: false });
+      fs.renameSync(path.join(carried, 'holder.json'), path.join(lock, 'holder.json'));
+      fs.rmSync(carried, { recursive: true, force: true });
+      return false;
+    } catch {
+      console.error('slot: a claim changed hands mid-eviction and could not be restored.');
+    }
+  }
+  fs.rmSync(carried, { recursive: true, force: true });
+  return true;
+}
+// Free only what we hold. `expect` is the token from our own take; if the claim
+// sitting there now is somebody else's, we were evicted long ago and deleting it
+// would drop a live run's protection on the floor.
+function slotDrop(lock, expect) {
+  const h = slotHolder(lock);
+  if (expect && h && h.token && h.token !== expect) return false;
+  try { fs.rmSync(lock, { recursive: true, force: true }); } catch { /* already gone */ }
+  return true;
 }
 function describeHolder(lock) {
   const h = slotHolder(lock);
   if (!h) return 'held (holder unknown — claim being written, or leftover)';
   const mins = Math.round((Date.now() - Date.parse(h.since || 0)) / 60000);
-  return 'held by ' + (h.task || 'pid ' + h.pid) + ' on ' + h.host + ' for ' + mins + ' min';
+  return 'held by ' + (h.task || (h.pid ? 'pid ' + h.pid : 'a manual take')) + ' on ' + h.host +
+         ' for ' + mins + ' min' + (h.manual ? ' (taken by hand)' : '');
+}
+
+// The command after `--` is handed to bash, so every word has to be quoted or a
+// path with a space becomes two arguments. But quoting the FIRST word turns a
+// leading `FOO=1` into a command named "FOO=1" — and the register is full of
+// verify lines in exactly that shape, so `slot run ci -- FOO=1 ./scripts/test`
+// died with "FOO=1: command not found" before it ran anything at all.
+//
+// Shell grammar says a leading run of NAME=value words are assignments and the
+// first word that is not one is the command, so reproduce that: keep the names
+// bare, quote the values, quote everything after.
+const SH_ASSIGN = /^([A-Za-z_][A-Za-z0-9_]*)=([\s\S]*)$/;
+const shq = (s) => "'" + String(s).replace(/'/g, "'\\''") + "'";
+function bashCommandLine(raw) {
+  const words = raw.map(String);
+  const out = [];
+  let i = 0;
+  for (; i < words.length; i++) {
+    const m = SH_ASSIGN.exec(words[i]);
+    if (!m) break;
+    out.push(m[1] + '=' + shq(m[2]));
+  }
+  for (; i < words.length; i++) out.push(shq(words[i]));
+  return out.join(' ');
 }
 
 function cmdSlot(sub, rest, flags, raw) {
   const name = rest[0] || 'ci';
   const lock = slotLockPath(name);
-  const staleMs = (Number(flags.stale) > 0 ? Number(flags.stale) : 30) * 60000;
+  const staleMs = (numFlag(flags, 'stale', { min: 1, what: 'a whole number of minutes' }) ?? 30) * 60000;
 
   if (sub === 'status') {
     const d = path.dirname(lock);
@@ -2085,17 +2666,27 @@ function cmdSlot(sub, rest, flags, raw) {
   }
   if (sub === 'free') {
     if (!fs.existsSync(lock)) return console.log(name + ' is already free.');
-    if (!flags.force && !slotIsStale(lock, staleMs))
+    const held = slotHolder(lock);
+    // The `--force` guard exists for one case: a `slot run` holder with a live
+    // command inside it. A claim taken by hand has no run inside it — the process
+    // that took it exited on purpose — so freeing one plainly is the normal path
+    // and does not need the flag whose refusal is the load-bearing part.
+    const byHand = !!(held && held.manual);
+    if (!flags.force && !byHand && !slotIsStale(lock, staleMs))
       die(name + ' is ' + describeHolder(lock) + " — its run may be inside it right now.\n" +
           '       Freeing under a live run causes the exact crash the slot exists to stop.\n' +
           '       If you are certain the holder is gone: slot free ' + name + ' --force');
-    fs.rmSync(lock, { recursive: true, force: true });
+    // Drop the claim we just looked at, not whatever happens to be at that path by
+    // the time the rm runs — otherwise a slow decision deletes somebody's fresh run.
+    if (!slotDrop(lock, held && held.token))
+      return console.log(name + ' changed hands while we looked — it is now ' + describeHolder(lock) + ', left alone.');
     console.log(name + ' freed.');
     return;
   }
   if (sub === 'take') {
-    const got = slotTryTake(name, flags.task);
-    if (got) return console.log(name + ' taken. You MUST free it when done: slot free ' + name + ' --force');
+    const got = slotTryTake(name, flags.task, { manual: true });
+    if (got) return console.log(name + ' taken. Free it the moment you are done: slot free ' + name +
+      '\n(--force is only for a slot whose holder you know is gone — do not reach for it by habit.)');
     die(name + ' is ' + describeHolder(lock) + '. Prefer `slot run` — it frees itself.');
   }
   if (sub === 'wait' || sub === 'run') {
@@ -2107,9 +2698,11 @@ function cmdSlot(sub, rest, flags, raw) {
     for (;;) {
       mine = slotTryTake(name, flags.task);
       if (mine) break;
+      const held = slotHolder(lock);
       if (slotIsStale(lock, staleMs)) {
-        console.error('slot ' + name + ': holder is dead or over the ' + Math.round(staleMs / 60000) + ' min limit — taking over.');
-        fs.rmSync(lock, { recursive: true, force: true });
+        if (slotSteal(lock, held && held.token))
+          console.error('slot ' + name + ': holder is gone, or unreachable and over the ' +
+                        Math.round(staleMs / 60000) + ' min limit — taking over.');
         continue;
       }
       if (Date.now() - t0 > timeoutMs)
@@ -2119,11 +2712,13 @@ function cmdSlot(sub, rest, flags, raw) {
       // ~10s with jitter, so a crowd of waiters does not stampede the same instant
       try { execSync('sleep ' + (8 + Math.floor(Math.random() * 5))); } catch { /* keep waiting */ }
     }
-    const free = () => { try { fs.rmSync(mine, { recursive: true, force: true }); } catch { /* gone */ } };
+    // Free our own claim by its token. If we were evicted while the suite ran, the
+    // lock now belongs to whoever replaced us and is not ours to delete.
+    const free = () => { try { slotDrop(mine.lock, mine.token); } catch { /* gone */ } };
     if (sub === 'wait') { free(); return console.log(name + ' became free.'); }
     process.on('exit', free);
     for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(sig, () => { free(); process.exit(130); });
-    const q = raw.map((x) => "'" + String(x).replace(/'/g, "'\\''") + "'").join(' ');
+    const q = bashCommandLine(raw);
     console.error('slot ' + name + ': taken — running: ' + raw.join(' '));
     const res = spawnSync('/bin/bash', ['-c', q], { stdio: 'inherit', cwd: process.cwd() });
     free();
@@ -2326,7 +2921,17 @@ function cmdChip(key, flags) {
   const r = readReg(); const t = getTask(r, key);
   if (['landed', 'reported', 'cancelled'].includes(t.status))
     die(key + ' is ' + t.status + ' — a chip cannot rewind it. If this is really meant to run again, that is a new task.');
-  if (!t.chip) {
+  // The record has to be able to say which chip is which — without it there is
+  // no way back from a key to the thing actually running the work.
+  if (!t.chip && !flags.id)
+    die('chip ' + key + ' --id <task_id> — the chip id is how the record points at the running\n' +
+        '       agent. Take it from the tool that created the chip. Add --worktree <path> too if\n' +
+        '       the copy it works in is not the branch\'s own worktree.');
+  // Both gates below used to sit behind `if (!t.chip)`, so re-pointing a chip ran
+  // no check at all — and what a task owns can widen after its first chip, by
+  // `preflight done` or by a later `task add`. The second call is exactly when
+  // the answer may have changed, so it is the last call that may skip it.
+  {
     const pending = heldNeeds(r, t);
     if (pending.length) {
       console.error('✗ ' + key + ' still waits for ' + pending.join(', ') + ' to land.');
@@ -2349,6 +2954,9 @@ function cmdChip(key, flags) {
   }
   if (flags.id) t.chip = flags.id;
   if (flags.worktree) t.worktree = flags.worktree;
+  // --branch used to be accepted and then dropped on the floor, so `guard` and
+  // `release` went looking for a branch nobody had ever created.
+  if (flags.branch) t.branch = flags.branch;
   const held = heldNeeds(r, t);
   t.status = held.length ? 'held' : 'ready';
   commit(r);
@@ -2365,10 +2973,17 @@ function cmdAgent(key, flags) {
   const r = readReg(); const t = getTask(r, key);
   if (!flags.name) die('need --name <peer name it checked in from>');
   t.agent = flags.name;
-  if (t.status === 'planned') t.status = (t.needs || []).some((n) => getTask(r, n).status !== 'landed') ? 'held' : 'ready';
+  // heldNeeds treats a requirement that is not on record as unlanded and names
+  // it. Reading it with getTask instead used to abort the whole command with
+  // "no task X (have: ...)", which reads like the task being checked in is the
+  // one that does not exist.
+  const stillHeld = heldNeeds(r, t);
+  if (t.status === 'planned') t.status = stillHeld.length ? 'held' : 'ready';
   commit(r);
   console.log(key + ' is reachable at ' + t.agent + '  (' + t.status + ')');
-  const stillHeld = (t.needs || []).filter((n) => getTask(r, n).status !== 'landed');
+  const missing = (t.needs || []).filter((n) => !depOf(r, n));
+  if (missing.length) console.log('⚠ it waits on ' + missing.join(', ') + ', which ' +
+    (missing.length > 1 ? 'are' : 'is') + ' not on record — a typo, or a task never added. Fix `needs`.');
   if (stillHeld.length) console.log('Reply to it now: you are on hold until ' + stillHeld.join(', ') + ' land. Do not start.');
 }
 
@@ -2410,8 +3025,20 @@ function cmdRelease(key) {
 }
 
 const OUTCOMES = ['passed', 'partial', 'failed'];
+// `chip`, `release` and `landed` all refuse to move a task that is not in a
+// state the move makes sense from. `done` did not, and it is the one command an
+// agent runs itself: a report on a landed task rewound it to `reported` while
+// keeping its landedAt, and a report on a task nobody had ever handed out was
+// accepted as if there were work behind it.
+const REPORTABLE = ['held', 'ready', 'reported'];
 function cmdDone(key) {
   const r = readReg(); const t = getTask(r, key);
+  if (!REPORTABLE.includes(t.status))
+    die(key + ' is "' + t.status + '" — ' + (t.status === 'planned'
+      ? 'it has never been handed out, so there is no work to report on.\n' +
+        '       Create the chip first: driver.mjs chip ' + key + ' --id <task_id>'
+      : 'a report cannot rewind finished work. If this is really meant to run\n' +
+        '       again, that is a new task.'));
   const rep = stdinJson();
   // This one is run by the chip's own process, so it takes untrusted input.
   if (rep === null || typeof rep !== 'object' || Array.isArray(rep))
@@ -2446,21 +3073,50 @@ function worktreeFor(t) {
   return null;
 }
 
+// git, run as an argument vector rather than a shell string. Nothing here is
+// interpolated into a command line: a branch name arrives from agent-authored
+// `task add < json`, and as a shell string one called `main; touch /tmp/PWNED`
+// did exactly that. `-z` also stops core.quotePath mangling any path that is
+// not ASCII, which used to be recorded as a blocking trespass defect.
+function gitZ(args, cwd) {
+  return execFileSync('git', ['-c', 'core.quotePath=false', ...args],
+    { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).split('\0');
+}
+// `main` was hardcoded, so guard was unusable in any repo whose default branch
+// is called something else. Ask the repo what its integration branch is.
+function defaultBase() {
+  for (const ref of ['refs/remotes/origin/HEAD', 'HEAD']) {
+    try {
+      const out = execFileSync('git', ['symbolic-ref', '--short', '-q', ref],
+        { cwd: CWD, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+      if (out) return out.replace(/^origin\//, '');
+    } catch { /* not set, or not a repo */ }
+  }
+  return 'main';
+}
+
 function cmdGuard(key, flags) {
   const r = readReg(); const t = getTask(r, key);
   const wt = worktreeFor(t);
   if (!wt) die('cannot find a copy of the repository on branch ' + t.branch +
     '\n       Record it: driver.mjs chip ' + key + ' --worktree <path>');
-  const base = flags.base || 'main';
+  const base = flags.base || defaultBase();
+  for (const [what, v] of [['--base', base], ['the branch', t.branch]])
+    if (!v || v.startsWith('-')) die(what + ' is not a usable git ref: "' + v + '"');
+  // --no-renames matters: with renames detected, `git diff --name-only` prints
+  // only a rename's destination. `git mv other/config.ts src/config.ts` deletes
+  // a file this task does not own, and guard used to call that clean.
+  const range = base + '...' + t.branch;
+  const cmdText = 'git diff --no-renames -z --name-only ' + range;
   let changed;
   try {
-    changed = execSync('git diff --name-only ' + base + '...' + t.branch, { cwd: wt, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })
-      .split('\n').map((x) => x.trim()).filter(Boolean);
-  } catch (e) { die('could not diff ' + base + '...' + t.branch + ' in ' + wt); }
+    changed = gitZ(['diff', '--no-renames', '-z', '--name-only', range, '--'], wt)
+      .map((x) => x.trim()).filter(Boolean);
+  } catch (e) { die('could not diff ' + range + ' in ' + wt + '\n       (is "' + base + '" a branch this repo has? pass --base <ref> if not)'); }
   if (!changed.length) {
     const d = recordDefect(r, { task: key, kind: 'guard',
       what: key + ' reported finished but its branch changed nothing against ' + base,
-      evidence: 'git diff --name-only ' + base + '...' + t.branch + ' → empty', blocking: true });
+      evidence: cmdText + ' → empty', blocking: true });
     commit(r);
     console.log('⚠ ' + key + ' changed nothing at all against ' + base + '. That is not finished work.');
     console.log('  recorded ' + d.id + '. Ask which branch it committed to — do not go looking yourself.');
@@ -2489,11 +3145,21 @@ function cmdGuard(key, flags) {
 function cmdLanded(key, flags) {
   const r = readReg(); const t = getTask(r, key);
   if (t.status !== 'reported') die(key + ' is "' + t.status + '" — it cannot land before it reports finished');
+  // Landing on top of an unlanded requirement puts work in the main line that
+  // was built without the thing it was told to build on.
+  const held = heldNeeds(r, t);
+  if (held.length) {
+    console.error('✗ ' + key + ' cannot land — it waits for ' + held.join(', ') + ', and ' +
+      (held.length > 1 ? 'those have' : 'that has') + ' not landed.');
+    console.error('  Whatever it built, it built without them. Land them first, or fix `needs` if');
+    console.error('  the requirement is not real.');
+    process.exit(1);
+  }
   t.status = 'landed'; t.landedAt = now();
   t.landedSha = flags.sha || '';
   // No checkpoint is destroyed by a landing. The new work is simply not covered
   // by any run yet, which `frontier` and `digest` report as drift.
-  const un = unprovenLanded(r).length + 1;
+  const un = unprovenLanded(r).length;   // t is already landed above, so it is counted
   if (un > 1) console.log(un + ' landing(s) now sit beyond the last checkpoint.');
   if (!t.landedSha) console.log('(no --sha given: a released chip cannot then prove its copy carries this work)');
   // Anything owed on this task can no longer be done by it. Stamp when the
@@ -2524,9 +3190,18 @@ function cmdLanded(key, flags) {
 function trespass(r) {
   let out = [];
   try {
-    const dirty = execSync('git status --porcelain', { cwd: CWD, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })
-      .split('\n').map((l) => l.slice(3).trim()).filter(Boolean)
-      .map((l) => l.includes(' -> ') ? l.split(' -> ')[1] : l);
+    // -z, so a non-ASCII path is not handed back quoted and mangled, and so a
+    // rename's two halves arrive as two records instead of one " -> " line.
+    // Both halves count: renaming a file away is changing it.
+    const parts = gitZ(['status', '--porcelain', '-z'], CWD);
+    const dirty = [];
+    for (let i = 0; i < parts.length; i++) {
+      const e = parts[i];
+      if (!e) continue;
+      const xy = e.slice(0, 2), p = e.slice(3).trim();
+      if (p) dirty.push(p);
+      if (/[RC]/.test(xy)) { const src = (parts[++i] || '').trim(); if (src) dirty.push(src); }
+    }
     for (const f of dirty) for (const t of tasks(r)) {
       if ((t.owns || []).some((o) => collides(f, o))) out.push({ file: f, key: t.key });
     }
@@ -2554,132 +3229,6 @@ function ledger() {
     try { return JSON.parse(l); } catch { return null; }
   }).filter(Boolean);
 }
-
-
-// ------------------------------------------------------------- message store
-// The old ledger had the orchestrator retype what an agent said, which put the
-// payload through a context that gets compacted — so a question could be lost
-// entirely, or logged as a paraphrase. Now the sender writes the file, from its
-// own process, before the orchestrator's context ever sees it. Messages are
-// immutable files; being handled is a separate sidecar file, so nothing is ever
-// rewritten and two writers can never collide.
-function msgDir() { return orchDir('messages'); }
-function newMsgId(key) {
-  const stamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\..+/, '');
-  return stamp + '-' + slug(key || 'x').slice(0, 20) + '-' + crypto.randomBytes(3).toString('hex');
-}
-// tmp + rename: a half-written message is never visible to a reader
-function writeMsg(m) {
-  const dir = msgDir();
-  const f = path.join(dir, m.id + '.json');
-  const tmp = path.join(dir, '.' + m.id + '.tmp');
-  fs.writeFileSync(tmp, JSON.stringify(m, null, 2) + '\n');
-  fs.renameSync(tmp, f);
-  return f;
-}
-function allMsgs() {
-  const dir = msgDir();
-  return fs.readdirSync(dir).filter((f) => f.endsWith('.json') && !f.endsWith('.ack.json'))
-    .sort()
-    .map((f) => {
-      try {
-        const m = JSON.parse(fs.readFileSync(path.join(dir, f), 'utf8'));
-        m.acked = fs.existsSync(path.join(dir, m.id + '.ack.json'))
-          ? JSON.parse(fs.readFileSync(path.join(dir, m.id + '.ack.json'), 'utf8')) : null;
-        return m;
-      } catch { return null; }
-    }).filter(Boolean);
-}
-const NEEDS_REPLY = ['question', 'blocked', 'report', 'checkin'];
-
-// Run by the AGENT, from its own process. Body comes in on stdin so nothing is
-// shortened to fit a flag, and the register is only read, never locked.
-function cmdPost(key, flags) {
-  const r = readRegRO();
-  if (!tasks(r).some((t) => t.key === key))
-    die('no task "' + key + '" on record — check the key in your brief.');
-  const kind = flags.kind || 'note';
-  if (!IN_KINDS.includes(kind)) die('--kind must be one of: ' + IN_KINDS.join(', '));
-  let body = '';
-  try { body = fs.readFileSync(0, 'utf8'); } catch { /* none */ }
-  if (!body.trim()) die('the message body goes on stdin:\n' +
-    "       driver.mjs post " + key + " --kind " + kind + " <<'EOF'\n       ...what you want to say...\n       EOF");
-  const m = { id: newMsgId(key), at: now(), dir: 'in', key, kind,
-              subject: flags.subject || body.trim().split('\n')[0].slice(0, 90), body: body.trimEnd() };
-  writeMsg(m);
-  console.log('posted ' + m.id);
-  console.log('');
-  console.log('Now send exactly this one line — nothing more. The orchestrator reads the message');
-  console.log('itself, from the file, so it cannot lose or shorten what you actually wrote:');
-  console.log('');
-  console.log('  [' + key + '] ' + kind + ' posted: ' + m.id + ' — ' + m.subject);
-}
-
-// Run by the ORCHESTRATOR. Composing and recording are one act, so what was
-// promised survives whether or not anyone remembers to log it afterwards.
-function recordOut(key, kind, text) {
-  const m = { id: newMsgId(key), at: now(), dir: 'out', key, kind,
-              subject: String(text).trim().split('\n')[0].slice(0, 90), body: String(text).trimEnd() };
-  writeMsg(m);
-  return m;
-}
-function cmdReply(key, flags) {
-  const r = readRegRO(); const t = tasks(r).find((x) => x.key === key);
-  if (!t) die('no task "' + key + '"');
-  let text = typeof flags.text === 'string' ? flags.text : '';
-  if (!text) { try { text = fs.readFileSync(0, 'utf8'); } catch { /* none */ } }
-  if (!text.trim()) die('reply ' + key + ' --text "..."  (or the body on stdin)');
-  const kind = flags.kind || 'reply';
-  if (!OUT_KINDS.includes(kind)) die('--kind must be one of: ' + OUT_KINDS.join(', '));
-  const m = recordOut(key, kind, text);
-  const acked = [];
-  if (flags.to) { acked.push(...String(flags.to).split(',').map((x) => x.trim()).filter(Boolean)); }
-  for (const id of acked) ackMsg(id, 'answered by ' + m.id);
-  console.log('recorded ' + m.id + (acked.length ? '  (marks ' + acked.join(', ') + ' handled)' : ''));
-  console.log('');
-  console.log('Send this to ' + (t.agent || '<no address yet>') + ':');
-  console.log('');
-  console.log(m.body);
-}
-
-function ackMsg(id, note) {
-  const f = path.join(msgDir(), id + '.json');
-  if (!fs.existsSync(f)) die('no message ' + id);
-  fs.writeFileSync(path.join(msgDir(), id + '.ack.json'),
-    JSON.stringify({ id, at: now(), note: note || '' }, null, 2) + '\n');
-}
-function cmdAck(id, flags) {
-  ackMsg(id, flags.note || '');
-  console.log(id + ' marked handled.');
-}
-
-function cmdInbox(flags) {
-  const msgs = allMsgs().filter((m) => m.dir === 'in')
-    .filter((m) => (flags.key ? m.key === flags.key : true))
-    .filter((m) => (flags.all ? true : !m.acked));
-  if (!msgs.length) return console.log(flags.all ? 'no messages.' : 'nothing unread.');
-  console.log((flags.all ? 'Every message' : 'Unread — each of these is somebody waiting') + ':\n');
-  for (const m of msgs) {
-    const age = Math.round((Date.now() - Date.parse(m.at)) / 60000);
-    console.log('  ' + m.id);
-    console.log('    ' + m.key.padEnd(10) + m.kind.padEnd(10) + age + ' min ago' + (m.acked ? '   ✓ handled' : ''));
-    console.log('    ' + m.subject);
-  }
-  console.log('\nRead one in full:  driver.mjs read <id>');
-  console.log('Answer and close:  driver.mjs reply <key> --text "..." --to <id>');
-}
-
-function cmdReadMsg(id) {
-  const m = allMsgs().find((x) => x.id === id || x.id.startsWith(id));
-  if (!m) die('no message ' + id + ' — `inbox --all` lists them');
-  console.log('id      ' + m.id);
-  console.log('from    ' + m.key + '  (' + m.dir + ', ' + m.kind + ')');
-  console.log('at      ' + m.at.slice(0, 19).replace('T', ' '));
-  console.log('handled ' + (m.acked ? 'yes — ' + (m.acked.note || '') : 'NO — it is waiting on you'));
-  console.log('');
-  console.log(m.body);
-}
-
 
 // ------------------------------------------------------- deriving the ledger
 // Logging a message by hand only works if the orchestrator remembers, and a
@@ -2718,14 +3267,29 @@ function textOf(msg) {
   return '';
 }
 
-// The task a message is about, if it names one. Longest key first so "1.9" does
-// not swallow "1.9a".
+// The task a message is about, if it names one. A message is addressed at its
+// start — "0.9 — stop, and do not write anything…" is about 0.9 — and mentions
+// come later. Walking the keys longest-first and returning the first that
+// matched ANYWHERE in the first 400 characters ignored position entirely, so
+// that message was filed under 1.8b because 1.8b happened to be named in a
+// later sentence and is one character longer; 22 real messages were filed
+// under a task they merely mentioned.
+//
+// The length sort existed so "1.9" would not swallow "1.9a", but the boundary
+// regex below already prevents that — "1.9" cannot match inside "1.9a" because
+// "a" is a word character. So the rule is simply: earliest match wins, and a
+// tie (the same position, which only a prefix could produce) goes to the
+// longer key.
 function keyIn(text, keys) {
   const head = text.slice(0, 400);
+  let best = '', at = Infinity;
   for (const k of keys) {
-    if (new RegExp('(^|[^A-Za-z0-9._-])' + k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '([^A-Za-z0-9._-]|$)').test(head)) return k;
+    const m = head.match(new RegExp('(^|[^A-Za-z0-9._-])' + k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '([^A-Za-z0-9._-]|$)'));
+    if (!m) continue;
+    const pos = m.index + m[1].length;
+    if (pos < at || (pos === at && k.length > best.length)) { at = pos; best = k; }
   }
-  return '';
+  return best;
 }
 
 // Everything outside the tags is Claude Code's own wrapper — the "Another
@@ -2747,9 +3311,52 @@ function innerMessage(text) {
 // cutting the conclusion off the end of most of them.
 const MSG_CAP = 4000;
 
+// A cut message used to be stored as `body.slice(0, MSG_CAP)` and nothing else
+// — no ellipsis, no flag, no original length — so 33 of 311 entries on the real
+// ledger ended mid-sentence and were read afterwards as complete statements.
+// The mark is in the text where a reader will see it, and the two fields say
+// exactly how much is missing so a total can be trusted.
+function capped(body) {
+  const s = String(body);
+  if (s.length <= MSG_CAP) return { text: s };
+  return { text: s.slice(0, MSG_CAP) + '\n\n… [cut at ' + MSG_CAP + ' of ' + s.length + ' characters]',
+           truncated: true, fullLength: s.length };
+}
+
+// The peer that sent a message, off the opening tag. Claude Code writes two
+// wrapper shapes and only one of them carries from-name:
+//
+//   <cross-session-message from="uds:/…/1234.sock" from-name="lms-v2-3d" …>
+//   <cross-session-message from="local_<uuid>" name="<title>" encoded="1">
+//
+// The second is what it emits when the peer channel is gone and the transcript
+// is the only surviving copy of the message — which is precisely the case
+// `ingest` exists for. Requiring from-name counted those lines as candidates
+// and then dropped them in silence, so `ingest` reported success having lost
+// them; on the real run that was 3 complete task reports, about 14.6 KB. Here
+// the name is taken from whichever attribute carries one, and `name` is kept
+// separately because on that shape it is the message's title, not the sender.
+function senderOf(openTag) {
+  const attr = (n) => { const m = openTag.match(new RegExp('\\b' + n + '="([^"]*)"')); return m ? m[1] : ''; };
+  const fromName = attr('from-name');
+  const from = attr('from');
+  return { agent: fromName || from, subject: fromName ? '' : attr('name') };
+}
+
+// Whether a transcript line was written from this run. An exact string match
+// dropped every line whose cwd was a subdirectory — and the orchestrator
+// routinely works from apps/api and the like — which on the real run cost 13
+// outbound "released, rebase now" messages, exactly the ones `waitingOn` reads
+// to decide a question has been answered.
+function underCwd(cwd) {
+  if (!cwd) return true;
+  const a = path.resolve(cwd), b = path.resolve(CWD);
+  return a === b || a.startsWith(b + path.sep);
+}
+
 function harvest(dir, keys) {
   const out = [];
-  const seen = { files: 0, lines: 0, candidates: 0, parsed: 0, wrongCwd: 0 };
+  const seen = { files: 0, lines: 0, candidates: 0, parsed: 0, wrongCwd: 0, underCwd: 0 };
   for (const f of fs.readdirSync(dir).filter((x) => x.endsWith('.jsonl'))) {
     let lines;
     try { lines = fs.readFileSync(path.join(dir, f), 'utf8').split('\n'); } catch { continue; }
@@ -2759,21 +3366,22 @@ function harvest(dir, keys) {
       seen.candidates++;
       let j; try { j = JSON.parse(line); } catch { continue; }
       seen.parsed++;
-      if (j.cwd && j.cwd !== CWD) seen.wrongCwd++;
-      if (j.cwd && j.cwd !== CWD) continue;
+      if (j.cwd && j.cwd !== CWD) { if (underCwd(j.cwd)) seen.underCwd++; else { seen.wrongCwd++; continue; } }
       if (j.type === 'user') {
         const text = textOf(j.message);
-        const env = text.match(/<cross-session-message[^>]*from-name="([^"]+)"/);
-        if (!env) continue;
+        const open = text.match(/<cross-session-message[^>]*>/);
+        if (!open) continue;
+        const who = senderOf(open[0]);
         const body = innerMessage(text);
-        out.push({ at: j.timestamp, dir: 'in', kind: 'derived', agent: env[1],
-                   key: keyIn(body, keys), text: body.slice(0, MSG_CAP), uuid: j.uuid, session: j.sessionId });
+        out.push({ at: j.timestamp, dir: 'in', kind: 'derived', agent: who.agent,
+                   key: keyIn(body, keys), ...capped(body), uuid: j.uuid, session: j.sessionId,
+                   ...(who.subject ? { summary: who.subject } : {}) });
       } else if (j.type === 'assistant' && Array.isArray(j.message && j.message.content)) {
         for (const b of j.message.content) {
           if (!b || b.type !== 'tool_use' || b.name !== 'SendMessage' || !b.input) continue;
           const body = String(b.input.message || '');
           out.push({ at: j.timestamp, dir: 'out', kind: 'derived', agent: String(b.input.to || ''),
-                     key: keyIn(body, keys), text: body.slice(0, MSG_CAP), uuid: b.id || j.uuid, session: j.sessionId,
+                     key: keyIn(body, keys), ...capped(body), uuid: b.id || j.uuid, session: j.sessionId,
                      summary: b.input.summary || '' });
         }
       }
@@ -2831,28 +3439,47 @@ function cmdIngest(flags) {
   if (flags.reclean) {
     const byUuid = new Map(found.map((e) => [e.uuid, e]));
     const cur = ledger();
-    let fixed = 0, gained = 0;
+    let fixed = 0, gained = 0, marked = 0;
     for (const e of cur) {
       const f = e.uuid && byUuid.get(e.uuid);
-      if (!f || typeof f.text !== 'string' || f.text === e.text) continue;
-      gained += f.text.length - String(e.text || '').length;
+      if (!f || typeof f.text !== 'string') continue;
+      // An entry already at the cap cannot be lengthened — the transcript
+      // yields the same cut text — but it CAN stop passing itself off as
+      // whole. Carry the marks across whether or not the text changed, and
+      // count them apart from text actually recovered, so the "+n chars"
+      // figure never claims the cut-here note as content.
+      const wasCut = !!e.truncated;
+      if (f.truncated && !wasCut) { e.truncated = true; e.fullLength = f.fullLength; marked++; }
+      if (f.text === e.text) continue;
+      const before = String(e.text || '').length;
       e.text = f.text; if (!e.key && f.key) e.key = f.key;
+      gained += (f.truncated ? MSG_CAP : f.text.length) - (wasCut ? before : Math.min(before, MSG_CAP));
       fixed++;
     }
-    if (fixed) {
+    if (fixed || marked) {
       fs.copyFileSync(ledgerPath(), ledgerPath() + '.bak');
       fs.writeFileSync(ledgerPath(), cur.map((e) => JSON.stringify(e)).join('\n') + '\n');
     }
-    recleaned = { fixed, gained };
+    recleaned = { fixed, gained, marked };
   }
   console.log('read ' + rel(dir) + '  (' + seen.files + ' transcript(s), ' + seen.candidates + ' candidate line(s))');
+  if (seen.underCwd)
+    console.log('  ' + seen.underCwd + ' from a directory under this one (a worktree or a package) — kept.');
+  if (seen.wrongCwd)
+    console.log('  ' + seen.wrongCwd + ' line(s) belong to another project entirely — skipped.');
   console.log('  ' + found.length + ' message(s) in the transcripts, ' + fresh.length + ' new to the ledger.');
   const named = fresh.filter((e) => e.key).length;
   console.log('  ' + named + ' name a task; ' + (fresh.length - named) + ' do not (still logged, just unattributed).');
+  const cut = fresh.filter((e) => e.truncated).length;
+  if (cut) console.log('  ' + cut + ' were longer than ' + MSG_CAP + ' characters and are stored cut, and marked as cut.');
   if (recleaned) {
     console.log('  re-derived ' + recleaned.fixed + ' entr(ies) already in the ledger' +
       (recleaned.fixed ? ': ' + (recleaned.gained >= 0 ? '+' : '') + recleaned.gained +
         ' chars of message text recovered, previous file kept as messages.jsonl.bak' : ' — nothing to repair'));
+    if (recleaned.marked)
+      console.log('  ' + recleaned.marked + ' entr(ies) already at the cap could not be lengthened — the transcript');
+    if (recleaned.marked)
+      console.log('  holds the same cut text — but are now marked as cut, with their true length.');
   } else if (ledger().some((e) => /^Another Claude session sent a message:/.test(String(e.text || '')))) {
     console.log('\nSome entries still carry the wrapper Claude Code puts around a message, and were');
     console.log('cut short by it. They can be derived again: `ingest --reclean`.');
@@ -2886,11 +3513,11 @@ function cmdHeard(key, flags) {
   const r = readReg(); const t = getTask(r, key);
   const kind = flags.kind || 'note';
   if (!IN_KINDS.includes(kind)) die('kind must be one of: ' + IN_KINDS.join(', '));
-  if (!flags.text) die('need --text "what they actually said"');
-  append({ dir: 'in', key, kind, agent: t.agent || '', text: flags.text });
+  const text = strFlag(flags, 'text', 'need --text "what they actually said"');
+  append({ dir: 'in', key, kind, agent: t.agent || '', text });
   t.lastHeard = now();
   let d = null;
-  if (kind === 'blocked') d = recordDefect(r, { task: key, kind: 'blocked', what: flags.text, evidence: '', blocking: true });
+  if (kind === 'blocked') d = recordDefect(r, { task: key, kind: 'blocked', what: text, evidence: '', blocking: true });
   commit(r);
   console.log('logged: ← ' + key + ' [' + kind + ']');
   if (d) console.log('  recorded ' + d.id + ' — it stays open until you run: defect fixed ' + d.id);
@@ -2930,8 +3557,14 @@ function cmdDigest() {
   if (waits.length) {
     L.push('');
     L.push('**Waiting on you:**');
-    for (const w of waits.slice(0, 8))
-      L.push('- ' + w.key + ' ' + w.why + (w.detail ? ': ' + w.detail.slice(0, 70) : ''));
+    // The same clipping `outstanding` does, and for a stronger reason: this is
+    // what a SessionStart hook feeds a freshly compacted context, so one agent
+    // report printed raw — newlines, headings, code fences and all — buried
+    // every other line here at exactly the moment they were needed most.
+    for (const w of waits.slice(0, 8)) {
+      const d = String(w.detail || '').replace(/\s+/g, ' ').trim();
+      L.push('- ' + w.key + ' ' + w.why + (d ? ': ' + d.slice(0, 70) + (d.length > 70 ? '…' : '') : ''));
+    }
     if (waits.length > 8)
       L.push('- …and ' + (waits.length - 8) + ' more. Run `outstanding` — this list is cut, not complete.');
   }
@@ -2983,11 +3616,19 @@ function waitingOn(r, log) {
     if (lastAsk) {
       // Only an actual reply answers a question. Sending the work back is a
       // rejection, not an answer — counting it as one is how an agent ends up
-      // waiting for ever on a list that says nothing is waiting.
-      const replied = mine.some((e) => e.dir === 'out' && ['reply', 'release'].includes(e.kind) && e.at > lastAsk.at);
+      // waiting for ever on a list that says nothing is waiting. A `release`
+      // was counted here for the same reason a sendback once was, and it is
+      // the same hole: telling somebody to go ahead is not telling them the
+      // thing they asked. `heard` promises the operator "only a reply clears
+      // it", and now that is what happens.
+      const replied = mine.some((e) => e.dir === 'out' && e.kind === 'reply' && e.at > lastAsk.at);
       if (!replied) {
         spokeFor = true;
-        rows.push({ key: t.key, why: 'asked you something and has had no answer',
+        // A blocked message did not ask anything — saying it did sends the
+        // operator looking for a question that was never put.
+        rows.push({ key: t.key, why: lastAsk.kind === 'blocked'
+            ? 'says it is blocked and has had nothing back'
+            : 'asked you something and has had no answer',
           detail: String(lastAsk.text || '').slice(0, 90), since: lastAsk.at });
       }
     }
@@ -3072,12 +3713,13 @@ function cmdBoard() {
   const r = readReg();
   if (!tasks(r).length) return console.log('no tasks yet');
   const ICON = { planned: '·', held: '⏸', ready: '▶', reported: '✓?', landed: '●', cancelled: '✗' };
-  console.log('key'.padEnd(14) + 'state'.padEnd(11) + 'waits for'.padEnd(14) + 'address'.padEnd(18) + 'title');
+  console.log('key'.padEnd(14) + 'state'.padEnd(11) + 'waits for'.padEnd(14) + 'address'.padEnd(26) + 'title');
   console.log('-'.repeat(90));
   for (const t of tasks(r)) {
     const held = (t.needs || []).filter((n) => { const d = tasks(r).find((x) => x.key === n); return !d || d.status !== 'landed'; });
     console.log(t.key.padEnd(14) + ((ICON[t.status] || '?') + ' ' + t.status).padEnd(11) +
-      (held.length ? held.join(',') : '—').padEnd(14) + (t.agent || 'not checked in').padEnd(18) + t.title.slice(0, 32));
+      (held.length ? held.join(',') : '—').padEnd(14) +
+      (t.agent || 'not checked in').slice(0, 24).padEnd(26) + t.title.slice(0, 32));
   }
   const n = (s) => tasks(r).filter((t) => t.status === s).length;
   console.log('\n' + n('landed') + ' landed · ' + n('reported') + ' waiting on your check · ' +
@@ -3117,18 +3759,54 @@ function cmdBoard() {
 
 const argv = process.argv.slice(2);
 const flags = {}; const rest = [];
-const BOOL_FLAGS = new Set(['stdout', 'all', 'load-bearing']);
+// Both sets are declared, because the old rule — "takes a value unless the next
+// word starts with --" — silently turned a value into `true` whenever an agent
+// wrote one that began with a dash, and silently ate a positional whenever a
+// boolean was not on the short list. Both failures reported success.
+const BOOL_FLAGS = new Set(['stdout', 'all', 'load-bearing', 'dry-run', 'force',
+  'not-blocking', 'reclean', 'check']);
+const VALUE_FLAGS = new Set(['base', 'branch', 'evidence', 'from', 'grep', 'id', 'into', 'key',
+  'kind', 'n', 'name', 'note', 'out', 'plan', 'ref', 'register', 'scope', 'session',
+  'sha', 'since', 'stale', 'status', 'subject', 'task', 'text', 'timeout', 'title',
+  'to', 'wave', 'what', 'why', 'window', 'worktree']);
+const flagName = (s) => s.startsWith('--') ? s.slice(2).split('=')[0] : null;
+const isKnownFlag = (s) => {
+  const k = flagName(s);
+  return k !== null && (BOOL_FLAGS.has(k) || VALUE_FLAGS.has(k));
+};
 const raw = [];   // everything after `--`, verbatim — the command a slot runs
 for (let i = 0; i < argv.length; i++) {
-  if (argv[i] === '--') { raw.push(...argv.slice(i + 1)); break; }
-  if (argv[i].startsWith('--')) {
-    const k = argv[i].slice(2);
-    flags[k] = (!BOOL_FLAGS.has(k) && argv[i + 1] && !argv[i + 1].startsWith('--')) ? argv[++i] : true;
-  } else rest.push(argv[i]);
+  const a = argv[i];
+  if (a === '--') { raw.push(...argv.slice(i + 1)); break; }
+  if (!a.startsWith('--')) { rest.push(a); continue; }
+  let k = a.slice(2), v;
+  const eq = k.indexOf('=');
+  if (eq >= 0) { v = k.slice(eq + 1); k = k.slice(0, eq); }
+  if (!BOOL_FLAGS.has(k) && !VALUE_FLAGS.has(k))
+    die('unknown flag --' + k + '\n       A misspelled flag used to be ignored, and the command ran on without it.');
+  if (BOOL_FLAGS.has(k)) {
+    if (v !== undefined) die('--' + k + ' is a yes/no flag and takes no value');
+    flags[k] = true; continue;
+  }
+  if (v === undefined) {
+    // Consume whatever comes next, dash or not — that is the whole point. Only a
+    // flag this driver actually knows stops it, so `--text "--force broke it"` is
+    // kept while `--text --kind note` is reported as the missing value it is.
+    if (i + 1 >= argv.length || argv[i + 1] === '--' || isKnownFlag(argv[i + 1]))
+      die('--' + k + ' needs a value.\n       If the value itself starts with --, write it as --' + k + '="--like this".');
+    v = argv[++i];
+  }
+  flags[k] = v;
 }
-if (flags.register) REG_PATH = path.resolve(CWD, flags.register);
+if (flags.register !== undefined) REG_PATH = path.resolve(CWD, flags.register);
 
 const cmd = rest.shift();
+// What the record calls this invocation. The commands below that read a second
+// word out of `rest` need that word too — `refine done` and `refine brief` are
+// different events and must not both show up as `refine`.
+const SUB_COMMANDS = new Set(['ci', 'defect', 'log', 'owed', 'preflight', 'refine', 'slot', 'task']);
+if (cmd) CMDNAME = cmd + (SUB_COMMANDS.has(cmd) && rest[0] && !rest[0].startsWith('--') ? ' ' + rest[0] : '');
+
 const HELP = `orchestrate-implementation driver — bookkeeping for a grill session.
 
   load <path|dir|glob>...   resolve plan files, record sizes. Read them yourself after.
@@ -3175,11 +3853,15 @@ driving the work out, after the grill:
   owed add|assign|done|list work only possible in a window between two pieces — record it, assign
                             it, and close no round on top of it silently.
   brief <key> [--stdout]    write the chip's brief to a file; print what to send. --all rewrites every one.
-  chip <key> --id <task_id> [--worktree p]    record the chip, set held or ready.
+  chip <key> --id <task_id> [--worktree p] [--branch b]   record the chip, set held or ready.
+                            --id is required the first time: it is how the record points at the
+                            agent actually doing the work. Refuses while the task would interfere
+                            with anything still open.
   agent <key> --name <peer>  record where a chip checked in from — without it you cannot release it.
   release <key>             refuses while a requirement has not landed; prints the release message.
   done <key>     < json     {commit, verified, notes} — a chip's own report.
   guard <key> [--base b]    diff its branch and name any file it was not allowed to touch. Exits 1.
+                            The base defaults to the repo's own default branch, not to "main".
   say <key> --kind k --text t     log what you sent (release|reply|sendback|note|hold|announce).
   heard <key> --kind k --text t   log what arrived (checkin|report|question|blocked|note).
   ingest [--from dir]       rebuild the ledger from the on-disk transcripts — both directions,

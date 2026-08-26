@@ -339,16 +339,29 @@ node driver.mjs            # every command
 
 ```
 .claude/orchestration/
-  register.json          every decision, gap and task
+  events.jsonl           the record: every change, append-only, never rewritten
+  register.json          every decision, gap and task — a projection of the above
   backups/               the last 30 states of it, kept on every write
+  archive/tasks-NN.json  finished detail moved off closed tasks
   refine/<plan>.json     what each refining agent found
   preflight/<key>.json   what each pre-flight agent found
   briefs/<key>.md        exactly what each chip was told
   messages.jsonl         every word that passed between the two
 ```
 
+`verify` replays the record and proves it still equals the register; `rebuild
+--to <seq>` reconstructs any earlier state from it. Because a removal is
+recorded like any other change, `archive` can take finished detail off landed
+and cancelled tasks — on a 54-task run that was 54% of the file — without the
+register and its own history drifting apart.
+
 Work that is only possible in a window between two pieces gets a first-class
-record (`owed`) — a round refuses to close silently on top of one.
+record (`owed`) — a round refuses to close silently on top of one, and when the
+task carrying one finishes, the shut window is reported rather than left for
+somebody to notice.
+
+`node test.mjs` runs the sweep: the whole lifecycle plus a case for every
+defect fixed so far, in a throwaway git repo.
 
 ## Licence
 

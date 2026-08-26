@@ -133,12 +133,20 @@ node $DRV ingest        # both directions, deduplicated, safe to re-run
 node $DRV outstanding   # questions you never answered may have just surfaced
 ```
 
-  Run it whenever you come back to a run, and after any gap. Two things to know:
-  the transcript format belongs to Claude Code and changes between versions, so
-  `ingest` **refuses loudly** rather than reporting a quiet zero if it can no
-  longer read them — if that happens, fall back to `say`/`heard` and say so. And
-  transcripts are kept about 30 days, so a very old run is not recoverable this
-  way.
+  Run it whenever you come back to a run, and after any gap. Three things to
+  know. The transcript format belongs to Claude Code and changes between
+  versions, so `ingest` **refuses loudly** rather than reporting a quiet zero if
+  it can no longer read them — if that happens, fall back to `say`/`heard` and
+  say so. Transcripts are kept about 30 days, so a very old run is not
+  recoverable this way. And a recovered message carries **no kind** — the
+  transcript never recorded one — so `outstanding` does not ask for one: it
+  reports anyone who spoke last and has had nothing back. Both halves of that
+  are read off the ledger rather than guessed at, so it cannot invent a question
+  nobody asked.
+
+  If a run was ingested by an older copy of this tool, its messages may still
+  carry the wrapper Claude Code puts around them, and were cut short by it.
+  `ingest --reclean` derives them again from the transcripts.
 
 - **Put the run back in front of yourself after a compaction.** `digest` is the
   whole state in a few hundred words — who you are, what is open and at which
@@ -800,6 +808,14 @@ node $DRV owed assign o01 --to 1.10c    # and put it in that task's brief
 `ci` lists every open owed item as it records — assign each to a task that can
 still do it, or mark it done. A window that closes on an unassigned item closes
 for good.
+
+An assignment is not the end of it, because the task it names will finish. When
+that happens the item is still owed and has nobody left to do it, so `landed`
+says so on the spot, `owed list` marks it **SHUT**, `doctor` fails on it and it
+stays on `outstanding` until you reassign it to work that is still open or
+settle it. Landing does not settle it for you — that would make the loss
+automatic, which is the thing this list exists to prevent. Absorbing a task into
+a bundle moves its owed items and open defects to the host for the same reason.
 
 ## 17. If the session running this ends, take it over
 

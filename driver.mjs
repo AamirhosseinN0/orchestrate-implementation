@@ -2773,14 +2773,29 @@ function textOf(msg) {
   return '';
 }
 
-// The task a message is about, if it names one. Longest key first so "1.9" does
-// not swallow "1.9a".
+// The task a message is about, if it names one. A message is addressed at its
+// start — "0.9 — stop, and do not write anything…" is about 0.9 — and mentions
+// come later. Walking the keys longest-first and returning the first that
+// matched ANYWHERE in the first 400 characters ignored position entirely, so
+// that message was filed under 1.8b because 1.8b happened to be named in a
+// later sentence and is one character longer; 22 real messages were filed
+// under a task they merely mentioned.
+//
+// The length sort existed so "1.9" would not swallow "1.9a", but the boundary
+// regex below already prevents that — "1.9" cannot match inside "1.9a" because
+// "a" is a word character. So the rule is simply: earliest match wins, and a
+// tie (the same position, which only a prefix could produce) goes to the
+// longer key.
 function keyIn(text, keys) {
   const head = text.slice(0, 400);
+  let best = '', at = Infinity;
   for (const k of keys) {
-    if (new RegExp('(^|[^A-Za-z0-9._-])' + k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '([^A-Za-z0-9._-]|$)').test(head)) return k;
+    const m = head.match(new RegExp('(^|[^A-Za-z0-9._-])' + k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '([^A-Za-z0-9._-]|$)'));
+    if (!m) continue;
+    const pos = m.index + m[1].length;
+    if (pos < at || (pos === at && k.length > best.length)) { at = pos; best = k; }
   }
-  return '';
+  return best;
 }
 
 // Everything outside the tags is Claude Code's own wrapper — the "Another

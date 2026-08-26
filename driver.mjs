@@ -1390,14 +1390,24 @@ function cmdBrief(key, flags) {
   B.push('');
   B.push('**Then commit your work on your branch.** One clear message, no attribution trailers.');
   B.push('');
+  B.push('**If it is not clean, say so — do not round it up.** `outcome` takes `partial` or');
+  B.push('`failed`, and either opens a record against this task that stays visible until somebody');
+  B.push('deals with it. A half-passing run reported as passing is the one thing here that wastes');
+  B.push('everybody\'s time, because the next piece gets built on it.');
+  B.push('');
   B.push('**Then report, both ways — the message is how it hears, the list is what survives:**');
   B.push('');
   B.push('```bash');
   B.push('node ~/.claude/skills/orchestrate-implementation/driver.mjs --register \'' +
          path.resolve(CWD, REG_PATH) + '\' done \'' + t.key + '\' <<\'J\'');
-  B.push('{"commit": "<sha>", "verified": "<what you ran and what it said>", "notes": "<anything the next one needs>"}');
+  B.push('{"commit": "<sha>",');
+  B.push(' "verified": "<what you ran and what it said>",');
+  B.push(' "outcome": "passed",');
+  B.push(' "notes": "<anything the next one needs>"}');
   B.push('J');
   B.push('```');
+  B.push('');
+  B.push('`outcome` is `passed`, `partial` or `failed`. It is JSON, so do not put a comment in it.');
   B.push('');
   B.push('and send this message' + (r.orchestrator ? ' to `' + r.orchestrator + '`' : ' back to whoever briefed you') + ':');
   B.push('');

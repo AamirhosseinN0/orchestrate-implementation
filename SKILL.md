@@ -51,12 +51,22 @@ and you read that file. Your context carries the pointer, never the payload.
 ```
 .claude/orchestration/
   register.json          every decision, gap and task
-  backups/               the last 30 states of it, kept automatically on every write
+  events.jsonl           the record — one line per change, appended, never rewritten
+  backups/               the last 30 states of the register, kept on every write
   refine/<plan>.json     what each refining agent found, in its own words
   preflight/<key>.json   what each pre-flight agent found, in its own words
   briefs/<key>.md        exactly what each chip was told
   messages.jsonl         every word that passed between you and an agent
+  bin/with-ci-slot       the wrapper the heavy checks are run through
+  slots/                 the shared machine slot, while somebody holds it
+  archive/tasks-NN.json  finished detail moved off landed and cancelled tasks
 ```
+
+Each of those is written by the tool, not by you. One is worth watching: on a
+real 56-task run every folder above was on disk **except `refine/`, which did
+not exist at all.** Nine plans were marked refined and not one agent report had
+been read from a file. See the note on `refine done` below — that is what the
+absence means.
 
 **The record is `events.jsonl`, and the register is derived from it.** Every
 change appends one line naming what actually changed and which command did it,
@@ -78,10 +88,21 @@ line, which is dropped and reported, and trimmed before the next append. A bad
 line *anywhere else* is corruption and `rebuild` refuses rather than replaying a
 log with a hole in it.
 
-The register itself is gitignored, so the backups remain a second net — thirty
-states, a no-op write burning no slot. Every driver command locks the register
-first, and the lock now asks the operating system whether its holder is alive,
-so a slow command is never mistaken for a dead one.
+The backups are a second net — thirty states, a no-op write burning no slot.
+They are the *only* net if the register is not in the project's history, and
+nothing here puts it there or keeps it out. Decide which, once, at the start:
+
+```bash
+grep -q '^.claude/orchestration/' .gitignore || echo '.claude/orchestration/' >> .gitignore
+```
+
+Ignoring it is the usual choice — it is one run's working state, not the
+project. Say so to the user rather than assuming it, because if it is ignored
+and the backups are swept, the run is gone.
+
+Every driver command locks the register first, and the lock asks the operating
+system whether its holder is alive, so a slow command is never mistaken for a
+dead one. `rebuild`, `verify` and `log reseed` take that lock too.
 
 Two habits follow, and they are not optional:
 
@@ -97,7 +118,12 @@ Two habits follow, and they are not optional:
   answer is "nothing changes", it is not a check.
 - **Never summarise an agent's report into the record.** If a report is missing,
   ask the agent to write the file — do not reconstruct it from what it said in
-  the chat. `refine done` refuses rather than letting you type it in.
+  the chat. `refine done` will not stop you: with no file at the path it falls
+  back to reading stdin, prints `⚠ took the report from stdin`, and records
+  whatever you typed. That is the one place in this whole arrangement where the
+  payload goes through your context, and it is not a rare escape — on the real
+  56-task run it was every single refinement, all nine of them. Treat the
+  warning as a defect in the run, not a note.
 - **A failure is a record, not a remark.** A sendback, a guard trespass, a red
   run, a blocked message, a self-reported partial — each opens a defect with an
   id, the task, and the evidence, recorded automatically where it happens. It
@@ -353,11 +379,14 @@ node $DRV refine list              # which plans still need it
 node $DRV refine brief docs/plans/2.1-flashcards.md
 ```
 
-The brief hands the agent the settled decisions that bind this plan, tells it to
-read the codebase and find what the work must build on, and tells it to rewrite
-the plan so every decided thing is stated as decided — **including pasting in the
-settled-decisions table**, which `render --plan` will print for you to include. It is bounded hard: it may
-touch no file but that plan, it writes no product code, and —
+The brief hands the agent the settled decisions that bind this plan — each one
+written out in the brief itself, with its conditions — tells it to read the
+codebase and find what the work must build on, and tells it to rewrite the plan
+so every decided thing is stated as decided. It does not mention the
+settled-decisions table and it does not name `render --plan`; the agent works
+from the decisions in its brief. If you want the table in the plan file as well,
+that is the line `render` prints for you when it writes the record. It is
+bounded hard: it may touch no file but that plan, it writes no product code, and —
 
 **it may decide nothing.** If it finds something the plan needs that nobody has
 settled — a number, a method, a rule that only became visible against the real
@@ -372,8 +401,7 @@ node $DRV refine done docs/plans/2.1-flashcards.md
 # read the agent's own report: .claude/orchestration/refine/docs-plans-2.1-flashcards.json
 ```
 
-If the file is not there, `refine done` refuses. Ask the agent to write it.
-Do not type in what it told you — that is exactly how a file goes missing:
+If the file is not there **and nothing is piped in**, `refine done` stops:
 
 ```
 error: no report at .claude/orchestration/refine/docs-plans-2.1-flashcards.json
@@ -382,14 +410,30 @@ error: no report at .claude/orchestration/refine/docs-plans-2.1-flashcards.json
        rather than retyping what it told you — that is how files get dropped.
 ```
 
-The shape it must write:
+**But pipe JSON in and it takes it.** It prints a warning and records it:
+
+```
+⚠ took the report from stdin, not from the agent's own file.
+  It passed through your context to get here, so check nothing was lost.
+```
+
+That hatch is open on purpose and it is the sharp edge of this act. A report
+that arrives that way came through your context, which is the one thing that
+gets compacted, so what is now on record is what you could still remember — not
+what the agent found. Do not use it. If the file is missing, the agent has not
+finished; ask it to write the file to the path in its brief.
+
+The shape it must write — `serialises` included, because `graph`, `chip` and
+pre-flight all read it and a task with an empty one is a task claiming it moves
+no migration chain, no lockfile and no closed list:
 
 ```bash
 # .claude/orchestration/refine/docs-plans-2.1-flashcards.json
 {"summary":"wrote the settled scheduler into the plan and named the queue it uses",
  "builtOn":[{"path":"packages/offline/src/outbox.ts","what":"the queue a phone already uses"}],
  "tasks":[{"key":"2.1","title":"the flashcard scheduler","needs":["0.14"],
-           "owns":["apps/api/src/core/cards"],"verify":["pnpm -C apps/api test"]}],
+           "owns":["apps/api/src/core/cards"],"serialises":["alembic-head"],
+           "verify":["pnpm -C apps/api test"]}],
  "newGaps":[{"title":"how long a phone keeps changes it could not send","why":"nothing says what happens after a week offline"}]}
 ```
 

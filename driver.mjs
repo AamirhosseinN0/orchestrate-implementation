@@ -445,26 +445,80 @@ function cmdLogReseed(flags) {
 
 // ---------------------------------------------------------------- resolving
 
+// Every plan file under a directory, deepest last, dot-dirs and node_modules
+// skipped.
+function walkPlans(root) {
+  const out = [];
+  (function walk(d) {
+    let entries = [];
+    try { entries = fs.readdirSync(d, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      if (e.name.startsWith('.') || e.name === 'node_modules') continue;
+      const p = path.join(d, e.name);
+      if (e.isDirectory()) walk(p);
+      else if (/\.(md|markdown|txt|rst)$/i.test(e.name)) out.push(p);
+    }
+  })(root);
+  return out.sort();
+}
+
+// A wildcard was only ever read in the last segment, so `docs/*/plan.md` looked
+// in a directory literally named "*" and reported "no files matched"; and a
+// wildcard that matched a directory handed that directory to readFileSync,
+// which threw EISDIR. Both are fixed by matching segment by segment: `*` inside
+// one name, `**` across any depth, and a directory that survives the match is
+// walked for plans rather than read as one.
+function globPlans(arg) {
+  const abs = path.resolve(CWD, arg);
+  const parts = abs.split(path.sep).filter(Boolean);
+  const seg = (s) => new RegExp('^' + s.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '[^/]*') + '$');
+  let here = [path.sep];
+  for (let i = 0; i < parts.length; i++) {
+    const part = parts[i];
+    const next = [];
+    if (part === '**') {
+      // any depth, this level included
+      for (const d of here) {
+        next.push(d);
+        for (const sub of (function all(x, acc) {
+          let es = [];
+          try { es = fs.readdirSync(x, { withFileTypes: true }); } catch { return acc; }
+          for (const e of es) {
+            if (!e.isDirectory() || e.name.startsWith('.') || e.name === 'node_modules') continue;
+            const p = path.join(x, e.name); acc.push(p); all(p, acc);
+          }
+          return acc;
+        })(d, [])) next.push(sub);
+      }
+    } else if (part.includes('*')) {
+      const re = seg(part);
+      for (const d of here) {
+        let es = [];
+        try { es = fs.readdirSync(d); } catch { continue; }
+        for (const e of es) if (re.test(e)) next.push(path.join(d, e));
+      }
+    } else {
+      for (const d of here) {
+        const p = path.join(d, part);
+        if (fs.existsSync(p)) next.push(p);
+      }
+    }
+    here = [...new Set(next)];
+    if (!here.length) return [];
+  }
+  const out = [];
+  for (const p of here) {
+    let st; try { st = fs.statSync(p); } catch { continue; }
+    if (st.isDirectory()) out.push(...walkPlans(p));
+    else out.push(p);
+  }
+  return [...new Set(out)].sort();
+}
+
 function expand(arg) {
   const abs = path.resolve(CWD, arg);
-  if (fs.existsSync(abs) && fs.statSync(abs).isDirectory()) {
-    const out = [];
-    (function walk(d) {
-      for (const e of fs.readdirSync(d, { withFileTypes: true })) {
-        if (e.name.startsWith('.') || e.name === 'node_modules') continue;
-        const p = path.join(d, e.name);
-        if (e.isDirectory()) walk(p);
-        else if (/\.(md|markdown|txt|rst)$/i.test(e.name)) out.push(p);
-      }
-    })(abs);
-    return out.sort();
-  }
-  if (arg.includes('*')) {
-    const dir = path.dirname(abs), base = path.basename(abs);
-    if (!fs.existsSync(dir)) return [];
-    const re = new RegExp('^' + base.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*') + '$');
-    return fs.readdirSync(dir).filter((f) => re.test(f)).map((f) => path.join(dir, f)).sort();
-  }
+  if (arg.includes('*')) return globPlans(arg);
+  if (fs.existsSync(abs) && fs.statSync(abs).isDirectory()) return walkPlans(abs);
   return fs.existsSync(abs) ? [abs] : [];
 }
 
@@ -485,16 +539,43 @@ const LEX = [
   { id: 'tuning',   why: 'a number somebody has to pick', re: /\b(configurable|tunable|tuned|adjustable|to taste|per deployment|environment[- ]specific)\b/i },
 ];
 
-const SETTLED_HEADING = /(settled|do not relitigate|already decided|decisions \(|resolved|answered)/i;
+// Whole words only, and never the negation of one. Unanchored, "resolved" sits
+// inside "unresolved" and "answered" inside "unanswered", so a section headed
+// "Unresolved questions" turned suppression ON and every gap under it was
+// dropped without a word — the sections most likely to hold undecided things
+// were exactly the ones skipped, and `check` then went green. The boundaries
+// stop the run-together forms; the lookbehind stops "un-resolved" and
+// "un answered", which a boundary alone lets through.
+const SETTLED_HEADING = /(?<!\bun[- ])\b(settled|do not relitigate|already decided|resolved|answered)\b|\bdecisions \(/i;
 const FENCE = /^\s*(```|~~~)/;
 
+// Which lines sit inside a code fence. Toggling a flag line by line meant a
+// plan with an odd number of fence lines left the fence open for ever, so
+// every line after the last ``` was treated as code and never scanned. An
+// unterminated fence is a typo in the plan, not an instruction to stop reading
+// it: the unmatched opener is ignored, the rest is scanned as prose, and the
+// operator is told the plan needs fixing.
+function fencedLines(lines) {
+  const marks = [];
+  lines.forEach((l, i) => { if (FENCE.test(l)) marks.push(i); });
+  let unterminated = false;
+  if (marks.length % 2 === 1) { marks.pop(); unterminated = true; }
+  const inFence = new Array(lines.length).fill(false);
+  for (let k = 0; k + 1 < marks.length; k += 2)
+    for (let i = marks[k]; i <= marks[k + 1]; i++) inFence[i] = true;
+  return { inFence, unterminated };
+}
+
 function scanFile(p) {
-  const lines = fs.readFileSync(p, 'utf8').split('\n');
+  const lines = readPlan(p).split('\n');
   const hits = [];
-  let fenced = false, heading = '', settled = false;
+  const { inFence, unterminated } = fencedLines(lines);
+  if (unterminated)
+    console.error('note: ' + rel(p) + ' has an odd number of code fence lines — the last one is ' +
+                  'never closed. Reading past it as prose; fix the fence in the plan.');
+  let heading = '', settled = false;
   lines.forEach((line, i) => {
-    if (FENCE.test(line)) { fenced = !fenced; return; }
-    if (fenced) return;
+    if (inFence[i]) return;
     const h = line.match(/^\s{0,3}(#{1,6})\s+(.*)$/);
     if (h) { heading = h[2].trim(); settled = SETTLED_HEADING.test(heading); return; }
     if (settled) return;
@@ -509,20 +590,53 @@ function scanFile(p) {
 
 // A plan can also be silent. If a whole category of question is never
 // mentioned anywhere in the document, that is a gap nobody wrote down.
+//
+// Each word below is matched as a WORD, not as a run of letters. Matched as
+// bare substrings, "deliberate" and "separate" both read as *rate*, "download"
+// read as *load*, "against" as *again* and "capture" as *cap* — so a plan that
+// says nothing at all about limits or growth was recorded as covering both, and
+// on the real corpus 11 of 14 genuine silences went unreported. A trailing `*`
+// means "this word and anything grown from it" (migrat* → migrate, migration,
+// migrating); without it the whole word must stand alone.
 const CATEGORIES = [
-  { id: 'failure',    ask: 'what happens when it fails',        words: ['fail', 'error', 'crash', 'retry', 'timeout', 'rollback', 'roll back', 'exception', 'goes wrong'] },
-  { id: 'limits',     ask: 'how much is too much',              words: ['limit', 'quota', 'cap', 'maximum', 'max ', 'rate', 'throttle', 'too many', 'size'] },
-  { id: 'permission', ask: 'who is allowed to do it',           words: ['who can', 'allowed', 'permission', 'role', 'actor', 'access', 'may not', 'forbidden'] },
-  { id: 'repeat',     ask: 'what happens if it runs twice',     words: ['twice', 'duplicate', 'idempot', 'replay', 'again', 'already', 'repeat', 're-run', 'rerun'] },
-  { id: 'existing',   ask: 'what happens to what already exists',words: ['migrat', 'backfill', 'existing', 'already stored', 'upgrade', 'old rows', 'historic'] },
-  { id: 'proof',      ask: 'how anyone knows it works',         words: ['test', 'fixture', 'golden', 'verify', 'prove', 'assert', 'check that', 'acceptance'] },
-  { id: 'undo',       ask: 'how it is undone or deleted',       words: ['undo', 'delete', 'remove', 'revert', 'erase', 'retention', 'purge', 'cancel'] },
-  { id: 'growth',     ask: 'what it looks like at ten times the size', words: ['scale', 'grow', 'volume', 'load', 'how many', 'per second', 'concurren', 'thousand'] },
+  { id: 'failure',    ask: 'what happens when it fails',        words: ['fail*', 'error*', 'crash*', 'retry*', 'timeout*', 'rollback*', 'roll back', 'exception*', 'goes wrong'] },
+  { id: 'limits',     ask: 'how much is too much',              words: ['limit*', 'quota*', 'cap', 'caps', 'maximum', 'max', 'rate', 'rates', 'rate-limit*', 'throttl*', 'too many', 'size*'] },
+  { id: 'permission', ask: 'who is allowed to do it',           words: ['who can', 'allow*', 'permission*', 'role', 'roles', 'actor*', 'access*', 'may not', 'forbidden'] },
+  { id: 'repeat',     ask: 'what happens if it runs twice',     words: ['twice', 'duplicat*', 'idempot*', 'replay*', 'again', 'already', 'repeat*', 're-run', 'rerun*'] },
+  { id: 'existing',   ask: 'what happens to what already exists',words: ['migrat*', 'backfill*', 'existing', 'already stored', 'upgrade*', 'old rows', 'historic*'] },
+  { id: 'proof',      ask: 'how anyone knows it works',         words: ['test*', 'fixture*', 'golden', 'verif*', 'prove*', 'proof', 'assert*', 'check that', 'acceptance'] },
+  { id: 'undo',       ask: 'how it is undone or deleted',       words: ['undo', 'undone', 'delete*', 'remove*', 'removal', 'revert*', 'erase*', 'erasure', 'retention', 'purge*', 'cancel*'] },
+  { id: 'growth',     ask: 'what it looks like at ten times the size', words: ['scale*', 'scaling', 'grow*', 'growth', 'volume*', 'load', 'loads', 'how many', 'per second', 'concurren*', 'thousand*'] },
 ];
 
+// `foo*` → the word and anything grown from it; `foo` → that word alone.
+// Built once, because `silence` runs this over every plan in the register.
+const CATEGORY_RE = new Map(CATEGORIES.map((c) => [c.id, new RegExp(
+  c.words.map((w) => {
+    const stem = w.endsWith('*') ? w.slice(0, -1) : w;
+    const src = stem.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/[ -]/g, '[ -]');
+    return '\\b' + src + (w.endsWith('*') ? '[a-z]*' : '\\b');
+  }).join('|'), 'i')]));
+
 function silenceFile(p) {
-  const text = fs.readFileSync(p, 'utf8').toLowerCase();
-  return CATEGORIES.filter((c) => !c.words.some((w) => text.includes(w)));
+  const text = readPlan(p);
+  return CATEGORIES.filter((c) => !CATEGORY_RE.get(c.id).test(text));
+}
+
+// Every read of a plan file goes through here. A plan that has been renamed or
+// moved since `load` used to come back as a raw ENOENT stack trace, which says
+// nothing about what to do; this names the file and the way out.
+function readPlan(p) {
+  try {
+    return fs.readFileSync(p, 'utf8');
+  } catch (e) {
+    if (e && e.code === 'ENOENT')
+      die('the plan ' + rel(p) + ' is on the register but not on disk — it has been renamed,\n' +
+          '       moved or deleted since `load`. Re-run `load` with its new path, or restore it.');
+    if (e && e.code === 'EISDIR') die(rel(p) + ' is a directory, not a plan file.');
+    if (e && e.code === 'EACCES') die('cannot read the plan ' + rel(p) + ' — permission denied.');
+    throw e;
+  }
 }
 
 // ------------------------------------------------------------------ commands
@@ -569,6 +683,9 @@ function cmdScan() {
       added++;
     }
   }
+  // So `check` can tell "everything was judged" from "nothing was ever looked
+  // at". An empty gap list means both, and only this says which.
+  reg.scannedAt = now();
   commit(reg);
   const byPlan = {};
   for (const g of reg.gaps.filter((x) => x.status === 'candidate')) (byPlan[g.plan] ||= []).push(g);
@@ -681,6 +798,17 @@ const JARGON = ['idempoten', 'schema', 'endpoint', 'api', 'rls', 'jwt', 'oauth',
   'algorithm', 'implementation', 'architecture', 'infrastructure', 'configuration', 'authenticat',
   'authoris', 'authoriz', 'provision', 'orchestrat', 'instantiat', 'parameteris', 'parameteriz'];
 
+// Each entry above is a STEM, and a stem only counts where a word starts. Held
+// as bare substrings they matched inside ordinary English — "orm" sits in
+// normal, format, information, performance and platform, "api" in rapid — so
+// the linter refused plain words and, naming only the stem, never said which
+// word of the question it had objected to. Anchored to a word start and run on
+// to the end of that word, it catches the growths a stem is there for
+// ("schema" in schemas, "authoris" in authorisation) and reports the word the
+// writer actually used.
+const JARGON_RE = new RegExp(
+  '\\b(?:' + JARGON.map((j) => j.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|') + ')[a-z]*', 'i');
+
 const PATHY = /(^|\s|\()[\w.\-/]*\/[\w.\-/]+|\b\w+\.(md|ts|tsx|js|mjs|py|json|sql|toml|yaml|yml|sh|rs|go|java|rb)\b|`[^`]+`/i;
 
 function words(s) { return s.trim().split(/\s+/).filter(Boolean); }
@@ -691,8 +819,8 @@ function lintText(label, s, maxWords) {
   const w = words(s);
   if (w.length > maxWords) p.push(label + ' is ' + w.length + ' words, max ' + maxWords);
   if (PATHY.test(s)) p.push(label + ' names a file or path — say what it does instead');
-  const low = ' ' + s.toLowerCase() + ' ';
-  for (const j of JARGON) if (low.includes(j)) { p.push(label + ' uses "' + j + '" — plainer word needed'); break; }
+  const j = s.match(JARGON_RE);
+  if (j) p.push(label + ' uses "' + j[0] + '" — say what it does instead (see reference/plain-words.md)');
   // Measure each unhyphenated run: "multiply-the-gap" is plain English,
   // "implementation" is not.
   const long = w.flatMap((x) => x.split(/[-\u2013\u2014/]/)).find((x) => x.replace(/[^a-z]/gi, '').length >= 14);
@@ -804,17 +932,40 @@ function cmdStatus() {
   } else console.log('\nnothing in scope is unanswered.');
 }
 
+// The gate before the record gets written. It used to read status strings and
+// nothing else, which made it a formality: an empty gap list satisfied every
+// condition, and `set <id> status=answered` walked straight past it without an
+// answer ever being recorded — after which `render` died with a raw TypeError
+// on the very register `check` had just blessed. It now asks whether the work
+// was actually done, not whether a word says so.
 function cmdCheck() {
   const reg = readReg();
   const cand = reg.gaps.filter((g) => g.status === 'candidate');
   const unset = reg.gaps.filter((g) => g.scope === 'unset' && !['dropped', 'candidate'].includes(g.status));
   const open = reg.gaps.filter((g) => g.scope === 'in' && !['answered', 'dropped'].includes(g.status));
+  // "answered" with nothing recorded under it is the state `render` cannot
+  // read. A status is a claim; the answer is the evidence for it.
+  const hollow = reg.gaps.filter((g) => g.status === 'answered' &&
+    !(g.answer && typeof g.answer.choice === 'string' && g.answer.choice.trim()));
   let fail = false;
+  if (!reg.plans.length) { console.error('✗ no plans loaded — nothing has been read, so nothing can be finished. Run `load`.'); fail = true; }
+  else if (!reg.scannedAt) {
+    console.error('✗ no scan has been run against these plans, so there is nothing to have judged.');
+    console.error('  Read every plan in full, then run `scan` (and `silence`).');
+    fail = true;
+  }
   if (cand.length) { console.error('✗ ' + cand.length + ' candidate(s) never judged — keep or drop each one'); fail = true; }
   if (unset.length) { console.error('✗ ' + unset.length + ' gap(s) with no scope — in or out?'); fail = true; }
   if (open.length) { console.error('✗ ' + open.length + ' in-scope gap(s) unanswered:'); for (const g of open) console.error('    ' + g.id + '  ' + (g.title || g.quote.slice(0, 60))); fail = true; }
+  if (hollow.length) {
+    console.error('✗ ' + hollow.length + ' gap(s) marked answered with no answer recorded — a status is not a decision:');
+    for (const g of hollow) console.error('    ' + g.id + '  ' + (g.title || g.quote.slice(0, 60)) + '   — run `answer ' + g.id + '`');
+    fail = true;
+  }
   if (fail) { console.error('\nnot finished. Do not report this session as done.'); process.exit(1); }
-  console.log('✓ every candidate judged, every in-scope gap answered. Safe to write the record.');
+  const answered = reg.gaps.filter((g) => g.status === 'answered').length;
+  console.log('✓ every candidate judged, every in-scope gap answered, ' + answered +
+              ' answer(s) on record. Safe to write the record.');
 }
 
 // ------------------------------------------------------------------- render
@@ -823,6 +974,12 @@ function cmdRender(flags) {
   const reg = readReg();
   const done = reg.gaps.filter((g) => g.status === 'answered');
   if (!done.length) die('nothing answered yet');
+  // Belt as well as braces: `check` refuses these now, but `render` can be run
+  // without it, and a raw TypeError deep in the writer says nothing useful.
+  const hollow = done.filter((g) => !(g.answer && typeof g.answer.choice === 'string' && g.answer.choice.trim()));
+  if (hollow.length)
+    die(hollow.length + ' gap(s) are marked answered with no answer recorded: ' +
+        hollow.map((g) => g.id).join(', ') + '\n       Record each with `answer <id>`, or set it back to gap.');
   if (flags.plan) {
     const gs = done.filter((g) => g.plan.includes(flags.plan));
     if (!gs.length) { console.log('(nothing was decided for ' + flags.plan + ' — leave that plan alone)'); return; }
@@ -2933,132 +3090,6 @@ function ledger() {
   }).filter(Boolean);
 }
 
-
-// ------------------------------------------------------------- message store
-// The old ledger had the orchestrator retype what an agent said, which put the
-// payload through a context that gets compacted — so a question could be lost
-// entirely, or logged as a paraphrase. Now the sender writes the file, from its
-// own process, before the orchestrator's context ever sees it. Messages are
-// immutable files; being handled is a separate sidecar file, so nothing is ever
-// rewritten and two writers can never collide.
-function msgDir() { return orchDir('messages'); }
-function newMsgId(key) {
-  const stamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\..+/, '');
-  return stamp + '-' + slug(key || 'x').slice(0, 20) + '-' + crypto.randomBytes(3).toString('hex');
-}
-// tmp + rename: a half-written message is never visible to a reader
-function writeMsg(m) {
-  const dir = msgDir();
-  const f = path.join(dir, m.id + '.json');
-  const tmp = path.join(dir, '.' + m.id + '.tmp');
-  fs.writeFileSync(tmp, JSON.stringify(m, null, 2) + '\n');
-  fs.renameSync(tmp, f);
-  return f;
-}
-function allMsgs() {
-  const dir = msgDir();
-  return fs.readdirSync(dir).filter((f) => f.endsWith('.json') && !f.endsWith('.ack.json'))
-    .sort()
-    .map((f) => {
-      try {
-        const m = JSON.parse(fs.readFileSync(path.join(dir, f), 'utf8'));
-        m.acked = fs.existsSync(path.join(dir, m.id + '.ack.json'))
-          ? JSON.parse(fs.readFileSync(path.join(dir, m.id + '.ack.json'), 'utf8')) : null;
-        return m;
-      } catch { return null; }
-    }).filter(Boolean);
-}
-const NEEDS_REPLY = ['question', 'blocked', 'report', 'checkin'];
-
-// Run by the AGENT, from its own process. Body comes in on stdin so nothing is
-// shortened to fit a flag, and the register is only read, never locked.
-function cmdPost(key, flags) {
-  const r = readRegRO();
-  if (!tasks(r).some((t) => t.key === key))
-    die('no task "' + key + '" on record — check the key in your brief.');
-  const kind = flags.kind || 'note';
-  if (!IN_KINDS.includes(kind)) die('--kind must be one of: ' + IN_KINDS.join(', '));
-  let body = '';
-  try { body = fs.readFileSync(0, 'utf8'); } catch { /* none */ }
-  if (!body.trim()) die('the message body goes on stdin:\n' +
-    "       driver.mjs post " + key + " --kind " + kind + " <<'EOF'\n       ...what you want to say...\n       EOF");
-  const m = { id: newMsgId(key), at: now(), dir: 'in', key, kind,
-              subject: flags.subject || body.trim().split('\n')[0].slice(0, 90), body: body.trimEnd() };
-  writeMsg(m);
-  console.log('posted ' + m.id);
-  console.log('');
-  console.log('Now send exactly this one line — nothing more. The orchestrator reads the message');
-  console.log('itself, from the file, so it cannot lose or shorten what you actually wrote:');
-  console.log('');
-  console.log('  [' + key + '] ' + kind + ' posted: ' + m.id + ' — ' + m.subject);
-}
-
-// Run by the ORCHESTRATOR. Composing and recording are one act, so what was
-// promised survives whether or not anyone remembers to log it afterwards.
-function recordOut(key, kind, text) {
-  const m = { id: newMsgId(key), at: now(), dir: 'out', key, kind,
-              subject: String(text).trim().split('\n')[0].slice(0, 90), body: String(text).trimEnd() };
-  writeMsg(m);
-  return m;
-}
-function cmdReply(key, flags) {
-  const r = readRegRO(); const t = tasks(r).find((x) => x.key === key);
-  if (!t) die('no task "' + key + '"');
-  let text = typeof flags.text === 'string' ? flags.text : '';
-  if (!text) { try { text = fs.readFileSync(0, 'utf8'); } catch { /* none */ } }
-  if (!text.trim()) die('reply ' + key + ' --text "..."  (or the body on stdin)');
-  const kind = flags.kind || 'reply';
-  if (!OUT_KINDS.includes(kind)) die('--kind must be one of: ' + OUT_KINDS.join(', '));
-  const m = recordOut(key, kind, text);
-  const acked = [];
-  if (flags.to) { acked.push(...String(flags.to).split(',').map((x) => x.trim()).filter(Boolean)); }
-  for (const id of acked) ackMsg(id, 'answered by ' + m.id);
-  console.log('recorded ' + m.id + (acked.length ? '  (marks ' + acked.join(', ') + ' handled)' : ''));
-  console.log('');
-  console.log('Send this to ' + (t.agent || '<no address yet>') + ':');
-  console.log('');
-  console.log(m.body);
-}
-
-function ackMsg(id, note) {
-  const f = path.join(msgDir(), id + '.json');
-  if (!fs.existsSync(f)) die('no message ' + id);
-  fs.writeFileSync(path.join(msgDir(), id + '.ack.json'),
-    JSON.stringify({ id, at: now(), note: note || '' }, null, 2) + '\n');
-}
-function cmdAck(id, flags) {
-  ackMsg(id, flags.note || '');
-  console.log(id + ' marked handled.');
-}
-
-function cmdInbox(flags) {
-  const msgs = allMsgs().filter((m) => m.dir === 'in')
-    .filter((m) => (flags.key ? m.key === flags.key : true))
-    .filter((m) => (flags.all ? true : !m.acked));
-  if (!msgs.length) return console.log(flags.all ? 'no messages.' : 'nothing unread.');
-  console.log((flags.all ? 'Every message' : 'Unread — each of these is somebody waiting') + ':\n');
-  for (const m of msgs) {
-    const age = Math.round((Date.now() - Date.parse(m.at)) / 60000);
-    console.log('  ' + m.id);
-    console.log('    ' + m.key.padEnd(10) + m.kind.padEnd(10) + age + ' min ago' + (m.acked ? '   ✓ handled' : ''));
-    console.log('    ' + m.subject);
-  }
-  console.log('\nRead one in full:  driver.mjs read <id>');
-  console.log('Answer and close:  driver.mjs reply <key> --text "..." --to <id>');
-}
-
-function cmdReadMsg(id) {
-  const m = allMsgs().find((x) => x.id === id || x.id.startsWith(id));
-  if (!m) die('no message ' + id + ' — `inbox --all` lists them');
-  console.log('id      ' + m.id);
-  console.log('from    ' + m.key + '  (' + m.dir + ', ' + m.kind + ')');
-  console.log('at      ' + m.at.slice(0, 19).replace('T', ' '));
-  console.log('handled ' + (m.acked ? 'yes — ' + (m.acked.note || '') : 'NO — it is waiting on you'));
-  console.log('');
-  console.log(m.body);
-}
-
-
 // ------------------------------------------------------- deriving the ledger
 // Logging a message by hand only works if the orchestrator remembers, and a
 // compaction is exactly the event that makes it forget. It does not have to:
@@ -3096,14 +3127,29 @@ function textOf(msg) {
   return '';
 }
 
-// The task a message is about, if it names one. Longest key first so "1.9" does
-// not swallow "1.9a".
+// The task a message is about, if it names one. A message is addressed at its
+// start — "0.9 — stop, and do not write anything…" is about 0.9 — and mentions
+// come later. Walking the keys longest-first and returning the first that
+// matched ANYWHERE in the first 400 characters ignored position entirely, so
+// that message was filed under 1.8b because 1.8b happened to be named in a
+// later sentence and is one character longer; 22 real messages were filed
+// under a task they merely mentioned.
+//
+// The length sort existed so "1.9" would not swallow "1.9a", but the boundary
+// regex below already prevents that — "1.9" cannot match inside "1.9a" because
+// "a" is a word character. So the rule is simply: earliest match wins, and a
+// tie (the same position, which only a prefix could produce) goes to the
+// longer key.
 function keyIn(text, keys) {
   const head = text.slice(0, 400);
+  let best = '', at = Infinity;
   for (const k of keys) {
-    if (new RegExp('(^|[^A-Za-z0-9._-])' + k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '([^A-Za-z0-9._-]|$)').test(head)) return k;
+    const m = head.match(new RegExp('(^|[^A-Za-z0-9._-])' + k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '([^A-Za-z0-9._-]|$)'));
+    if (!m) continue;
+    const pos = m.index + m[1].length;
+    if (pos < at || (pos === at && k.length > best.length)) { at = pos; best = k; }
   }
-  return '';
+  return best;
 }
 
 // Everything outside the tags is Claude Code's own wrapper — the "Another
@@ -3125,9 +3171,52 @@ function innerMessage(text) {
 // cutting the conclusion off the end of most of them.
 const MSG_CAP = 4000;
 
+// A cut message used to be stored as `body.slice(0, MSG_CAP)` and nothing else
+// — no ellipsis, no flag, no original length — so 33 of 311 entries on the real
+// ledger ended mid-sentence and were read afterwards as complete statements.
+// The mark is in the text where a reader will see it, and the two fields say
+// exactly how much is missing so a total can be trusted.
+function capped(body) {
+  const s = String(body);
+  if (s.length <= MSG_CAP) return { text: s };
+  return { text: s.slice(0, MSG_CAP) + '\n\n… [cut at ' + MSG_CAP + ' of ' + s.length + ' characters]',
+           truncated: true, fullLength: s.length };
+}
+
+// The peer that sent a message, off the opening tag. Claude Code writes two
+// wrapper shapes and only one of them carries from-name:
+//
+//   <cross-session-message from="uds:/…/1234.sock" from-name="lms-v2-3d" …>
+//   <cross-session-message from="local_<uuid>" name="<title>" encoded="1">
+//
+// The second is what it emits when the peer channel is gone and the transcript
+// is the only surviving copy of the message — which is precisely the case
+// `ingest` exists for. Requiring from-name counted those lines as candidates
+// and then dropped them in silence, so `ingest` reported success having lost
+// them; on the real run that was 3 complete task reports, about 14.6 KB. Here
+// the name is taken from whichever attribute carries one, and `name` is kept
+// separately because on that shape it is the message's title, not the sender.
+function senderOf(openTag) {
+  const attr = (n) => { const m = openTag.match(new RegExp('\\b' + n + '="([^"]*)"')); return m ? m[1] : ''; };
+  const fromName = attr('from-name');
+  const from = attr('from');
+  return { agent: fromName || from, subject: fromName ? '' : attr('name') };
+}
+
+// Whether a transcript line was written from this run. An exact string match
+// dropped every line whose cwd was a subdirectory — and the orchestrator
+// routinely works from apps/api and the like — which on the real run cost 13
+// outbound "released, rebase now" messages, exactly the ones `waitingOn` reads
+// to decide a question has been answered.
+function underCwd(cwd) {
+  if (!cwd) return true;
+  const a = path.resolve(cwd), b = path.resolve(CWD);
+  return a === b || a.startsWith(b + path.sep);
+}
+
 function harvest(dir, keys) {
   const out = [];
-  const seen = { files: 0, lines: 0, candidates: 0, parsed: 0, wrongCwd: 0 };
+  const seen = { files: 0, lines: 0, candidates: 0, parsed: 0, wrongCwd: 0, underCwd: 0 };
   for (const f of fs.readdirSync(dir).filter((x) => x.endsWith('.jsonl'))) {
     let lines;
     try { lines = fs.readFileSync(path.join(dir, f), 'utf8').split('\n'); } catch { continue; }
@@ -3137,21 +3226,22 @@ function harvest(dir, keys) {
       seen.candidates++;
       let j; try { j = JSON.parse(line); } catch { continue; }
       seen.parsed++;
-      if (j.cwd && j.cwd !== CWD) seen.wrongCwd++;
-      if (j.cwd && j.cwd !== CWD) continue;
+      if (j.cwd && j.cwd !== CWD) { if (underCwd(j.cwd)) seen.underCwd++; else { seen.wrongCwd++; continue; } }
       if (j.type === 'user') {
         const text = textOf(j.message);
-        const env = text.match(/<cross-session-message[^>]*from-name="([^"]+)"/);
-        if (!env) continue;
+        const open = text.match(/<cross-session-message[^>]*>/);
+        if (!open) continue;
+        const who = senderOf(open[0]);
         const body = innerMessage(text);
-        out.push({ at: j.timestamp, dir: 'in', kind: 'derived', agent: env[1],
-                   key: keyIn(body, keys), text: body.slice(0, MSG_CAP), uuid: j.uuid, session: j.sessionId });
+        out.push({ at: j.timestamp, dir: 'in', kind: 'derived', agent: who.agent,
+                   key: keyIn(body, keys), ...capped(body), uuid: j.uuid, session: j.sessionId,
+                   ...(who.subject ? { summary: who.subject } : {}) });
       } else if (j.type === 'assistant' && Array.isArray(j.message && j.message.content)) {
         for (const b of j.message.content) {
           if (!b || b.type !== 'tool_use' || b.name !== 'SendMessage' || !b.input) continue;
           const body = String(b.input.message || '');
           out.push({ at: j.timestamp, dir: 'out', kind: 'derived', agent: String(b.input.to || ''),
-                     key: keyIn(body, keys), text: body.slice(0, MSG_CAP), uuid: b.id || j.uuid, session: j.sessionId,
+                     key: keyIn(body, keys), ...capped(body), uuid: b.id || j.uuid, session: j.sessionId,
                      summary: b.input.summary || '' });
         }
       }
@@ -3209,28 +3299,47 @@ function cmdIngest(flags) {
   if (flags.reclean) {
     const byUuid = new Map(found.map((e) => [e.uuid, e]));
     const cur = ledger();
-    let fixed = 0, gained = 0;
+    let fixed = 0, gained = 0, marked = 0;
     for (const e of cur) {
       const f = e.uuid && byUuid.get(e.uuid);
-      if (!f || typeof f.text !== 'string' || f.text === e.text) continue;
-      gained += f.text.length - String(e.text || '').length;
+      if (!f || typeof f.text !== 'string') continue;
+      // An entry already at the cap cannot be lengthened — the transcript
+      // yields the same cut text — but it CAN stop passing itself off as
+      // whole. Carry the marks across whether or not the text changed, and
+      // count them apart from text actually recovered, so the "+n chars"
+      // figure never claims the cut-here note as content.
+      const wasCut = !!e.truncated;
+      if (f.truncated && !wasCut) { e.truncated = true; e.fullLength = f.fullLength; marked++; }
+      if (f.text === e.text) continue;
+      const before = String(e.text || '').length;
       e.text = f.text; if (!e.key && f.key) e.key = f.key;
+      gained += (f.truncated ? MSG_CAP : f.text.length) - (wasCut ? before : Math.min(before, MSG_CAP));
       fixed++;
     }
-    if (fixed) {
+    if (fixed || marked) {
       fs.copyFileSync(ledgerPath(), ledgerPath() + '.bak');
       fs.writeFileSync(ledgerPath(), cur.map((e) => JSON.stringify(e)).join('\n') + '\n');
     }
-    recleaned = { fixed, gained };
+    recleaned = { fixed, gained, marked };
   }
   console.log('read ' + rel(dir) + '  (' + seen.files + ' transcript(s), ' + seen.candidates + ' candidate line(s))');
+  if (seen.underCwd)
+    console.log('  ' + seen.underCwd + ' from a directory under this one (a worktree or a package) — kept.');
+  if (seen.wrongCwd)
+    console.log('  ' + seen.wrongCwd + ' line(s) belong to another project entirely — skipped.');
   console.log('  ' + found.length + ' message(s) in the transcripts, ' + fresh.length + ' new to the ledger.');
   const named = fresh.filter((e) => e.key).length;
   console.log('  ' + named + ' name a task; ' + (fresh.length - named) + ' do not (still logged, just unattributed).');
+  const cut = fresh.filter((e) => e.truncated).length;
+  if (cut) console.log('  ' + cut + ' were longer than ' + MSG_CAP + ' characters and are stored cut, and marked as cut.');
   if (recleaned) {
     console.log('  re-derived ' + recleaned.fixed + ' entr(ies) already in the ledger' +
       (recleaned.fixed ? ': ' + (recleaned.gained >= 0 ? '+' : '') + recleaned.gained +
         ' chars of message text recovered, previous file kept as messages.jsonl.bak' : ' — nothing to repair'));
+    if (recleaned.marked)
+      console.log('  ' + recleaned.marked + ' entr(ies) already at the cap could not be lengthened — the transcript');
+    if (recleaned.marked)
+      console.log('  holds the same cut text — but are now marked as cut, with their true length.');
   } else if (ledger().some((e) => /^Another Claude session sent a message:/.test(String(e.text || '')))) {
     console.log('\nSome entries still carry the wrapper Claude Code puts around a message, and were');
     console.log('cut short by it. They can be derived again: `ingest --reclean`.');
@@ -3308,8 +3417,14 @@ function cmdDigest() {
   if (waits.length) {
     L.push('');
     L.push('**Waiting on you:**');
-    for (const w of waits.slice(0, 8))
-      L.push('- ' + w.key + ' ' + w.why + (w.detail ? ': ' + w.detail.slice(0, 70) : ''));
+    // The same clipping `outstanding` does, and for a stronger reason: this is
+    // what a SessionStart hook feeds a freshly compacted context, so one agent
+    // report printed raw — newlines, headings, code fences and all — buried
+    // every other line here at exactly the moment they were needed most.
+    for (const w of waits.slice(0, 8)) {
+      const d = String(w.detail || '').replace(/\s+/g, ' ').trim();
+      L.push('- ' + w.key + ' ' + w.why + (d ? ': ' + d.slice(0, 70) + (d.length > 70 ? '…' : '') : ''));
+    }
     if (waits.length > 8)
       L.push('- …and ' + (waits.length - 8) + ' more. Run `outstanding` — this list is cut, not complete.');
   }
@@ -3361,11 +3476,19 @@ function waitingOn(r, log) {
     if (lastAsk) {
       // Only an actual reply answers a question. Sending the work back is a
       // rejection, not an answer — counting it as one is how an agent ends up
-      // waiting for ever on a list that says nothing is waiting.
-      const replied = mine.some((e) => e.dir === 'out' && ['reply', 'release'].includes(e.kind) && e.at > lastAsk.at);
+      // waiting for ever on a list that says nothing is waiting. A `release`
+      // was counted here for the same reason a sendback once was, and it is
+      // the same hole: telling somebody to go ahead is not telling them the
+      // thing they asked. `heard` promises the operator "only a reply clears
+      // it", and now that is what happens.
+      const replied = mine.some((e) => e.dir === 'out' && e.kind === 'reply' && e.at > lastAsk.at);
       if (!replied) {
         spokeFor = true;
-        rows.push({ key: t.key, why: 'asked you something and has had no answer',
+        // A blocked message did not ask anything — saying it did sends the
+        // operator looking for a question that was never put.
+        rows.push({ key: t.key, why: lastAsk.kind === 'blocked'
+            ? 'says it is blocked and has had nothing back'
+            : 'asked you something and has had no answer',
           detail: String(lastAsk.text || '').slice(0, 90), since: lastAsk.at });
       }
     }

@@ -1,0 +1,53 @@
+name: checks
+
+# The suite drives the real command line and reads the files back, so it needs
+# a git identity and a working tree — not much else. No dependencies to install.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  suite:
+    name: the sweep
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      # Several checks build throwaway repositories and commit in them.
+      - name: give git an identity to commit with
+        run: |
+          git config --global user.email "ci@example.invalid"
+          git config --global user.name "ci"
+          git config --global init.defaultBranch main
+
+      - name: run the sweep
+        run: node test.mjs
+
+  coverage:
+    name: the coverage floor
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: give git an identity to commit with
+        run: |
+          git config --global user.email "ci@example.invalid"
+          git config --global user.name "ci"
+          git config --global init.defaultBranch main
+
+      # Runs the sweep again under V8 coverage and fails if driver-function
+      # coverage drops below the floor in scripts/coverage.mjs.
+      - name: run the sweep under coverage
+        run: node scripts/coverage.mjs

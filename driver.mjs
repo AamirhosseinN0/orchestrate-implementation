@@ -9,7 +9,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { execSync, spawnSync } from 'node:child_process';
+import { execSync, execFileSync, spawnSync } from 'node:child_process';
 import os from 'node:os';
 
 const CWD = process.cwd();
@@ -2634,21 +2634,50 @@ function worktreeFor(t) {
   return null;
 }
 
+// git, run as an argument vector rather than a shell string. Nothing here is
+// interpolated into a command line: a branch name arrives from agent-authored
+// `task add < json`, and as a shell string one called `main; touch /tmp/PWNED`
+// did exactly that. `-z` also stops core.quotePath mangling any path that is
+// not ASCII, which used to be recorded as a blocking trespass defect.
+function gitZ(args, cwd) {
+  return execFileSync('git', ['-c', 'core.quotePath=false', ...args],
+    { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).split('\0');
+}
+// `main` was hardcoded, so guard was unusable in any repo whose default branch
+// is called something else. Ask the repo what its integration branch is.
+function defaultBase() {
+  for (const ref of ['refs/remotes/origin/HEAD', 'HEAD']) {
+    try {
+      const out = execFileSync('git', ['symbolic-ref', '--short', '-q', ref],
+        { cwd: CWD, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+      if (out) return out.replace(/^origin\//, '');
+    } catch { /* not set, or not a repo */ }
+  }
+  return 'main';
+}
+
 function cmdGuard(key, flags) {
   const r = readReg(); const t = getTask(r, key);
   const wt = worktreeFor(t);
   if (!wt) die('cannot find a copy of the repository on branch ' + t.branch +
     '\n       Record it: driver.mjs chip ' + key + ' --worktree <path>');
-  const base = flags.base || 'main';
+  const base = flags.base || defaultBase();
+  for (const [what, v] of [['--base', base], ['the branch', t.branch]])
+    if (!v || v.startsWith('-')) die(what + ' is not a usable git ref: "' + v + '"');
+  // --no-renames matters: with renames detected, `git diff --name-only` prints
+  // only a rename's destination. `git mv other/config.ts src/config.ts` deletes
+  // a file this task does not own, and guard used to call that clean.
+  const range = base + '...' + t.branch;
+  const cmdText = 'git diff --no-renames -z --name-only ' + range;
   let changed;
   try {
-    changed = execSync('git diff --name-only ' + base + '...' + t.branch, { cwd: wt, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })
-      .split('\n').map((x) => x.trim()).filter(Boolean);
-  } catch (e) { die('could not diff ' + base + '...' + t.branch + ' in ' + wt); }
+    changed = gitZ(['diff', '--no-renames', '-z', '--name-only', range, '--'], wt)
+      .map((x) => x.trim()).filter(Boolean);
+  } catch (e) { die('could not diff ' + range + ' in ' + wt + '\n       (is "' + base + '" a branch this repo has? pass --base <ref> if not)'); }
   if (!changed.length) {
     const d = recordDefect(r, { task: key, kind: 'guard',
       what: key + ' reported finished but its branch changed nothing against ' + base,
-      evidence: 'git diff --name-only ' + base + '...' + t.branch + ' → empty', blocking: true });
+      evidence: cmdText + ' → empty', blocking: true });
     commit(r);
     console.log('⚠ ' + key + ' changed nothing at all against ' + base + '. That is not finished work.');
     console.log('  recorded ' + d.id + '. Ask which branch it committed to — do not go looking yourself.');
@@ -2712,9 +2741,18 @@ function cmdLanded(key, flags) {
 function trespass(r) {
   let out = [];
   try {
-    const dirty = execSync('git status --porcelain', { cwd: CWD, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })
-      .split('\n').map((l) => l.slice(3).trim()).filter(Boolean)
-      .map((l) => l.includes(' -> ') ? l.split(' -> ')[1] : l);
+    // -z, so a non-ASCII path is not handed back quoted and mangled, and so a
+    // rename's two halves arrive as two records instead of one " -> " line.
+    // Both halves count: renaming a file away is changing it.
+    const parts = gitZ(['status', '--porcelain', '-z'], CWD);
+    const dirty = [];
+    for (let i = 0; i < parts.length; i++) {
+      const e = parts[i];
+      if (!e) continue;
+      const xy = e.slice(0, 2), p = e.slice(3).trim();
+      if (p) dirty.push(p);
+      if (/[RC]/.test(xy)) { const src = (parts[++i] || '').trim(); if (src) dirty.push(src); }
+    }
     for (const f of dirty) for (const t of tasks(r)) {
       if ((t.owns || []).some((o) => collides(f, o))) out.push({ file: f, key: t.key });
     }

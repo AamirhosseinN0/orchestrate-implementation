@@ -14,6 +14,12 @@ import os from 'node:os';
 
 const CWD = process.cwd();
 const CMDLINE = process.argv.slice(2).join(' ').slice(0, 200);
+// The resolved subcommand — `refine done`, `defect add`, `iam` — filled in by the
+// dispatch at the bottom. The raw argv is kept alongside it, but argv is not what
+// belongs in a narrow column: an invocation that leads with `--register <abs path>`
+// pushes the command itself off the end of the line, and the log then reads as
+// hundreds of rows that name no command at all.
+let CMDNAME = '';
 let REG_PATH = path.join(CWD, '.claude', 'orchestration', 'register.json');
 
 const die = (m) => { console.error('error: ' + m); process.exit(2); };
@@ -303,7 +309,7 @@ function commit(r, why) {
   const seq = (events.length ? Math.max(...events.map((e) => e.seq || 0)) : 0) + 1;
   fs.mkdirSync(path.dirname(f), { recursive: true });
   sealLastLine(f);
-  const rec = { seq, at: now(), cmd: why || CMDLINE, ops };
+  const rec = { seq, at: now(), cmd: why || CMDNAME || CMDLINE, argv: CMDLINE, ops };
   if (lost) {
     rec.reseed = true;
     rec.why = 'the record at ' + rel(f) + ' was missing or empty while the register still held ' +
@@ -372,17 +378,44 @@ function cmdRebuild(flags) {
   }
 }
 
+// Events written before the command was recorded by name hold the raw argv, and
+// an argv that leads with `--register <abs path>` fills the whole column with the
+// path. Nothing can be done about what was written, but the column can drop the
+// flags nobody reads and show the words that actually name the command.
+function cmdLabel(e) {
+  const raw = String(e.cmd || '');
+  if (e.argv === undefined) {          // an old row: raw argv, flags and all
+    const words = [];
+    const parts = raw.split(/\s+/).filter(Boolean);
+    for (let i = 0; i < parts.length && words.length < 3; i++) {
+      const p = parts[i];
+      if (p === '--') break;
+      if (p.startsWith('--')) {
+        // Once the command's own words have started, a flag ends them. Reading on
+        // past it picks up the loose words of a long `--why "..."` and renders
+        // them as if they were the command.
+        if (words.length) break;
+        if (!p.includes('=') && parts[i + 1] && !parts[i + 1].startsWith('--')) i++;
+        continue;
+      }
+      words.push(p);
+    }
+    return words.join(' ') || raw;
+  }
+  return raw;
+}
+
 function cmdEvents(flags) {
   const { events, problems } = readEvents();
   for (const x of problems) console.error('· ' + x.why);
   let show = events;
   const since = numFlag(flags, 'since', { min: 0 });
   if (since !== undefined) show = show.filter((e) => (e.seq || 0) > since);
-  if (typeof flags.task === 'string') show = show.filter((e) => JSON.stringify(e.ops).includes('"' + flags.task + '"') || String(e.cmd).includes(flags.task));
+  if (typeof flags.task === 'string') show = show.filter((e) => JSON.stringify(e.ops).includes('"' + flags.task + '"') || cmdLabel(e).includes(flags.task));
   if (typeof flags.grep === 'string') show = show.filter((e) => JSON.stringify(e).includes(flags.grep));
   const n = numFlag(flags, 'n', { min: 1 }) ?? 40;
   for (const e of show.slice(-n)) {
-    console.log(String(e.seq).padStart(5) + '  ' + String(e.at).slice(0, 19).replace('T', ' ') + '  ' + String(e.cmd || '').slice(0, 46));
+    console.log(String(e.seq).padStart(5) + '  ' + String(e.at).slice(0, 19).replace('T', ' ') + '  ' + cmdLabel(e).slice(0, 46));
     for (const o of e.ops.slice(0, 4))
       console.log('        ' + (o.d ? '- ' : '  ') + o.p.join('.') + (o.d ? '' : ' → ' + JSON.stringify(o.v).slice(0, 60)));
     if (e.ops.length > 4) console.log('        …' + (e.ops.length - 4) + ' more change(s)');
@@ -3263,6 +3296,12 @@ for (let i = 0; i < argv.length; i++) {
 if (flags.register !== undefined) REG_PATH = path.resolve(CWD, flags.register);
 
 const cmd = rest.shift();
+// What the record calls this invocation. The commands below that read a second
+// word out of `rest` need that word too — `refine done` and `refine brief` are
+// different events and must not both show up as `refine`.
+const SUB_COMMANDS = new Set(['ci', 'defect', 'log', 'owed', 'preflight', 'refine', 'slot', 'task']);
+if (cmd) CMDNAME = cmd + (SUB_COMMANDS.has(cmd) && rest[0] && !rest[0].startsWith('--') ? ' ' + rest[0] : '');
+
 const HELP = `orchestrate-implementation driver — bookkeeping for a grill session.
 
   load <path|dir|glob>...   resolve plan files, record sizes. Read them yourself after.

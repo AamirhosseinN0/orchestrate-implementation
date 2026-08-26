@@ -332,26 +332,80 @@ function cmdLogReseed(flags) {
 
 // ---------------------------------------------------------------- resolving
 
+// Every plan file under a directory, deepest last, dot-dirs and node_modules
+// skipped.
+function walkPlans(root) {
+  const out = [];
+  (function walk(d) {
+    let entries = [];
+    try { entries = fs.readdirSync(d, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      if (e.name.startsWith('.') || e.name === 'node_modules') continue;
+      const p = path.join(d, e.name);
+      if (e.isDirectory()) walk(p);
+      else if (/\.(md|markdown|txt|rst)$/i.test(e.name)) out.push(p);
+    }
+  })(root);
+  return out.sort();
+}
+
+// A wildcard was only ever read in the last segment, so `docs/*/plan.md` looked
+// in a directory literally named "*" and reported "no files matched"; and a
+// wildcard that matched a directory handed that directory to readFileSync,
+// which threw EISDIR. Both are fixed by matching segment by segment: `*` inside
+// one name, `**` across any depth, and a directory that survives the match is
+// walked for plans rather than read as one.
+function globPlans(arg) {
+  const abs = path.resolve(CWD, arg);
+  const parts = abs.split(path.sep).filter(Boolean);
+  const seg = (s) => new RegExp('^' + s.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '[^/]*') + '$');
+  let here = [path.sep];
+  for (let i = 0; i < parts.length; i++) {
+    const part = parts[i];
+    const next = [];
+    if (part === '**') {
+      // any depth, this level included
+      for (const d of here) {
+        next.push(d);
+        for (const sub of (function all(x, acc) {
+          let es = [];
+          try { es = fs.readdirSync(x, { withFileTypes: true }); } catch { return acc; }
+          for (const e of es) {
+            if (!e.isDirectory() || e.name.startsWith('.') || e.name === 'node_modules') continue;
+            const p = path.join(x, e.name); acc.push(p); all(p, acc);
+          }
+          return acc;
+        })(d, [])) next.push(sub);
+      }
+    } else if (part.includes('*')) {
+      const re = seg(part);
+      for (const d of here) {
+        let es = [];
+        try { es = fs.readdirSync(d); } catch { continue; }
+        for (const e of es) if (re.test(e)) next.push(path.join(d, e));
+      }
+    } else {
+      for (const d of here) {
+        const p = path.join(d, part);
+        if (fs.existsSync(p)) next.push(p);
+      }
+    }
+    here = [...new Set(next)];
+    if (!here.length) return [];
+  }
+  const out = [];
+  for (const p of here) {
+    let st; try { st = fs.statSync(p); } catch { continue; }
+    if (st.isDirectory()) out.push(...walkPlans(p));
+    else out.push(p);
+  }
+  return [...new Set(out)].sort();
+}
+
 function expand(arg) {
   const abs = path.resolve(CWD, arg);
-  if (fs.existsSync(abs) && fs.statSync(abs).isDirectory()) {
-    const out = [];
-    (function walk(d) {
-      for (const e of fs.readdirSync(d, { withFileTypes: true })) {
-        if (e.name.startsWith('.') || e.name === 'node_modules') continue;
-        const p = path.join(d, e.name);
-        if (e.isDirectory()) walk(p);
-        else if (/\.(md|markdown|txt|rst)$/i.test(e.name)) out.push(p);
-      }
-    })(abs);
-    return out.sort();
-  }
-  if (arg.includes('*')) {
-    const dir = path.dirname(abs), base = path.basename(abs);
-    if (!fs.existsSync(dir)) return [];
-    const re = new RegExp('^' + base.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*') + '$');
-    return fs.readdirSync(dir).filter((f) => re.test(f)).map((f) => path.join(dir, f)).sort();
-  }
+  if (arg.includes('*')) return globPlans(arg);
+  if (fs.existsSync(abs) && fs.statSync(abs).isDirectory()) return walkPlans(abs);
   return fs.existsSync(abs) ? [abs] : [];
 }
 
@@ -396,20 +450,53 @@ function scanFile(p) {
 
 // A plan can also be silent. If a whole category of question is never
 // mentioned anywhere in the document, that is a gap nobody wrote down.
+//
+// Each word below is matched as a WORD, not as a run of letters. Matched as
+// bare substrings, "deliberate" and "separate" both read as *rate*, "download"
+// read as *load*, "against" as *again* and "capture" as *cap* — so a plan that
+// says nothing at all about limits or growth was recorded as covering both, and
+// on the real corpus 11 of 14 genuine silences went unreported. A trailing `*`
+// means "this word and anything grown from it" (migrat* → migrate, migration,
+// migrating); without it the whole word must stand alone.
 const CATEGORIES = [
-  { id: 'failure',    ask: 'what happens when it fails',        words: ['fail', 'error', 'crash', 'retry', 'timeout', 'rollback', 'roll back', 'exception', 'goes wrong'] },
-  { id: 'limits',     ask: 'how much is too much',              words: ['limit', 'quota', 'cap', 'maximum', 'max ', 'rate', 'throttle', 'too many', 'size'] },
-  { id: 'permission', ask: 'who is allowed to do it',           words: ['who can', 'allowed', 'permission', 'role', 'actor', 'access', 'may not', 'forbidden'] },
-  { id: 'repeat',     ask: 'what happens if it runs twice',     words: ['twice', 'duplicate', 'idempot', 'replay', 'again', 'already', 'repeat', 're-run', 'rerun'] },
-  { id: 'existing',   ask: 'what happens to what already exists',words: ['migrat', 'backfill', 'existing', 'already stored', 'upgrade', 'old rows', 'historic'] },
-  { id: 'proof',      ask: 'how anyone knows it works',         words: ['test', 'fixture', 'golden', 'verify', 'prove', 'assert', 'check that', 'acceptance'] },
-  { id: 'undo',       ask: 'how it is undone or deleted',       words: ['undo', 'delete', 'remove', 'revert', 'erase', 'retention', 'purge', 'cancel'] },
-  { id: 'growth',     ask: 'what it looks like at ten times the size', words: ['scale', 'grow', 'volume', 'load', 'how many', 'per second', 'concurren', 'thousand'] },
+  { id: 'failure',    ask: 'what happens when it fails',        words: ['fail*', 'error*', 'crash*', 'retry*', 'timeout*', 'rollback*', 'roll back', 'exception*', 'goes wrong'] },
+  { id: 'limits',     ask: 'how much is too much',              words: ['limit*', 'quota*', 'cap', 'caps', 'maximum', 'max', 'rate', 'rates', 'rate-limit*', 'throttl*', 'too many', 'size*'] },
+  { id: 'permission', ask: 'who is allowed to do it',           words: ['who can', 'allow*', 'permission*', 'role', 'roles', 'actor*', 'access*', 'may not', 'forbidden'] },
+  { id: 'repeat',     ask: 'what happens if it runs twice',     words: ['twice', 'duplicat*', 'idempot*', 'replay*', 'again', 'already', 'repeat*', 're-run', 'rerun*'] },
+  { id: 'existing',   ask: 'what happens to what already exists',words: ['migrat*', 'backfill*', 'existing', 'already stored', 'upgrade*', 'old rows', 'historic*'] },
+  { id: 'proof',      ask: 'how anyone knows it works',         words: ['test*', 'fixture*', 'golden', 'verif*', 'prove*', 'proof', 'assert*', 'check that', 'acceptance'] },
+  { id: 'undo',       ask: 'how it is undone or deleted',       words: ['undo', 'undone', 'delete*', 'remove*', 'removal', 'revert*', 'erase*', 'erasure', 'retention', 'purge*', 'cancel*'] },
+  { id: 'growth',     ask: 'what it looks like at ten times the size', words: ['scale*', 'scaling', 'grow*', 'growth', 'volume*', 'load', 'loads', 'how many', 'per second', 'concurren*', 'thousand*'] },
 ];
 
+// `foo*` → the word and anything grown from it; `foo` → that word alone.
+// Built once, because `silence` runs this over every plan in the register.
+const CATEGORY_RE = new Map(CATEGORIES.map((c) => [c.id, new RegExp(
+  c.words.map((w) => {
+    const stem = w.endsWith('*') ? w.slice(0, -1) : w;
+    const src = stem.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/[ -]/g, '[ -]');
+    return '\\b' + src + (w.endsWith('*') ? '[a-z]*' : '\\b');
+  }).join('|'), 'i')]));
+
 function silenceFile(p) {
-  const text = fs.readFileSync(p, 'utf8').toLowerCase();
-  return CATEGORIES.filter((c) => !c.words.some((w) => text.includes(w)));
+  const text = readPlan(p);
+  return CATEGORIES.filter((c) => !CATEGORY_RE.get(c.id).test(text));
+}
+
+// Every read of a plan file goes through here. A plan that has been renamed or
+// moved since `load` used to come back as a raw ENOENT stack trace, which says
+// nothing about what to do; this names the file and the way out.
+function readPlan(p) {
+  try {
+    return fs.readFileSync(p, 'utf8');
+  } catch (e) {
+    if (e && e.code === 'ENOENT')
+      die('the plan ' + rel(p) + ' is on the register but not on disk — it has been renamed,\n' +
+          '       moved or deleted since `load`. Re-run `load` with its new path, or restore it.');
+    if (e && e.code === 'EISDIR') die(rel(p) + ' is a directory, not a plan file.');
+    if (e && e.code === 'EACCES') die('cannot read the plan ' + rel(p) + ' — permission denied.');
+    throw e;
+  }
 }
 
 // ------------------------------------------------------------------ commands

@@ -1117,7 +1117,32 @@ function cmdTaskAdd() {
     const probs = taskProblems(it, at < 0);
     const label = 'item ' + (i + 1) + (it && it.key ? ' ("' + it.key + '")' : '');
     if (probs.length) { for (const x of probs) errs.push(label + ' ' + x); continue; }
-    plans.push({ it, at });
+    plans.push({ it, at, label });
+  }
+  // "two tasks may not touch one file" was asserted in the message above and
+  // then never checked against another task. A path claimed twice is the one
+  // failure this whole arrangement exists to prevent, so a NEW task claiming a
+  // path some still-open task already owns is refused here, at the only moment
+  // it is cheap to fix. Existing state is not re-judged — `doctor` reports that
+  // — because a register with the collision already in it must stay usable.
+  const contender = (t) => !['landed', 'cancelled'].includes(t.status);
+  for (let n = 0; n < plans.length; n++) {
+    const { it, at, label } = plans[n];
+    if (at >= 0) continue;                       // an update, not a new claim
+    for (const own of it.owns || []) {
+      const clashes = [];
+      for (const other of tasks(r)) {
+        if (other.key === it.key || !contender(other)) continue;
+        for (const b of other.owns || []) if (collides(own, b)) clashes.push(other.key + ' owns ' + b);
+      }
+      for (let m = 0; m < plans.length; m++) {
+        if (m === n || plans[m].it.key === it.key) continue;
+        for (const b of plans[m].it.owns || []) if (collides(own, b)) clashes.push(plans[m].it.key + ' (same batch) owns ' + b);
+      }
+      if (clashes.length)
+        errs.push(label + ' claims ' + own + ', which is already owned: ' + [...new Set(clashes)].join('; ') +
+          ' — two tasks may not touch one file. Narrow one of them, or make one wait for the other and split the file.');
+    }
   }
   if (errs.length) die('nothing was saved:\n       ' + errs.join('\n       '));
   const said = [];
@@ -1151,7 +1176,8 @@ function cmdTaskAdd() {
 function cmdGraph() {
   const r = readReg(); const ws = waves(r);
   if (!ws.length) die('no tasks yet');
-  let bad = 0;
+  let bad = 0, pairs = 0, skipped = 0;
+  const history = [];
   const lines = [];
   lines.push('## The work, and what can run side by side');
   lines.push('');
@@ -1956,6 +1982,48 @@ function cmdDoctor() {
     bad++;
     console.log('✗ ' + t.key);
     for (const x of probs) console.log('    ' + x);
+  }
+  // `task add` refuses a new claim on a path some other open task already owns.
+  // Nothing ever looked at what was already on record, and on a real run 52 of
+  // 203 owned paths turned out to be claimed twice, one of them seven times.
+  // This is the only place that says so.
+  const open = tasks(r).filter((t) => !['landed', 'cancelled'].includes(t.status));
+  const dup = [];
+  for (let i = 0; i < open.length; i++) for (let j = i + 1; j < open.length; j++) {
+    const o = overlap(open[i], open[j]);
+    if (o.length) dup.push(open[i].key + ' ↔ ' + open[j].key + '   ' + o.join('; '));
+  }
+  if (dup.length) {
+    bad += dup.length;
+    console.log('✗ ' + dup.length + ' pair(s) of open tasks claim the same path:');
+    for (const x of dup.slice(0, 40)) console.log('    ' + x);
+    if (dup.length > 40) console.log('    … and ' + (dup.length - 40) + ' more.');
+    console.log('    Ownership is the rule everything else rests on. Narrow one side of each pair,');
+    console.log('    or make one wait for the other — they cannot both be handed out.');
+  }
+  // Duplicates where one side has already merged are history, not a gate — but
+  // the count says how often the rule was broken while nothing was checking.
+  const everything = tasks(r).filter((t) => t.status !== 'cancelled');
+  let past = 0;
+  for (let i = 0; i < everything.length; i++) for (let j = i + 1; j < everything.length; j++)
+    if ((everything[i].status === 'landed' || everything[j].status === 'landed') &&
+        overlap(everything[i], everything[j]).length) past++;
+  if (past) console.log('· ' + past + ' further pair(s) share a path with work that has already landed — history, not a gate.');
+  // A serialisation point is a claim about something two tasks share. One named
+  // by a single task is either a typo for somebody else's spelling, or a note
+  // that gates nothing — and it reads, wrongly, like a live constraint.
+  const byPoint = new Map();
+  for (const t of open) for (const s of t.serialises || []) {
+    const e = byPoint.get(normPoint(s)) || { keys: new Set(), spellings: new Set() };
+    e.keys.add(t.key); e.spellings.add(s);
+    byPoint.set(normPoint(s), e);
+  }
+  const lone = [...byPoint.entries()].filter(([, e]) => e.keys.size === 1);
+  if (lone.length) {
+    console.log('· ' + lone.length + ' serialisation point(s) only one task names:');
+    for (const [, e] of lone) console.log('    ' + [...e.spellings][0] + '   (' + [...e.keys][0] + ' alone)');
+    console.log('    A point nobody else claims gates nothing. Either another task should be naming');
+    console.log('    it — check the spelling against theirs — or it does not belong in `serialises`.');
   }
   // An owed item outlives the task it was assigned to, and nothing else looks.
   const shut = allShutWindows(r);

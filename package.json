@@ -1,0 +1,10 @@
+{
+  "name": "orchestrate-implementation",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "test": "node test.mjs",
+    "test:coverage": "node scripts/coverage.mjs"
+  }
+}

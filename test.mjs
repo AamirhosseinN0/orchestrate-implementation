@@ -41,9 +41,14 @@ function drv(cwd, args, { stdin, timeout } = {}) {
 // itself. Several cases below care about that and not about the exit code.
 const traced = (out) => /\n\s+at /.test(String(out));
 const readIf = (f) => { try { return fs.readFileSync(f, 'utf8'); } catch { return ''; } };
-const reg = (d) => JSON.parse(fs.readFileSync(path.join(d, '.claude/orchestration/register.json'), 'utf8'));
-const ledger = (d) => fs.readFileSync(path.join(d, '.claude/orchestration/messages.jsonl'), 'utf8')
-  .split('\n').filter(Boolean).map((l) => JSON.parse(l));
+// Both come back empty rather than throwing. A register the driver has just
+// destroyed is a failing check, not a stack trace that stops the sweep before
+// the rest of it has run.
+const reg = (d) => { try { return JSON.parse(readIf(path.join(d, '.claude/orchestration/register.json'))); } catch { return {}; } };
+const ledger = (d) => readIf(path.join(d, '.claude/orchestration/messages.jsonl'))
+  .split('\n').filter(Boolean).flatMap((l) => { try { return [JSON.parse(l)]; } catch { return []; } });
+const tasksOf = (d) => (reg(d) || {}).tasks || [];
+const gapsOf = (d) => (reg(d) || {}).gaps || [];
 
 function sandbox(name) {
   const d = fs.mkdtempSync(path.join(os.tmpdir(), 'orch-' + name + '-'));
@@ -355,7 +360,7 @@ say('a lost record does not take the register with it');
   fs.rmSync(path.join(d, '.claude/orchestration/events.jsonl'));
   drv(d, ['iam', 'zed']);
   drv(d, ['rebuild']);
-  ok('the tasks are all still there', reg(d).tasks.length === 3, reg(d).tasks.length + ' task(s)');
+  ok('the tasks are all still there', tasksOf(d).length === 3, tasksOf(d).length + ' task(s)');
   ok('and the record was seeded, not started as a delta', has(drv(d, ['verify']).out, 'agree exactly'));
 }
 
@@ -437,7 +442,7 @@ say('one path has one owner, and task add is where that is cheap to fix');
     { key: 'x2', title: 'y', plan: 'docs/plans/p.md', owns: ['src/shared.py'], needs: [] },
   ]) });
   ok('two tasks in one batch may not claim one path', same.code !== 0 && has(same.out, 'already owned'));
-  ok('and nothing was saved from the batch', !reg(d).tasks.some((t) => t.key === 'x1'));
+  ok('and nothing was saved from the batch', !tasksOf(d).some((t) => t.key === 'x1'));
   const under = drv(d, ['task', 'add'], { stdin: JSON.stringify([
     { key: 'x3', title: 'z', plan: 'docs/plans/p.md', owns: ['src'], needs: [] },
   ]) });
@@ -472,7 +477,7 @@ say('two chips may not move the same serialisation point, however it is spelled'
     { key: 'u1', title: 'one', plan: 'docs/plans/p.md', owns: ['src/u1.py'], needs: [], serialises: ['docker-compose.yml'] },
     { key: 'u2', title: 'two', plan: 'docs/plans/p.md', owns: ['src/u2.py'], needs: [], serialises: ['Docker-Compose.yml '] },
   ]) });
-  ok('both were recorded', reg(d).tasks.filter((t) => ['u1', 'u2'].includes(t.key)).length === 2);
+  ok('both were recorded', tasksOf(d).filter((t) => ['u1', 'u2'].includes(t.key)).length === 2);
   ok('the first chip opens', drv(d, ['chip', 'u1', '--id', 'cu1']).code === 0);
   const second = drv(d, ['chip', 'u2', '--id', 'cu2']);
   ok('the second is refused on the shared point',
@@ -545,7 +550,7 @@ say('a report has to be about work that was actually handed out');
   drv(d, ['landed', 't1', '--sha', 'abc']);
   const after = drv(d, ['done', 't1'], { stdin: '{"verified":"nothing","outcome":"failed"}' });
   ok('and a landed task cannot report again', after.code !== 0);
-  ok('the landing survived the attempt', reg(d).tasks.find((t) => t.key === 't1').status === 'landed');
+  ok('the landing survived the attempt', tasksOf(d).find((t) => t.key === 't1')?.status === 'landed');
 }
 
 // Was: landing did not ask whether the task had ever reported, nor whether what
@@ -556,7 +561,7 @@ say('nothing lands that has not reported, or that stands on unlanded work');
   const unreported = drv(d, ['landed', 't2', '--sha', 'abc']);
   ok('a task that never reported cannot land',
      unreported.code !== 0 && has(unreported.out, 'cannot land before it reports'));
-  ok('and it did not land anyway', reg(d).tasks.find((t) => t.key === 't2').status !== 'landed');
+  ok('and it did not land anyway', tasksOf(d).find((t) => t.key === 't2')?.status !== 'landed');
   drv(d, ['chip', 't1', '--id', 'chip-t1']);
   drv(d, ['done', 't1'], { stdin: '{"verified":"ran true","outcome":"passed"}' });
   drv(d, ['landed', 't1', '--sha', 'abc']);
@@ -588,7 +593,7 @@ say('a bundle takes the dependencies of what it absorbed');
   const d = box('repoint');
   const out = drv(d, ['bundle', 't1', 't2', '--into', 't2']).out;
   ok('it says which task was repointed', has(out, 'repointed at t2'), out.split('\n').slice(-2)[0]);
-  const t3 = reg(d).tasks.find((t) => t.key === 't3');
+  const t3 = tasksOf(d).find((t) => t.key === 't3') || {};
   ok('t3 now waits for the host', (t3.needs || []).includes('t2'));
   ok('and no longer for the cancelled member', !(t3.needs || []).includes('t1'));
   ok('so the graph can still be ordered', drv(d, ['graph']).code === 0);
@@ -604,7 +609,7 @@ say('a section headed Unresolved is the opposite of settled');
     '## Unanswered so far', '', 'The page size is a threshold somebody must pick.', '',
     '## Already decided', '', 'The retry limit is TBD.', ''].join('\n'));
   drv(d, ['scan']);
-  const sections = (reg(d).gaps || []).map((g) => g.section);
+  const sections = gapsOf(d).map((g) => g.section);
   ok('the Unresolved section is read', sections.includes('Unresolved questions'));
   ok('so is the Unanswered one', sections.includes('Unanswered so far'));
   ok('and a genuinely settled heading still silences its own section',
@@ -617,7 +622,7 @@ say('ordinary English passes the plain-words lint and jargon still does not');
 {
   const d = planBox('words', '# a plan\n\n## What is open\n\nThe retry limit is TBD.\n');
   drv(d, ['scan']);
-  const g = (reg(d).gaps || [])[0]?.id;
+  const g = gapsOf(d)[0]?.id;
   ok('there is a gap to write a question against', !!g);
   const q = (text) => drv(d, ['question', g], { stdin: JSON.stringify({ text,
     options: [{ label: 'Work it out each time', gain: 'never stale', cost: 'slower', recommended: true },
@@ -640,7 +645,7 @@ say('check will not call a session finished on a claim');
   ok('a register nothing was ever scanned against is refused',
      never.code !== 0 && has(never.out, 'no scan has been run'));
   drv(d, ['scan']);
-  const g = (reg(d).gaps || [])[0]?.id;
+  const g = gapsOf(d)[0]?.id;
   drv(d, ['set', g, 'scope=in']);
   drv(d, ['set', g, 'status=answered']);
   const hollow = drv(d, ['check']);
@@ -699,8 +704,14 @@ say('telling an agent to go ahead is not answering what it asked');
 say('the dead message commands are gone');
 {
   const d = box('dead');
+  // They were unreachable from the dispatch long before they were removed, so
+  // asking the command line about them proves nothing. The source is the only
+  // place the difference shows.
+  const src = readIf(DRIVER);
+  for (const c of ['Inbox', 'Reply', 'Ack', 'Post', 'ReadMsg'])
+    ok('cmd' + c + ' is gone from the driver', !new RegExp('\\bfunction cmd' + c + '\\b').test(src));
   for (const c of ['inbox', 'reply', 'ack', 'post', 'read'])
-    ok('`' + c + '` is no longer a command',
+    ok('`' + c + '` is not a command either',
        has(drv(d, [c]).out, 'orchestrate-implementation driver'), c);
 }
 
@@ -786,7 +797,7 @@ say('verify is green on a recorded run nobody made up');
   const out = drv(d, ['verify']);
   ok('the record replays to the register exactly', out.code === 0 && has(out.out, 'agree exactly'),
      out.out.split('\n').slice(0, 3).join(' '));
-  ok('and it is a run of some size', reg(d).tasks.length >= 20 &&
+  ok('and it is a run of some size', tasksOf(d).length >= 20 &&
      readIf(path.join(d, '.claude/orchestration/events.jsonl')).split('\n').filter(Boolean).length >= 400);
 }
 
@@ -798,7 +809,7 @@ else console.log('\nsandboxes kept: ' + boxes.join('\n                '));
 // an exception thrown before its first `ok`, a case quietly commented out — and
 // the suite still ends on "all green", because green is only ever measured
 // against however many checks happened to run.
-const EXPECTED = 138;   // every check below counts; bump this deliberately when you add one
+const EXPECTED = 143;   // every check below counts; bump this deliberately when you add one
 
 console.log('\n' + '-'.repeat(60));
 if (pass + failures.length !== EXPECTED)

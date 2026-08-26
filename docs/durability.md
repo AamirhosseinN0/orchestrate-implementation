@@ -13,12 +13,15 @@ current mechanism:
 
 | Concern | What `driver.mjs` does | Where |
 |---|---|---|
-| Context gets compacted | `hook-install` injects `digest` on `compact\|resume\|startup` via a Claude Code SessionStart hook | `cmdHookInstall` (2155), `cmdDigest` (2110) |
+| Context gets compacted | `hook-install` injects `digest` on `compact\|resume\|startup` via a Claude Code SessionStart hook | `cmdHookInstall`, `cmdDigest` |
 | Full chip brief must not be lost | Every brief is written to a **file** (`briefs/<key>.md`), never held in context | `cmdBrief` → `fs.writeFileSync(briefPath(key))` |
-| Tasks / status / decisions | `register.json` is the single source of truth; 30 atomic backups kept on every write | `writeReg` (51) |
-| Messages between orchestrator and chips | Append-only `messages.jsonl` ledger; `ingest` rebuilds it from Claude's on-disk transcripts | `ledgerPath`/`cmdIngest` (1815, 2040) |
-| Session dies mid-run | `resume` re-announces to live chips and rewrites briefs with a new address | `cmdResume` (2206) |
-| Concurrent writers | Directory lock, 15s stale takeover, atomic rename (`tmp` → `REG_PATH`) | `acquireLock`/`writeReg` (37, 51) |
+| Tasks / status / decisions | `register.json` is the current state; 30 atomic backups kept on every write that changes it | `writeReg` |
+| Messages between orchestrator and chips | Append-only `messages.jsonl` ledger; `ingest` rebuilds it from Claude's on-disk transcripts | `ledgerPath`/`cmdIngest` |
+| Session dies mid-run | `resume` re-announces to live chips and rewrites briefs with a new address | `cmdResume` |
+| Concurrent writers | Directory lock, atomic rename (`tmp` → `REG_PATH`); a lock is taken over only once its holder is shown to be gone | `acquireLock`/`lockIsDead`/`writeReg` |
+
+(Function names rather than line numbers: the file moves, and a stale number
+sends the reader to the wrong place with no sign that it has.)
 
 So the design intent — durable artifacts (briefs are files), durable message
 log (`messages.jsonl`), state snapshot with backups (`register.json` +
@@ -108,13 +111,29 @@ documented recovery destroyed the only history. And the register lock was stolen
 from any command still running after fifteen seconds; it now asks the operating
 system whether the holder is alive.
 
+Three more things had to change before the record could be relied on, and they
+are worth naming because each was a way the two halves could quietly disagree.
+`rebuild --to <seq>` rewound the register and left the record where it was, so
+the two were permanently out of step from that moment on; it now cuts the record
+to the same point and keeps what it cut in an `events.jsonl.before-rewind-<stamp>`
+file. A missing `events.jsonl` was replayed as an empty one, so losing the record
+let `rebuild` empty a full register. And `rebuild`, `verify` and `log reseed`
+wrote without holding the lock, onto the same temporary file a locked writer was
+using — so a chip's concurrent `done` was overwritten with no word said. All
+three now take the lock, and `writeReg` takes it as a backstop if anything
+reaches it without one.
+
+The events themselves also record which subcommand produced them, which is what
+makes replay auditable rather than merely correct: `events --task <key>` can now
+say what happened to one task and what did it.
+
 ## The original gap and the fix as first proposed
 
 **Gap:** `register.json` is one mutable row with backups as its only history. It
-is also usually gitignored (per the README), so the 30-backup ring is the entire
-safety net. If the register is corrupted or the ring is swept, the run's task
-state is gone. `messages.jsonl` is already append-only and durable; task-state
-mutations are not.
+is also usually kept out of the project's history — nothing creates that rule, it
+is a choice each run makes — so the 30-backup ring is the entire safety net. If
+the register is corrupted or the ring is swept, the run's task state is gone.
+`messages.jsonl` is already append-only and durable; task-state mutations are not.
 
 **Fix (the proven, highest-leverage one):** split "current state" from "the
 record."
@@ -141,7 +160,12 @@ no context needed).
   the chip itself, not hoped-for (a2a's resubscribe loop).
 - **At-least-once with dedupe.** `ingest` already dedupes on `uuid`. Extend the
   same idempotency to an event log (a2a: deterministic `messageId`, effectively-
-  once delivery).
+  once delivery). Recovery itself has since been widened twice: a second shape
+  of message wrapper is now unpicked, and turns taken from a subdirectory of the
+  project are no longer discarded — on one real transcript set that moved the
+  recovered count from 311 messages to 632. A message the transcript itself cut
+  short is marked as cut rather than passed off as whole, and `ingest --reclean`
+  re-derives entries an older copy of the tool recovered badly.
 - **Terminal tasks are immutable.** Your `owed`/hotfix model already treats a
   defect as a new task, never a rewrite of history — keep that; it matches a2a
   and event-sourcing.

@@ -2129,6 +2129,56 @@ function waveArg(flags) {
   return Number(flags.wave) - 1;
 }
 
+// Results used to be filed under a round number in `r.ci`. When checkpoints
+// replaced that, every reader went with it and the data stayed — eight real
+// runs, with their references and the reasoning about what was contention and
+// what was code, that nothing in the tool could reach any more.
+//
+// They cannot be converted honestly. A checkpoint's `covers` is the whole
+// point of it, and a round number cannot be turned back into the task keys it
+// meant, because rounds renumber — that is why they were abandoned. So they
+// come across with `covers: []`, which is not a gap in the import: it says
+// they prove nothing that can still be named, and `provenAt` will never count
+// them. What they are is history, and history is worth keeping readable.
+function cmdCiImportLegacy() {
+  const r = readReg();
+  const old = r.ci && typeof r.ci === 'object' ? r.ci : null;
+  const rounds = old ? Object.keys(old).sort((a, b) => Number(a) - Number(b)) : [];
+  if (!rounds.length) return console.log('nothing to import — there is no `ci` block on this register.');
+  let n = checkpoints(r).reduce((m, c) => Math.max(m, /^l/.test(String(c.id)) ? parseInt(String(c.id).slice(1), 10) || 0 : 0), 0);
+  for (const k of rounds) {
+    const o = old[k] || {};
+    checkpoints(r).push({
+      id: 'l' + String(++n).padStart(2, '0'),
+      status: o.status || 'green', ref: o.ref || '',
+      why: '[imported from round ' + (Number(k) + 1) + '; the tasks it covered were never recorded] ' + (o.why || ''),
+      covers: [], legacy: true, mainSha: o.mainSha || o.sha || '', at: o.at || now(),
+    });
+  }
+  delete r.ci;
+  commit(r);
+  console.log('imported ' + rounds.length + ' legacy result(s) as l01…l' + String(n).padStart(2, '0') + ', and removed the `ci` block.');
+  console.log('Each carries covers: [] — they prove nothing that can still be named, because a round');
+  console.log('number cannot be turned back into task keys. They are kept as history, and `ci list`');
+  console.log('reads them. Nothing landed becomes proven or unproven by this.');
+}
+
+function cmdCiList() {
+  const r = readReg();
+  const cs = checkpoints(r);
+  if (!cs.length) return console.log('no checkpoint has been recorded yet.');
+  for (const c of [...cs].sort((a, b) => String(a.at).localeCompare(String(b.at)))) {
+    console.log(String(c.id).padEnd(5) + String(c.status).padEnd(8) + String(c.at).slice(0, 19).replace('T', ' ') +
+      '  ' + (c.ref || '(no ref)'));
+    console.log('     covers ' + (c.covers && c.covers.length ? c.covers.join(' ')
+      : '(nothing — proves no task)' + (c.legacy ? ', imported history' : '')));
+    if (c.why) console.log('     ' + String(c.why).replace(/\s+/g, ' ').slice(0, 150));
+  }
+  const un = unprovenLanded(r);
+  console.log('\n' + cs.length + ' checkpoint(s). ' + un.length + ' landed task(s) are not covered by a green one' +
+    (un.length ? ': ' + un.map((t) => t.key).join(' ') : '.'));
+}
+
 function cmdCi(flags) {
   const r = readReg();
   const wa = waveArg(flags);
@@ -3076,6 +3126,9 @@ driving the work out, after the grill:
                             free the slot even if it fails. Also: slot status|wait|take|free.
   wave [--wave n]           the round in flight: what is left, and whether the next may open.
   ci --status green|red|skipped [--ref r] [--why w]   record CI for the round just landed.
+  ci list                   every checkpoint, oldest first, and what each one covers.
+  ci import-legacy          one-off: move results still filed under a round number into
+                            checkpoints as history. They cover nothing and prove nothing.
 
   --register <path>         default .claude/orchestration/register.json`;
 
@@ -3131,7 +3184,11 @@ switch (cmd) {
   case 'slot': cmdSlot(rest.shift(), rest, flags, raw); break;
   case 'frontier': cmdFrontier(); break;
   case 'bundle': cmdBundle(rest.shift(), rest, flags); break;
-  case 'ci': cmdCi(flags); break;
+  case 'ci':
+    if (rest[0] === 'import-legacy') cmdCiImportLegacy();
+    else if (rest[0] === 'list') cmdCiList();
+    else cmdCi(flags);
+    break;
   case 'say': cmdSay(rest[0], flags); break;
   case 'heard': cmdHeard(rest[0], flags); break;
   case 'ingest': cmdIngest(flags); break;

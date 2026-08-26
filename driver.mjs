@@ -18,8 +18,14 @@ let REG_PATH = path.join(CWD, '.claude', 'orchestration', 'register.json');
 const die = (m) => { console.error('error: ' + m); process.exit(2); };
 const now = () => new Date().toISOString();
 
-function readReg() {
+function readReg() {          // for read-modify-write: holds the lock until exit
   acquireLock();
+  return readRegRO();
+}
+// Writes land by atomic rename, so a reader never sees a torn file. Commands
+// that only look (and commands a chip runs from its own process) use this and
+// never wait on anyone.
+function readRegRO() {
   if (!fs.existsSync(REG_PATH)) die('no register at ' + rel(REG_PATH) + ' — run `load` first');
   return JSON.parse(fs.readFileSync(REG_PATH, 'utf8'));
 }
@@ -1822,6 +1828,253 @@ function ledger() {
   }).filter(Boolean);
 }
 
+
+// ------------------------------------------------------------- message store
+// The old ledger had the orchestrator retype what an agent said, which put the
+// payload through a context that gets compacted — so a question could be lost
+// entirely, or logged as a paraphrase. Now the sender writes the file, from its
+// own process, before the orchestrator's context ever sees it. Messages are
+// immutable files; being handled is a separate sidecar file, so nothing is ever
+// rewritten and two writers can never collide.
+function msgDir() { return orchDir('messages'); }
+function newMsgId(key) {
+  const stamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\..+/, '');
+  return stamp + '-' + slug(key || 'x').slice(0, 20) + '-' + crypto.randomBytes(3).toString('hex');
+}
+// tmp + rename: a half-written message is never visible to a reader
+function writeMsg(m) {
+  const dir = msgDir();
+  const f = path.join(dir, m.id + '.json');
+  const tmp = path.join(dir, '.' + m.id + '.tmp');
+  fs.writeFileSync(tmp, JSON.stringify(m, null, 2) + '\n');
+  fs.renameSync(tmp, f);
+  return f;
+}
+function allMsgs() {
+  const dir = msgDir();
+  return fs.readdirSync(dir).filter((f) => f.endsWith('.json') && !f.endsWith('.ack.json'))
+    .sort()
+    .map((f) => {
+      try {
+        const m = JSON.parse(fs.readFileSync(path.join(dir, f), 'utf8'));
+        m.acked = fs.existsSync(path.join(dir, m.id + '.ack.json'))
+          ? JSON.parse(fs.readFileSync(path.join(dir, m.id + '.ack.json'), 'utf8')) : null;
+        return m;
+      } catch { return null; }
+    }).filter(Boolean);
+}
+const NEEDS_REPLY = ['question', 'blocked', 'report', 'checkin'];
+
+// Run by the AGENT, from its own process. Body comes in on stdin so nothing is
+// shortened to fit a flag, and the register is only read, never locked.
+function cmdPost(key, flags) {
+  const r = readRegRO();
+  if (!tasks(r).some((t) => t.key === key))
+    die('no task "' + key + '" on record — check the key in your brief.');
+  const kind = flags.kind || 'note';
+  if (!IN_KINDS.includes(kind)) die('--kind must be one of: ' + IN_KINDS.join(', '));
+  let body = '';
+  try { body = fs.readFileSync(0, 'utf8'); } catch { /* none */ }
+  if (!body.trim()) die('the message body goes on stdin:\n' +
+    "       driver.mjs post " + key + " --kind " + kind + " <<'EOF'\n       ...what you want to say...\n       EOF");
+  const m = { id: newMsgId(key), at: now(), dir: 'in', key, kind,
+              subject: flags.subject || body.trim().split('\n')[0].slice(0, 90), body: body.trimEnd() };
+  writeMsg(m);
+  console.log('posted ' + m.id);
+  console.log('');
+  console.log('Now send exactly this one line — nothing more. The orchestrator reads the message');
+  console.log('itself, from the file, so it cannot lose or shorten what you actually wrote:');
+  console.log('');
+  console.log('  [' + key + '] ' + kind + ' posted: ' + m.id + ' — ' + m.subject);
+}
+
+// Run by the ORCHESTRATOR. Composing and recording are one act, so what was
+// promised survives whether or not anyone remembers to log it afterwards.
+function recordOut(key, kind, text) {
+  const m = { id: newMsgId(key), at: now(), dir: 'out', key, kind,
+              subject: String(text).trim().split('\n')[0].slice(0, 90), body: String(text).trimEnd() };
+  writeMsg(m);
+  return m;
+}
+function cmdReply(key, flags) {
+  const r = readRegRO(); const t = tasks(r).find((x) => x.key === key);
+  if (!t) die('no task "' + key + '"');
+  let text = typeof flags.text === 'string' ? flags.text : '';
+  if (!text) { try { text = fs.readFileSync(0, 'utf8'); } catch { /* none */ } }
+  if (!text.trim()) die('reply ' + key + ' --text "..."  (or the body on stdin)');
+  const kind = flags.kind || 'reply';
+  if (!OUT_KINDS.includes(kind)) die('--kind must be one of: ' + OUT_KINDS.join(', '));
+  const m = recordOut(key, kind, text);
+  const acked = [];
+  if (flags.to) { acked.push(...String(flags.to).split(',').map((x) => x.trim()).filter(Boolean)); }
+  for (const id of acked) ackMsg(id, 'answered by ' + m.id);
+  console.log('recorded ' + m.id + (acked.length ? '  (marks ' + acked.join(', ') + ' handled)' : ''));
+  console.log('');
+  console.log('Send this to ' + (t.agent || '<no address yet>') + ':');
+  console.log('');
+  console.log(m.body);
+}
+
+function ackMsg(id, note) {
+  const f = path.join(msgDir(), id + '.json');
+  if (!fs.existsSync(f)) die('no message ' + id);
+  fs.writeFileSync(path.join(msgDir(), id + '.ack.json'),
+    JSON.stringify({ id, at: now(), note: note || '' }, null, 2) + '\n');
+}
+function cmdAck(id, flags) {
+  ackMsg(id, flags.note || '');
+  console.log(id + ' marked handled.');
+}
+
+function cmdInbox(flags) {
+  const msgs = allMsgs().filter((m) => m.dir === 'in')
+    .filter((m) => (flags.key ? m.key === flags.key : true))
+    .filter((m) => (flags.all ? true : !m.acked));
+  if (!msgs.length) return console.log(flags.all ? 'no messages.' : 'nothing unread.');
+  console.log((flags.all ? 'Every message' : 'Unread — each of these is somebody waiting') + ':\n');
+  for (const m of msgs) {
+    const age = Math.round((Date.now() - Date.parse(m.at)) / 60000);
+    console.log('  ' + m.id);
+    console.log('    ' + m.key.padEnd(10) + m.kind.padEnd(10) + age + ' min ago' + (m.acked ? '   ✓ handled' : ''));
+    console.log('    ' + m.subject);
+  }
+  console.log('\nRead one in full:  driver.mjs read <id>');
+  console.log('Answer and close:  driver.mjs reply <key> --text "..." --to <id>');
+}
+
+function cmdReadMsg(id) {
+  const m = allMsgs().find((x) => x.id === id || x.id.startsWith(id));
+  if (!m) die('no message ' + id + ' — `inbox --all` lists them');
+  console.log('id      ' + m.id);
+  console.log('from    ' + m.key + '  (' + m.dir + ', ' + m.kind + ')');
+  console.log('at      ' + m.at.slice(0, 19).replace('T', ' '));
+  console.log('handled ' + (m.acked ? 'yes — ' + (m.acked.note || '') : 'NO — it is waiting on you'));
+  console.log('');
+  console.log(m.body);
+}
+
+
+// ------------------------------------------------------- deriving the ledger
+// Logging a message by hand only works if the orchestrator remembers, and a
+// compaction is exactly the event that makes it forget. It does not have to:
+// Claude Code already writes every turn to a transcript on disk, inbound
+// cross-session messages included, with sender and timestamp. So the ledger is
+// derived from that rather than typed — retroactively, and for messages the
+// orchestrator can no longer see.
+function transcriptDir() {
+  const base = path.join(process.env.HOME, '.claude', 'projects');
+  if (!fs.existsSync(base)) return null;
+  const guess = path.join(base, CWD.replace(/[/_]/g, '-'));
+  if (fs.existsSync(guess)) return guess;
+  // fall back to whichever project dir whose records name this cwd
+  for (const d of fs.readdirSync(base)) {
+    const dir = path.join(base, d);
+    let files = [];
+    try { files = fs.readdirSync(dir).filter((f) => f.endsWith('.jsonl')); } catch { continue; }
+    for (const f of files.slice(0, 3)) {
+      try {
+        const head = fs.readFileSync(path.join(dir, f), 'utf8').split('\n', 40);
+        for (const line of head) {
+          if (!line) continue;
+          try { if (JSON.parse(line).cwd === CWD) return dir; } catch { /* not this one */ }
+        }
+      } catch { /* unreadable */ }
+    }
+  }
+  return null;
+}
+
+function textOf(msg) {
+  const c = msg && msg.content;
+  if (typeof c === 'string') return c;
+  if (Array.isArray(c)) return c.map((b) => b && b.text ? b.text : '').join('');
+  return '';
+}
+
+// The task a message is about, if it names one. Longest key first so "1.9" does
+// not swallow "1.9a".
+function keyIn(text, keys) {
+  const head = text.slice(0, 400);
+  for (const k of keys) {
+    if (new RegExp('(^|[^A-Za-z0-9._-])' + k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '([^A-Za-z0-9._-]|$)').test(head)) return k;
+  }
+  return '';
+}
+
+function harvest(dir, keys) {
+  const out = [];
+  const seen = { files: 0, lines: 0, candidates: 0, parsed: 0, wrongCwd: 0 };
+  for (const f of fs.readdirSync(dir).filter((x) => x.endsWith('.jsonl'))) {
+    let lines;
+    try { lines = fs.readFileSync(path.join(dir, f), 'utf8').split('\n'); } catch { continue; }
+    seen.files++; seen.lines += lines.length;
+    for (const line of lines) {
+      if (!line || (!line.includes('cross-session-message') && !line.includes('SendMessage'))) continue;
+      seen.candidates++;
+      let j; try { j = JSON.parse(line); } catch { continue; }
+      seen.parsed++;
+      if (j.cwd && j.cwd !== CWD) seen.wrongCwd++;
+      if (j.cwd && j.cwd !== CWD) continue;
+      if (j.type === 'user') {
+        const text = textOf(j.message);
+        const env = text.match(/<cross-session-message[^>]*from-name="([^"]+)"/);
+        if (!env) continue;
+        const body = text.replace(/<cross-session-message[^>]*>/, '').replace(/<\/cross-session-message>/, '').trim();
+        out.push({ at: j.timestamp, dir: 'in', kind: 'derived', agent: env[1],
+                   key: keyIn(body, keys), text: body.slice(0, 2000), uuid: j.uuid, session: j.sessionId });
+      } else if (j.type === 'assistant' && Array.isArray(j.message && j.message.content)) {
+        for (const b of j.message.content) {
+          if (!b || b.type !== 'tool_use' || b.name !== 'SendMessage' || !b.input) continue;
+          const body = String(b.input.message || '');
+          out.push({ at: j.timestamp, dir: 'out', kind: 'derived', agent: String(b.input.to || ''),
+                     key: keyIn(body, keys), text: body.slice(0, 2000), uuid: b.id || j.uuid, session: j.sessionId,
+                     summary: b.input.summary || '' });
+        }
+      }
+    }
+  }
+  out.seen = seen;
+  return out;
+}
+
+function cmdIngest(flags) {
+  const r = readReg();
+  const dir = flags.from ? path.resolve(CWD, flags.from) : transcriptDir();
+  if (!dir) die('cannot find the transcript directory for this project under ~/.claude/projects.\n' +
+                '       Pass it: ingest --from <dir>');
+  const keys = tasks(r).map((t) => t.key).sort((a, b) => b.length - a.length);
+  const found = harvest(dir, keys);
+  const seen = found.seen;
+  // The transcript format belongs to Claude Code, not to us, and it changes
+  // between versions. "I found nothing" and "I can no longer read this" look
+  // identical from the outside — so say which, loudly.
+  if (seen.candidates > 0 && found.length === 0) {
+    console.error('✗ ' + seen.candidates + ' line(s) in ' + rel(dir) + ' mention a message, and none could be read.');
+    console.error('  The transcript format is internal to Claude Code and changes between versions;');
+    console.error('  this most likely means it changed under us. DO NOT read this as "no messages" —');
+    console.error('  the ledger is now incomplete. Fall back to `say`/`heard` by hand and say so.');
+    process.exit(1);
+  }
+  if (seen.files === 0) {
+    console.error('✗ no transcript files in ' + rel(dir) + '. Wrong directory, or they have been cleaned up');
+    console.error('  (Claude Code keeps them ~30 days by default). Nothing can be recovered from here.');
+    process.exit(1);
+  }
+  const have = new Set(ledger().map((e) => e.uuid).filter(Boolean));
+  const fresh = found.filter((e) => e.uuid && !have.has(e.uuid))
+                     .sort((a, b) => String(a.at).localeCompare(String(b.at)));
+  for (const e of fresh) append(e);
+  console.log('read ' + rel(dir) + '  (' + seen.files + ' transcript(s), ' + seen.candidates + ' candidate line(s))');
+  console.log('  ' + found.length + ' message(s) in the transcripts, ' + fresh.length + ' new to the ledger.');
+  const named = fresh.filter((e) => e.key).length;
+  console.log('  ' + named + ' name a task; ' + (fresh.length - named) + ' do not (still logged, just unattributed).');
+  if (fresh.length) {
+    const ins = fresh.filter((e) => e.dir === 'in').length;
+    console.log('  ' + ins + ' inbound, ' + (fresh.length - ins) + ' outbound.');
+    console.log('\nRun `outstanding` — questions you never answered may have surfaced.');
+  }
+}
+
 const OUT_KINDS = ['release', 'reply', 'sendback', 'note', 'hold', 'announce'];
 const IN_KINDS = ['checkin', 'report', 'question', 'blocked', 'note'];
 
@@ -1845,6 +2098,79 @@ function cmdHeard(key, flags) {
   console.log('logged: ← ' + key + ' [' + kind + ']');
   if (kind === 'question' || kind === 'blocked')
     console.log('  It is now waiting on you. `outstanding` will keep saying so until you log a reply.');
+}
+
+
+// ------------------------------------------------------------------- digest
+// After a compaction the orchestrator still has every file, and no idea which
+// of them matter. This is the smallest thing that rebuilds "what is true and
+// what is waiting on me" — a few hundred words, not a 1 MB register. Meant to
+// be injected by a SessionStart hook (matcher compact|resume) as well as read
+// by hand.
+function cmdDigest() {
+  const r = readReg();
+  const T = tasks(r);
+  const L = [];
+  const n = (st) => T.filter((t) => t.status === st).length;
+  L.push('# Orchestration state — rebuilt from disk, not from memory');
+  L.push('');
+  L.push('You are running an implementation. Your address is **' + (r.orchestrator || '(not recorded — run `whoami` then `iam`)') + '**.');
+  L.push('State: `' + rel(REG_PATH) + '`. Briefs: `' + rel(orchDir('briefs')) + '`. Ledger: `' + rel(ledgerPath()) + '`.');
+  L.push('You refine nothing and write no product code — agents and chips do that.');
+  L.push('');
+  L.push('**Work:** ' + T.length + ' tasks — ' + n('landed') + ' landed, ' + n('ready') + ' open, ' +
+         n('reported') + ' awaiting your check, ' + n('planned') + ' not yet handed out.');
+  const open = T.filter((t) => t.chip && !['landed', 'cancelled'].includes(t.status));
+  if (open.length) {
+    L.push('');
+    L.push('**Open right now** (reply to these addresses):');
+    for (const t of open) L.push('- `' + t.key + '` ' + t.title.slice(0, 44) + ' — ' + (t.agent || '⚠ never checked in') + (t.status === 'reported' ? '  **← waiting on your check**' : ''));
+  }
+  // outstanding, computed the same way `outstanding` does
+  const log = ledger();
+  const waits = [];
+  for (const t of T) {
+    const mine = log.filter((e) => e.key === t.key);
+    const ask = [...mine].reverse().find((e) => e.dir === 'in' && ['question', 'blocked'].includes(e.kind));
+    if (ask && !mine.some((e) => e.dir === 'out' && e.at > ask.at)) waits.push(t.key + ' asked something and has had no answer');
+    if (t.status === 'reported') waits.push(t.key + ' says it is finished and needs your check');
+  }
+  if (waits.length) { L.push(''); L.push('**Waiting on you:**'); for (const w of waits) L.push('- ' + w); }
+  const owed = owedList(r).filter((o) => o.status !== 'done');
+  if (owed.length) {
+    L.push('');
+    L.push('**Owed** (' + owed.length + ' open, ' + owed.filter((o) => !o.to).length + ' unassigned) — a window closing on one closes for good:');
+    for (const o of owed.slice(0, 5)) L.push('- ' + o.id + ' ' + String(o.what).slice(0, 60) + (o.to ? ' → ' + o.to : ' → **nobody**'));
+  }
+  const ciAts = Object.values(r.ci || {}).map((c) => Date.parse(c.at)).filter(Boolean);
+  const last = ciAts.length ? Math.max(...ciAts) : 0;
+  const unproven = T.filter((t) => t.status === 'landed' && Date.parse(t.landedAt || 0) > last).length;
+  if (unproven) L.push('\n**' + unproven + ' landing(s) since the last CI checkpoint.**' + (unproven >= 5 ? ' That is a lot of unproven main line.' : ''));
+  L.push('');
+  L.push('**Next:** `frontier` (what can open) · `outstanding` (who is waiting) · `board` (everything).');
+  L.push('Before trusting the ledger after a gap, run `ingest` — it rebuilds it from the transcripts.');
+  console.log(L.join('\n'));
+}
+
+function cmdHookInstall() {
+  const self = path.resolve(process.argv[1]);
+  const reg = path.resolve(CWD, REG_PATH);
+  const dir = path.join(CWD, '.claude');
+  fs.mkdirSync(dir, { recursive: true });
+  const f = path.join(dir, 'settings.json');
+  let j = {};
+  if (fs.existsSync(f)) { try { j = JSON.parse(fs.readFileSync(f, 'utf8')); } catch (e) { die('cannot parse ' + rel(f) + ': ' + e.message); } }
+  const cmd = "node '" + self + "' --register '" + reg + "' digest 2>/dev/null || true";
+  const entry = { matcher: 'compact|resume|startup', hooks: [{ type: 'command', command: cmd }] };
+  const list = ((j.hooks ||= {}).SessionStart ||= []);
+  const already = list.some((e) => JSON.stringify(e) === JSON.stringify(entry));
+  if (already) return console.log('already installed in ' + rel(f) + ' — nothing to do.');
+  list.push(entry);
+  fs.writeFileSync(f, JSON.stringify(j, null, 2) + '\n');
+  console.log('added a SessionStart hook to ' + rel(f) + '.');
+  console.log('After a compaction, a resume, or a fresh start, the digest is put back in front of you');
+  console.log('automatically — so the run survives losing its context.');
+  console.log('\nIt runs: ' + cmd);
 }
 
 function cmdOutstanding() {
@@ -2010,7 +2336,11 @@ driving the work out, after the grill:
   guard <key> [--base b]    diff its branch and name any file it was not allowed to touch. Exits 1.
   say <key> --kind k --text t     log what you sent (release|reply|sendback|note|hold|announce).
   heard <key> --kind k --text t   log what arrived (checkin|report|question|blocked|note).
+  ingest [--from dir]       rebuild the ledger from the on-disk transcripts — both directions,
+                            retroactively, including messages a compaction already took.
   outstanding               who is waiting on you, and since when.
+  digest                    the whole run in a few hundred words — what is true, what waits on you.
+  hook-install              run the digest automatically after every compaction and resume.
   resume --name <peer>      take over a run after the session running it ended.
   landed <key>              record the merge, and name who that frees.
   board                     every task, its state, and what it waits for.
@@ -2076,6 +2406,9 @@ switch (cmd) {
   case 'ci': cmdCi(flags); break;
   case 'say': cmdSay(rest[0], flags); break;
   case 'heard': cmdHeard(rest[0], flags); break;
+  case 'ingest': cmdIngest(flags); break;
+  case 'digest': cmdDigest(); break;
+  case 'hook-install': cmdHookInstall(); break;
   case 'outstanding': cmdOutstanding(); break;
   case 'resume': cmdResume(flags); break;
   default: console.log(HELP); process.exit(cmd ? 2 : 0);

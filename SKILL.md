@@ -89,6 +89,40 @@ node $DRV say   2.1 --kind reply    --text "my error, brief rewritten, re-read i
 node $DRV outstanding    # who is waiting on you, and since when
 ```
 
+- **And do not rely on having remembered.** Logging by hand only works if you
+  remember, and a compaction is exactly the event that makes you forget. You do
+  not have to: Claude Code writes every turn to a transcript on disk, inbound
+  peer messages included, with sender and timestamp. `ingest` reads those and
+  rebuilds the ledger — retroactively, including messages you can no longer see.
+
+```bash
+node $DRV ingest        # both directions, deduplicated, safe to re-run
+node $DRV outstanding   # questions you never answered may have just surfaced
+```
+
+  Run it whenever you come back to a run, and after any gap. Two things to know:
+  the transcript format belongs to Claude Code and changes between versions, so
+  `ingest` **refuses loudly** rather than reporting a quiet zero if it can no
+  longer read them — if that happens, fall back to `say`/`heard` and say so. And
+  transcripts are kept about 30 days, so a very old run is not recoverable this
+  way.
+
+- **Put the run back in front of yourself after a compaction.** `digest` is the
+  whole state in a few hundred words — who you are, what is open and at which
+  address, who is waiting on you, what is owed, how far the main line has drifted
+  from its last CI checkpoint. On a 51-task run it is about 1.3 KB against a
+  1.1 MB register.
+
+```bash
+node $DRV digest
+node $DRV hook-install   # run it automatically on every compact, resume and restart
+```
+
+  `hook-install` adds one `SessionStart` hook to the project's `.claude/settings.json`,
+  preserving whatever is already there. After that the digest is injected for you
+  at exactly the moment your context was truncated — which is the moment you need
+  it and the moment you are least able to ask for it.
+
 - **When you correct a record, the briefs are now wrong.** `board` tells you
   which; `brief --all` rewrites them and names what changed, so you know which
   agents to send back to their brief.
@@ -747,6 +781,10 @@ answer coming, and the agent is still waiting.
 - **The gate is at chip creation, not at release.** Once a chip exists somebody
   can click it, and then work is happening on a floor you have not proved. That
   is why the refusal is there and not one step later.
+- **A derived ledger beats a remembered one.** `say`/`heard` are still worth
+  running as things happen — they carry your own wording and a kind — but they
+  are no longer the only record. `ingest` can rebuild both directions from disk,
+  so a round where you forgot to log is recoverable rather than lost.
 - **Task states say where the work is; they never say what you promised.** That
   the board shows `2.1 ready` tells you nothing about the question its agent
   asked you an hour ago. Only the ledger does, and only if you wrote to it.

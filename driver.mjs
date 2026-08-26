@@ -243,6 +243,23 @@ function readEvents({ tolerateTail = true } = {}) {
   return { events, problems, bytesGood };
 }
 
+// A final line with no trailing newline is not corruption yet, but the next append
+// concatenates onto it and turns two good events into one unparseable one — which
+// the reader then drops as a torn tail, losing both, while `verify` goes green on
+// the loss because the register was never told. Close the line before appending.
+function sealLastLine(f) {
+  let st;
+  try { st = fs.statSync(f); } catch { return; }
+  if (!st.isFile() || st.size === 0) return;
+  let last = null;
+  try {
+    const fd = fs.openSync(f, 'r');
+    const b = Buffer.alloc(1);
+    try { if (fs.readSync(fd, b, 0, 1, st.size - 1) === 1) last = b[0]; } finally { fs.closeSync(fd); }
+  } catch { return; }
+  if (last !== null && last !== 0x0a) fs.appendFileSync(f, '\n');
+}
+
 function replay(events) {
   let state = {}; let last = 0; const problems = [];
   for (const e of events) {
@@ -278,6 +295,7 @@ function commit(r, why) {
   }
   const seq = (events.length ? Math.max(...events.map((e) => e.seq || 0)) : 0) + 1;
   fs.mkdirSync(path.dirname(f), { recursive: true });
+  sealLastLine(f);
   fs.appendFileSync(f, JSON.stringify({ seq, at: now(), cmd: why || CMDLINE, ops }) + '\n');
   return writeReg(r);
 }

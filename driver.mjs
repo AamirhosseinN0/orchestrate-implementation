@@ -1039,6 +1039,26 @@ function overlap(t1, t2) {
   return out;
 }
 
+// A serialisation point is a shared invariant named in prose by whoever wrote
+// the task — "docker-compose.yml", "docker compose file", "Docker-Compose.yml".
+// Comparing those by exact string equality is a check that can only ever fire
+// when two authors typed the same characters, and on a real run it never fired
+// once: a pre-flight found a docker-compose.yml collision this reported clean.
+// Normalise before comparing; keep both spellings when reporting so the
+// mismatch is visible and can be tidied.
+function normPoint(s) { return String(s).trim().toLowerCase().replace(/\s+/g, ' '); }
+function sharedPoints(t1, t2) {
+  const theirs = new Map();
+  for (const y of t2.serialises || []) theirs.set(normPoint(y), y);
+  const out = [];
+  for (const x of t1.serialises || []) {
+    const y = theirs.get(normPoint(x));
+    if (y === undefined) continue;
+    out.push(y === x ? x : x + ' ≈ ' + y);
+  }
+  return out;
+}
+
 function waves(r) {
   const ts = tasks(r).filter((t) => t.status !== 'cancelled');
   const placed = new Map(); const out = [];
@@ -1164,7 +1184,16 @@ function cmdGraph() {
     // is merged work, not a contender, so it collides with nobody
     for (let i = 0; i < w.tasks.length; i++) for (let j = i + 1; j < w.tasks.length; j++) {
       const a = w.tasks[i], b = w.tasks[j];
-      if (a.status === 'landed' || b.status === 'landed') continue;
+      if (a.status === 'landed' || b.status === 'landed') {
+        // Still worth naming: the pair is not a gating decision, but "these two
+        // did share a file" is exactly the thing somebody reads this to find out.
+        skipped++;
+        const o = overlap(a, b), s = sharedPoints(a, b);
+        if (o.length) history.push('Round ' + (w.wave + 1) + ': ' + a.key + ' ↔ ' + b.key + ' share ' + o.join('; '));
+        if (s.length) history.push('Round ' + (w.wave + 1) + ': ' + a.key + ' ↔ ' + b.key + ' share serialisation point ' + s.join(', '));
+        continue;
+      }
+      pairs++;
       const o = overlap(a, b);
       if (o.length) {
         bad++;
@@ -1174,7 +1203,7 @@ function cmdGraph() {
       // A shared file is the easy case. A shared invariant — a migration chain
       // head, a lockfile, a closed list some test asserts exact equality over —
       // collides in CI with zero file overlap.
-      const shared = (a.serialises || []).filter((x) => (b.serialises || []).includes(x));
+      const shared = sharedPoints(a, b);
       if (shared.length) {
         bad++;
         lines.push('  ⚠ **' + a.key + '** and **' + b.key + '** both move the same serialisation point: ' + shared.join(', '));
@@ -1208,8 +1237,22 @@ function cmdGraph() {
     }
   }
   console.log(lines.join('\n'));
-  if (bad) { console.error('\n' + bad + ' problem(s) — fix the plan before creating any chip.'); process.exit(1); }
-  console.log('\nNothing clashes. Every round above can run side by side.');
+  // The all-clear used to be "Nothing clashes. Every round above can run side by
+  // side." — an absolute sentence about a check that is anything but. Pairs
+  // where either side has landed are skipped on purpose (merged work is not a
+  // contender), so the same register says "nothing clashes" today and would
+  // have said "these two collide" yesterday. Say what was actually looked at.
+  if (history.length) {
+    console.log('\nAlready merged, so not a gate — but it is what happened:');
+    for (const h of history) console.log('  · ' + h);
+  }
+  const scope = pairs + ' pair(s) of tasks that could still collide were checked for shared files\n' +
+    'and shared serialisation points' +
+    (skipped ? ('; ' + skipped + ' pair(s) were skipped because one side has already landed.') : '.');
+  if (bad) { console.error('\n' + bad + ' problem(s) — fix the plan before creating any chip.\n' + scope); process.exit(1); }
+  console.log('\n✓ ' + scope);
+  console.log('Nothing among them clashes, so every round above can run side by side.');
+  if (skipped) console.log('That is not a statement about the run as a whole — a landed task is not re-judged.');
 }
 
 
@@ -1220,11 +1263,18 @@ function cmdGraph() {
 // actually breaks parallel work.
 function interference(t, other) {
   const files = overlap(t, other);
-  const points = (t.serialises || []).filter((x) => (other.serialises || []).includes(x));
+  const points = sharedPoints(t, other);
   return files.length || points.length ? { files, points } : null;
 }
+// A task is open — its files are in somebody's hands — from the moment it is
+// handed out until it lands. This used to be keyed off `x.chip`, the chip id,
+// which is bookkeeping and which the documented invocation never passes. The
+// effect was that every gate reading this went dark: `frontier` saw nothing
+// open, `chip` refused nothing, and two tasks owning one file both went ready
+// with no complaint. Status is what actually says whether work is out there.
+const OPEN_STATUSES = ['held', 'ready', 'reported'];
 function openTasks(r, except) {
-  return tasks(r).filter((x) => x.key !== except && x.chip && !['landed', 'cancelled'].includes(x.status));
+  return tasks(r).filter((x) => x.key !== except && OPEN_STATUSES.includes(x.status));
 }
 
 
@@ -1783,7 +1833,10 @@ function cmdPreflightCheck(flags) {
   if (n === undefined) {
     // the round you are about to open: first one holding a task with no chip yet
     const ws = waves(r).filter((w) => w.wave >= 0);
-    const cand = ws.find((w) => w.tasks.some((t) => !t.chip && !['landed', 'cancelled'].includes(t.status)));
+    // "not handed out yet" is a status, not the presence of a chip id — the id
+    // is optional bookkeeping, and reading it here picked the wrong round
+    // whenever one had not been passed.
+    const cand = ws.find((w) => w.tasks.some((t) => t.status === 'planned'));
     n = cand ? cand.wave : currentWave(r);
   }
   const st = waveState(r, n);
@@ -2351,6 +2404,12 @@ function cmdChip(key, flags) {
   if (['landed', 'reported', 'cancelled'].includes(t.status))
     die(key + ' is ' + t.status + ' — a chip cannot rewind it. If this is really meant to run again, that is a new task.');
   if (!t.chip) {
+    // The record has to be able to say which chip is which — without it there is
+    // no way back from a key to the thing actually running the work.
+    if (!flags.id)
+      die('chip ' + key + ' --id <task_id> — the chip id is how the record points at the running\n' +
+          '       agent. Take it from the tool that created the chip. Add --worktree <path> too if\n' +
+          '       the copy it works in is not the branch\'s own worktree.');
     const pending = heldNeeds(r, t);
     if (pending.length) {
       console.error('✗ ' + key + ' still waits for ' + pending.join(', ') + ' to land.');

@@ -426,16 +426,43 @@ const LEX = [
   { id: 'tuning',   why: 'a number somebody has to pick', re: /\b(configurable|tunable|tuned|adjustable|to taste|per deployment|environment[- ]specific)\b/i },
 ];
 
-const SETTLED_HEADING = /(settled|do not relitigate|already decided|decisions \(|resolved|answered)/i;
+// Whole words only, and never the negation of one. Unanchored, "resolved" sits
+// inside "unresolved" and "answered" inside "unanswered", so a section headed
+// "Unresolved questions" turned suppression ON and every gap under it was
+// dropped without a word — the sections most likely to hold undecided things
+// were exactly the ones skipped, and `check` then went green. The boundaries
+// stop the run-together forms; the lookbehind stops "un-resolved" and
+// "un answered", which a boundary alone lets through.
+const SETTLED_HEADING = /(?<!\bun[- ])\b(settled|do not relitigate|already decided|resolved|answered)\b|\bdecisions \(/i;
 const FENCE = /^\s*(```|~~~)/;
 
+// Which lines sit inside a code fence. Toggling a flag line by line meant a
+// plan with an odd number of fence lines left the fence open for ever, so
+// every line after the last ``` was treated as code and never scanned. An
+// unterminated fence is a typo in the plan, not an instruction to stop reading
+// it: the unmatched opener is ignored, the rest is scanned as prose, and the
+// operator is told the plan needs fixing.
+function fencedLines(lines) {
+  const marks = [];
+  lines.forEach((l, i) => { if (FENCE.test(l)) marks.push(i); });
+  let unterminated = false;
+  if (marks.length % 2 === 1) { marks.pop(); unterminated = true; }
+  const inFence = new Array(lines.length).fill(false);
+  for (let k = 0; k + 1 < marks.length; k += 2)
+    for (let i = marks[k]; i <= marks[k + 1]; i++) inFence[i] = true;
+  return { inFence, unterminated };
+}
+
 function scanFile(p) {
-  const lines = fs.readFileSync(p, 'utf8').split('\n');
+  const lines = readPlan(p).split('\n');
   const hits = [];
-  let fenced = false, heading = '', settled = false;
+  const { inFence, unterminated } = fencedLines(lines);
+  if (unterminated)
+    console.error('note: ' + rel(p) + ' has an odd number of code fence lines — the last one is ' +
+                  'never closed. Reading past it as prose; fix the fence in the plan.');
+  let heading = '', settled = false;
   lines.forEach((line, i) => {
-    if (FENCE.test(line)) { fenced = !fenced; return; }
-    if (fenced) return;
+    if (inFence[i]) return;
     const h = line.match(/^\s{0,3}(#{1,6})\s+(.*)$/);
     if (h) { heading = h[2].trim(); settled = SETTLED_HEADING.test(heading); return; }
     if (settled) return;

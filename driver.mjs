@@ -1299,6 +1299,26 @@ function norm(p) {
 }
 // one-directional: does the owned entry `own` cover the path `p`?
 function coveredBy(own, p) { const o = norm(own), x = norm(p); return x === o || x.startsWith(o + '/'); }
+
+// A path field that only had to be a non-empty string let a pre-flight report
+// come back with seventeen of nineteen entries written as prose — "the verify
+// list itself", "apps/api/Dockerfile:7 — ENV PATH=… must be set" — and the
+// `task add` line printed from it put every one of them into `owns`. Once
+// there, prose matches itself, so `preflight check` goes green on it and the
+// pollution stops being visible. This is the check that says a path is a path.
+// Anything that actually exists on disk passes whatever it looks like: that is
+// the one unambiguous signal available, and it costs a stat.
+function pathProblem(s) {
+  const v = String(s).trim();
+  if (!v) return 'is empty';
+  try { if (fs.existsSync(path.resolve(CWD, v))) return null; } catch { /* unreadable is not proof */ }
+  if (/\s[—–]\s|\s--\s/.test(v)) return 'contains an em-dash clause — that is prose, not a path';
+  if (/["'`$=]/.test(v)) return 'contains quote or shell characters';
+  if (/:\d+/.test(v)) return 'carries a :line suffix — ownership is whole files';
+  if (v.split(/\s+/).length > 2) return 'reads as a sentence, not a path';
+  if (!/[/.]/.test(v)) return 'has no directory separator and no extension';
+  return null;
+}
 function collides(a, b) {
   const x = norm(a), y = norm(b);
   return x === y || x.startsWith(y + '/') || y.startsWith(x + '/');
@@ -1396,18 +1416,41 @@ function cmdTaskAdd() {
   // it is cheap to fix. Existing state is not re-judged — `doctor` reports that
   // — because a register with the collision already in it must stay usable.
   const contender = (t) => !['landed', 'cancelled'].includes(t.status);
-  for (let n = 0; n < plans.length; n++) {
-    const { it, at, label } = plans[n];
-    if (at >= 0) continue;                       // an update, not a new claim
-    for (const own of it.owns || []) {
+  // An update used to skip this check entirely, on the grounds that existing
+  // state must not be re-judged. But an update that ADDS a path is a new claim
+  // wearing an update's clothes, and `preflight done` prints exactly such an
+  // update under the words "do not retype it" — so the one collision this whole
+  // arrangement exists to prevent arrived through the door left open for it.
+  // Only the paths an update adds are judged; the ones it already had stay
+  // grandfathered, so a register with a collision already in it is still usable
+  // and `doctor` remains the thing that reports those.
+  const claimedNow = (p) => {
+    if (p.at < 0) return p.it.owns || [];
+    if (p.it.owns === undefined) return [];               // not an ownership change
+    const had = new Set(tasks(r)[p.at].owns || []);
+    return p.it.owns.filter((o) => !had.has(o));
+  };
+  // What each still-open task will own once this batch applies. Judging against
+  // the register alone read a narrowing task's stale entry, so the one correct
+  // way to hand a file over — narrow one and widen the other in a single batch —
+  // was refused against ownership that the same batch was giving up.
+  const after = new Map();
+  const fromBatch = new Set();
+  for (const t of tasks(r)) if (contender(t)) after.set(t.key, [...(t.owns || [])]);
+  for (const p of plans) {
+    if (p.at >= 0 && !contender(tasks(r)[p.at])) continue; // finished work claims nothing
+    if (p.it.owns !== undefined) { after.set(p.it.key, [...p.it.owns]); fromBatch.add(p.it.key); }
+    else if (p.at < 0) after.set(p.it.key, []);
+  }
+  for (const p of plans) {
+    const { it, at, label } = p;
+    if (at >= 0 && !contender(tasks(r)[at])) continue;
+    for (const own of claimedNow(p)) {
       const clashes = [];
-      for (const other of tasks(r)) {
-        if (other.key === it.key || !contender(other)) continue;
-        for (const b of other.owns || []) if (collides(own, b)) clashes.push(other.key + ' owns ' + b);
-      }
-      for (let m = 0; m < plans.length; m++) {
-        if (m === n || plans[m].it.key === it.key) continue;
-        for (const b of plans[m].it.owns || []) if (collides(own, b)) clashes.push(plans[m].it.key + ' (same batch) owns ' + b);
+      for (const [key, owns] of after) {
+        if (key === it.key) continue;
+        for (const b of owns) if (collides(own, b))
+          clashes.push(key + (fromBatch.has(key) ? ' (same batch)' : '') + ' owns ' + b);
       }
       if (clashes.length)
         errs.push(label + ' claims ' + own + ', which is already owned: ' + [...new Set(clashes)].join('; ') +
@@ -2146,6 +2189,10 @@ function cmdPreflightBrief(key) {
   B.push(' "notes": ""}');
   B.push('```');
   B.push('');
+  B.push('`path` is a **bare repository-relative file path** and nothing else — no `:line` suffix,');
+  B.push('no explanation, no prose. It goes straight into the task\'s ownership list, so a sentence');
+  B.push('there becomes a file nobody owns. Everything you want to say about it goes in `why`.');
+  B.push('');
   B.push('`loadBearing` means: without this the work cannot land green. When unsure, true.');
   B.push('**Report, do not fix.** Not the record, not the plan, not the code. When the file is');
   B.push('written, say so in one line and stop.');
@@ -2166,6 +2213,14 @@ function cmdPreflightDone(key) {
     if (rep.missing !== undefined && (!Array.isArray(rep.missing) ||
         rep.missing.some((m) => !m || typeof m !== 'object' || typeof m.path !== 'string' || !m.path.trim())))
       bad.push('missing must be a list of {path, why, evidence, loadBearing} with a real path each');
+    // `path` goes straight into `owns` through the line printed below, so a
+    // path that is not a path has to stop here rather than downstream.
+    else if (Array.isArray(rep.missing))
+      for (const m of rep.missing) {
+        const why = pathProblem(m.path);
+        if (why) bad.push('missing path "' + String(m.path).slice(0, 60) + '" ' + why +
+          '\n         — `path` is a bare repository-relative file path; the explanation belongs in `why`');
+      }
     if (rep.serialises !== undefined && (!Array.isArray(rep.serialises) ||
         rep.serialises.some((x) => typeof x !== 'string' || !x.trim())))
       bad.push('serialises must be a list of names');
@@ -2317,6 +2372,13 @@ function cmdDoctor() {
       const toks = String(v).trim().split(/\s+/).filter(Boolean);
       const bin = (toks.find((x) => !/^[A-Za-z_][A-Za-z0-9_]*=/.test(x)) || '').replace(/^[(]+/, '');
       if (bin && !binOk(bin)) probs.push('verify command\'s binary is not on PATH: `' + bin + '`  (' + v + ')');
+    }
+    // The backstop for prose that reached `owns` before the gate above existed.
+    // An entry that is not a path can never be matched by a diff, so `guard`
+    // cannot judge it and `preflight check` goes green on it matching itself.
+    for (const own of t.owns || []) {
+      const why = pathProblem(own);
+      if (why) probs.push('owns an entry that is not a path: "' + String(own).slice(0, 60) + '" — ' + why);
     }
     if (t.briefSha && t.briefSha !== briefSha(t, r)) probs.push('brief is stale — the record changed after it was written');
     if (!probs.length) continue;

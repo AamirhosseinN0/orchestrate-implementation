@@ -623,6 +623,24 @@ because a widened owns can create a collision that was not there before.
 `preflight check` gates the round the way `graph` does: nothing opens while a
 task is unflown or a load-bearing gap sits outside its owns.
 
+Two things that line assumes, which cost a real collision before they were enforced:
+
+- **The line is an *update*, and an update widens ownership.** `task add` checks a
+  widened `owns` against every other open task and refuses the batch, exactly as it does
+  for a new one. It judges only the paths the update *adds*, so narrowing is always free
+  and a register that already holds a collision stays usable. To hand a file from one
+  task to another, narrow one and widen the other **in the same batch** — that is read as
+  a hand-over and allowed; done as two commands the first one is refused.
+- **`graph` alone will not catch it.** Different rounds may legitimately share a file, so
+  a widened `owns` that collides across rounds is green in `graph` and red only in
+  `doctor`. Run `doctor` after a pre-flight widens anything, not just `graph`.
+
+And what the agent writes matters: `path` in a pre-flight report must be a **bare
+repository-relative path**, because it goes straight into `owns`. The generated brief now
+says so, and `preflight done` refuses a report whose paths are prose rather than merging
+it. Prose in `owns` is not a harmless typo — it matches itself, so `preflight check` goes
+green on it and it stops being visible.
+
 ## 12. Open every chip that cannot interfere
 
 The unit of dispatch is not the round — it is **interference**. A task may open

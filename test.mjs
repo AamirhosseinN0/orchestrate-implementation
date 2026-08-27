@@ -1694,6 +1694,102 @@ say('verify is green on a recorded run nobody made up');
      readIf(path.join(d, '.claude/orchestration/events.jsonl')).split('\n').filter(Boolean).length >= 400);
 }
 
+
+// ============================================================================
+// The eight instruction gaps — every one found by running the skill, not by
+// reading it. Each case below failed before the fix it guards; the comment says
+// what the old behaviour was, so the check can be watched failing.
+// ============================================================================
+
+// ------------------------------------------------- ownership on the UPDATE path
+{
+  say('task add re-checks ownership when an update widens owns');
+  const d = box('ownupd');
+  // was: `if (at >= 0) continue` skipped the check for every update, so an
+  // update could hand a second task a path another one already owned, silently.
+  const r1 = drv(d, ['task', 'add'], { stdin: JSON.stringify({ key: 't1', owns: ['src/a.py', 'src/b.py'] }) });
+  ok('an update claiming another open task\'s path is refused', r1.code !== 0, r1.out);
+  ok('and it names who already owns it', has(r1.out, 't2') && has(r1.out, 'src/b.py'), r1.out);
+  ok('and nothing was saved', (tasksOf(d).find((t) => t.key === 't1').owns || []).length === 1);
+
+  const r2 = drv(d, ['task', 'add'], { stdin: JSON.stringify({ key: 't1', owns: [] }) });
+  ok('narrowing to nothing is still refused on its own merits', r2.code !== 0, r2.out);
+
+  const r3 = drv(d, ['task', 'add'], { stdin: JSON.stringify({ key: 't1', notes: 'unrelated' }) });
+  ok('an update that never mentions owns is not an ownership change', r3.code === 0, r3.out);
+
+  // The hand-over: narrowing one and widening the other has to work as one
+  // batch, or there is no way to move a file between tasks at all. Judging the
+  // widening task against the register alone read the narrowing task's stale
+  // entry and refused it.
+  const r4 = drv(d, ['task', 'add'], { stdin: JSON.stringify([
+    { key: 't2', owns: ['src/c2.py'] },
+    { key: 't1', owns: ['src/a.py', 'src/b.py'] },
+  ]) });
+  ok('narrow-and-widen in one batch is read as a hand-over', r4.code === 0, r4.out);
+  ok('and the widened task really got it', (tasksOf(d).find((t) => t.key === 't1').owns || []).includes('src/b.py'));
+
+  // A register that already holds a collision has to stay usable — that is why
+  // the check was skipped in the first place, and only added paths are judged.
+  const reg0 = reg(d);
+  reg0.tasks.find((t) => t.key === 't2').owns = ['src/c2.py', 'src/b.py'];
+  fs.writeFileSync(path.join(d, '.claude/orchestration/register.json'), JSON.stringify(reg0, null, 2));
+  const r5 = drv(d, ['task', 'add'], { stdin: JSON.stringify({ key: 't1', notes: 'on top of a live collision' }) });
+  ok('an unrelated edit on top of an existing collision is not blocked', r5.code === 0, r5.out);
+  const r6 = drv(d, ['task', 'add'], { stdin: JSON.stringify({ key: 't1', owns: ['src/a.py', 'src/b.py'] }) });
+  ok('and re-stating the same owns unchanged is not a new claim', r6.code === 0, r6.out);
+}
+
+// ------------------------------------------- a path in a pre-flight is a path
+{
+  say('preflight done refuses prose where a path belongs');
+  const d = box('pfpath');
+  const rep = path.join(d, '.claude/orchestration/preflight');
+  fs.mkdirSync(rep, { recursive: true });
+  // was: `typeof m.path === 'string' && trim()` only, so seventeen of nineteen
+  // prose entries went straight into the printed `task add` line under the
+  // words "do not retype it", and from there into owns.
+  fs.writeFileSync(path.join(rep, 't1.json'), JSON.stringify({ missing: [
+    { path: 'src/a.py:7 — ENV PATH="/usr/bin" must be set', why: 'p', evidence: 'e', loadBearing: true },
+    { path: 'the verify list itself', why: 'p', evidence: 'e', loadBearing: true },
+  ] }));
+  const r1 = drv(d, ['preflight', 'done', 't1']);
+  ok('a report whose paths are prose is refused', r1.code !== 0, r1.out);
+  ok('and each offending entry is named', has(r1.out, 'the verify list itself') && has(r1.out, 'em-dash'), r1.out);
+  ok('and the task was not marked pre-flighted', !tasksOf(d).find((t) => t.key === 't1').preflight);
+
+  fs.writeFileSync(path.join(rep, 't1.json'), JSON.stringify({ missing: [
+    { path: 'src/b.py', why: 'real', evidence: 'src/b.py:1', loadBearing: true },
+  ] }));
+  const r2 = drv(d, ['preflight', 'done', 't1']);
+  ok('a report with real paths still passes', r2.code === 0, r2.out);
+
+  // An odd-looking path that exists on disk is a path, whatever it looks like.
+  fs.mkdirSync(path.join(d, 'a dir'), { recursive: true });
+  fs.writeFileSync(path.join(d, 'a dir/f.py'), 'x\n');
+  fs.writeFileSync(path.join(rep, 't2.json'), JSON.stringify({ missing: [
+    { path: 'a dir/f.py', why: 'odd but real', evidence: 'e', loadBearing: true },
+  ] }));
+  ok('a path that exists on disk passes whatever its shape', drv(d, ['preflight', 'done', 't2']).code === 0);
+
+  const b = drv(d, ['preflight', 'brief', 't1']);
+  ok('and the generated brief says what a path is', has(b.out, 'bare') && has(b.out, 'repository-relative'), b.out);
+}
+
+{
+  say('doctor names an owns entry that is not a path');
+  const d = box('docpath');
+  // was: nothing anywhere reported prose sitting in owns. It matches itself, so
+  // `preflight check` goes green on it and the pollution stops being visible.
+  const r0 = reg(d);
+  r0.tasks.find((t) => t.key === 't1').owns.push('the verify list itself');
+  fs.writeFileSync(path.join(d, '.claude/orchestration/register.json'), JSON.stringify(r0, null, 2));
+  const r = drv(d, ['doctor']);
+  ok('doctor reports it', has(r.out, 'not a path') && has(r.out, 'the verify list itself'), r.out);
+  ok('and fails on it', r.code !== 0);
+}
+
+
 // ---------------------------------------------------------------------- report
 if (!KEEP) for (const d of boxes) { try { fs.rmSync(d, { recursive: true, force: true }); } catch { /* gone */ } }
 else console.log('\nsandboxes kept: ' + boxes.join('\n                '));
@@ -1702,7 +1798,7 @@ else console.log('\nsandboxes kept: ' + boxes.join('\n                '));
 // an exception thrown before its first `ok`, a case quietly commented out — and
 // the suite still ends on "all green", because green is only ever measured
 // against however many checks happened to run.
-const EXPECTED = 273;   // every check above counts; raise it deliberately when you add one
+const EXPECTED = 290;   // every check above counts; raise it deliberately when you add one
 
 console.log('\n' + '-'.repeat(60));
 if (pass + failures.length !== EXPECTED)

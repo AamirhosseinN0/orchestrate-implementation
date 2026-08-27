@@ -632,7 +632,10 @@ function readPlan(p) {
   } catch (e) {
     if (e && e.code === 'ENOENT')
       die('the plan ' + rel(p) + ' is on the register but not on disk — it has been renamed,\n' +
-          '       moved or deleted since `load`. Re-run `load` with its new path, or restore it.');
+          '       moved or deleted since `load`. Repoint the record at where it went:\n' +
+          '         plan mv ' + rel(p) + ' <new-path>\n' +
+          '       which carries its gaps and tasks across. Re-running `load` on the new path only\n' +
+          '       appends a second entry beside this one unless the content is byte-identical.');
     if (e && e.code === 'EISDIR') die(rel(p) + ' is a directory, not a plan file.');
     if (e && e.code === 'EACCES') die('cannot read the plan ' + rel(p) + ' — permission denied.');
     throw e;
@@ -645,6 +648,7 @@ function cmdLoad(args) {
   const files = [...new Set(args.flatMap(expand))];
   if (!files.length) die('no plan files matched: ' + args.join(' '));
   const reg = fs.existsSync(REG_PATH) ? readReg() : { version: 1, created: now(), plans: [], gaps: [] };
+  const repointed = [];
   for (const f of files) {
     const body = fs.readFileSync(f, 'utf8');
     const entry = {
@@ -654,10 +658,26 @@ function cmdLoad(args) {
       sha: crypto.createHash('sha256').update(body).digest('hex').slice(0, 12),
     };
     const at = reg.plans.findIndex((x) => x.path === entry.path);
-    if (at >= 0) reg.plans[at] = entry; else reg.plans.push(entry);
+    if (at >= 0) { reg.plans[at] = entry; continue; }
+    // A plan that moved rather than a plan that is new: the registered path is
+    // gone from disk and the content is byte-identical. Appending here is what
+    // left nine stale entries beside nine live ones, with nothing able to tell
+    // them apart afterwards and `scan` refusing on the stale half.
+    const moved = reg.plans.findIndex((x) => x.sha === entry.sha &&
+      !fs.existsSync(path.resolve(CWD, x.path)));
+    if (moved >= 0) {
+      const was = reg.plans[moved].path;
+      for (const g of reg.gaps) if (g.plan === was) g.plan = entry.path;
+      for (const t of reg.tasks || []) if (t.plan === was) t.plan = entry.path;
+      reg.plans[moved] = entry;
+      repointed.push(was + '  →  ' + entry.path);
+      continue;
+    }
+    reg.plans.push(entry);
   }
   commit(reg);
   console.log('register: ' + rel(REG_PATH));
+  for (const m of repointed) console.log('repointed (same content, old path gone): ' + m);
   console.log('loaded ' + reg.plans.length + ' plan file(s):\n');
   let words = 0;
   for (const p of reg.plans) {
@@ -1053,6 +1073,73 @@ function planEntry(r, needle) {
   if (!hits.length) die('no plan matching "' + needle + '"');
   if (hits.length > 1) die('"' + needle + '" matches ' + hits.length + ': ' + hits.map((h) => h.path).join(', '));
   return hits[0];
+}
+
+// `load` matches a plan by its path, so a renamed plan is a new entry beside a
+// stale one, and `load` was the only thing that ever wrote `reg.plans` — there
+// was no way back. This project renames a plan when every piece of it lands, so
+// the workflow guarantees the paths go stale, and `scan` then refuses outright
+// while telling you to re-run `load` — which is what appends the duplicate. The
+// instruction caused the state it was diagnosing.
+function planRefs(r, p) {
+  return {
+    gaps: r.gaps.filter((g) => g.plan === p),
+    tasks: tasks(r).filter((t) => t.plan === p),
+  };
+}
+
+function cmdPlan(sub, rest, flags) {
+  const r = readReg();
+  if (sub === 'mv') {
+    const [from, to] = rest;
+    if (!from || !to) die('plan mv <old-path> <new-path> — repoint a plan the tree has moved');
+    const e = planEntry(r, from);
+    const dest = path.resolve(CWD, to);
+    if (!fs.existsSync(dest)) die('nothing at ' + rel(dest) + ' — mv the file first, then repoint the record');
+    const was = e.path;
+    const newPath = rel(dest);
+    if (was === newPath) return console.log(was + ' is already where the record says.');
+    const clash = r.plans.find((x) => x.path === newPath && x !== e);
+    // the duplicate this command exists to undo: fold it back rather than refuse
+    if (clash) r.plans.splice(r.plans.indexOf(clash), 1);
+    const body = fs.readFileSync(dest, 'utf8');
+    e.path = newPath;
+    e.lines = body.split('\n').length;
+    e.bytes = Buffer.byteLength(body);
+    e.sha = crypto.createHash('sha256').update(body).digest('hex').slice(0, 12);
+    // A rename that moves the entry and leaves the back-references orphans the
+    // gaps instead of the plan, which is the same loss wearing a different hat.
+    const ref = planRefs(r, was);
+    for (const g of ref.gaps) g.plan = newPath;
+    for (const t of ref.tasks) t.plan = newPath;
+    commit(r);
+    console.log(was + '  →  ' + newPath);
+    console.log('  ' + ref.gaps.length + ' gap(s) and ' + ref.tasks.length + ' task(s) repointed' +
+      (clash ? '; the duplicate entry a previous `load` appended was folded in' : '') + '.');
+  } else if (sub === 'rm') {
+    const [which] = rest;
+    if (!which) die('plan rm <path> — drop a plan entry from the record');
+    const e = planEntry(r, which);
+    const ref = planRefs(r, e.path);
+    if ((ref.gaps.length || ref.tasks.length) && !flags.force)
+      die(e.path + ' still has ' + ref.gaps.length + ' gap(s) and ' + ref.tasks.length + ' task(s) pointing at it.\n' +
+          '       Dropping it orphans them. Repoint with `plan mv`, or pass --force if the plan is\n' +
+          '       really gone and those references are meant to dangle.');
+    r.plans.splice(r.plans.indexOf(e), 1);
+    commit(r);
+    console.log('dropped ' + e.path + '. ' + r.plans.length + ' plan(s) left on record.');
+    if (ref.gaps.length || ref.tasks.length)
+      console.log('⚠ ' + ref.gaps.length + ' gap(s) and ' + ref.tasks.length + ' task(s) now point at a plan that is not on record.');
+  } else if (sub === 'list' || sub === undefined) {
+    if (!r.plans.length) return console.log('no plans loaded.');
+    for (const p of r.plans) {
+      const there = fs.existsSync(path.resolve(CWD, p.path));
+      const ref = planRefs(r, p.path);
+      console.log((there ? '  ' : '✗ ') + p.path.padEnd(50) +
+        String(ref.gaps.length).padStart(3) + ' gap(s) ' + String(ref.tasks.length).padStart(3) + ' task(s)' +
+        (there ? '' : '   NOT ON DISK — `plan mv` it to where it went'));
+    }
+  } else die('plan mv <old> <new>|rm <path> [--force]|list');
 }
 
 function cmdRefineList() {
@@ -2563,6 +2650,38 @@ function cmdOwed(sub, rest, flags) {
         o.id + '.\n       Assign it to work that is still open (`frontier` says which), or settle it: owed done ' + o.id);
     o.to = flags.to; commit(r);
     console.log(o.id + ' → ' + flags.to + '. Put it in that task\'s brief — an assignment the agent never sees is not one.');
+  } else if (sub === 'edit') {
+    // An owed item is a claim about the tree made in the past, not a fact, and
+    // some of them turn out wrong — the wrong cause named, a count short, six
+    // where it was twelve. The only way to correct one used to be to supersede
+    // and close it, so one item became a chain of four, and a churned record is
+    // one nobody trusts. Amending it is allowed; amending it *silently* is not,
+    // which is why the reason is required and the old value is kept. Three
+    // corrections then read as one item that was hard to pin down, which is
+    // true, rather than four that appeared and vanished, which is not.
+    const o = owedList(r).find((x) => x.id === rest[0]); if (!o) die('no owed item ' + rest[0]);
+    const F = ['what', 'why', 'window'];
+    for (const k of F) if (flags[k] !== undefined && typeof flags[k] !== 'string') die('--' + k + ' needs text');
+    if (flags['load-bearing'] && flags['not-load-bearing'])
+      die('--load-bearing and --not-load-bearing cannot both be given');
+    const wants = F.filter((k) => flags[k] !== undefined);
+    const flips = !!flags['load-bearing'] || !!flags['not-load-bearing'];
+    if (!wants.length && !flips)
+      die('owed edit <id> [--what "..."] [--why "..."] [--window "..."] [--load-bearing|--not-load-bearing] --why-changed "..."');
+    if (typeof flags['why-changed'] !== 'string' || !flags['why-changed'].trim())
+      die('owed edit needs --why-changed "..." — what you have learned since. An amendment nobody\n' +
+          '       can account for is the churn that makes a record untrustworthy.');
+    const was = { what: o.what, why: o.why, window: o.window, loadBearing: o.loadBearing };
+    for (const k of wants) o[k] = flags[k];
+    if (flags['load-bearing']) o.loadBearing = true;
+    if (flags['not-load-bearing']) o.loadBearing = false;
+    const changed = Object.keys(was).filter((k) => was[k] !== (k === 'loadBearing' ? o.loadBearing : o[k]));
+    if (!changed.length) return console.log(o.id + ' already said that — nothing amended.');
+    (o.amendments ||= []).push({ at: now(), why: flags['why-changed'], was, fields: changed });
+    commit(r);
+    console.log(o.id + ' amended: ' + changed.join(', ') + '  (' + o.amendments.length + ' amendment(s) on record)');
+    for (const k of changed) console.log('  ' + k + ': ' + JSON.stringify(was[k]) + ' → ' + JSON.stringify(o[k]));
+    if (o.status === 'done') console.log('Note: this item is already settled. The amendment is recorded against it as it stands.');
   } else if (sub === 'done') {
     const o = owedList(r).find((x) => x.id === rest[0]); if (!o) die('no owed item ' + rest[0]);
     o.status = 'done'; o.doneAt = now(); commit(r); console.log(o.id + ' settled.');
@@ -2572,8 +2691,9 @@ function cmdOwed(sub, rest, flags) {
     const shut = new Set(allShutWindows(r).map((o) => o.id));
     for (const o of os) {
       const to = o.to ? '→ ' + o.to + (shut.has(o.id) ? ' SHUT' : '') : 'UNASSIGNED';
+      const am = (o.amendments || []).length;
       console.log(o.id + '  ' + o.status.padEnd(6) + (o.loadBearing ? 'LOAD-BEARING  ' : '              ') +
-        to.padEnd(19) + o.what);
+        to.padEnd(19) + o.what + (am ? '  (amended ' + am + '\u00d7)' : ''));
       if (o.status === 'open') console.log('      why: ' + o.why + (o.window ? '   window: ' + o.window : ''));
     }
     const sh = allShutWindows(r);
@@ -2583,7 +2703,7 @@ function cmdOwed(sub, rest, flags) {
                   ' of those is load-bearing.');
       console.log('Reassign each to work that is still open, or settle it — leaving it is the loss.');
     }
-  } else die('owed add|assign <id> --to <key>|done <id>|list');
+  } else die('owed add|assign <id> --to <key>|edit <id> --why-changed "..."|done <id>|list');
 }
 
 
@@ -3825,12 +3945,12 @@ const flags = {}; const rest = [];
 // word starts with --" — silently turned a value into `true` whenever an agent
 // wrote one that began with a dash, and silently ate a positional whenever a
 // boolean was not on the short list. Both failures reported success.
-const BOOL_FLAGS = new Set(['stdout', 'all', 'load-bearing', 'dry-run', 'force',
+const BOOL_FLAGS = new Set(['stdout', 'all', 'load-bearing', 'not-load-bearing', 'dry-run', 'force',
   'not-blocking', 'reclean', 'check']);
 const VALUE_FLAGS = new Set(['base', 'branch', 'evidence', 'from', 'grep', 'id', 'into', 'key',
   'kind', 'n', 'name', 'note', 'out', 'plan', 'ref', 'register', 'scope', 'session',
   'sha', 'since', 'stale', 'status', 'subject', 'task', 'text', 'timeout', 'title',
-  'to', 'wave', 'what', 'why', 'window', 'worktree']);
+  'to', 'wave', 'what', 'why', 'why-changed', 'window', 'worktree']);
 const flagName = (s) => s.startsWith('--') ? s.slice(2).split('=')[0] : null;
 const isKnownFlag = (s) => {
   const k = flagName(s);
@@ -3866,7 +3986,7 @@ const cmd = rest.shift();
 // What the record calls this invocation. The commands below that read a second
 // word out of `rest` need that word too — `refine done` and `refine brief` are
 // different events and must not both show up as `refine`.
-const SUB_COMMANDS = new Set(['ci', 'defect', 'log', 'owed', 'preflight', 'refine', 'slot', 'task']);
+const SUB_COMMANDS = new Set(['ci', 'defect', 'log', 'owed', 'plan', 'preflight', 'refine', 'slot', 'task']);
 if (cmd) CMDNAME = cmd + (SUB_COMMANDS.has(cmd) && rest[0] && !rest[0].startsWith('--') ? ' ' + rest[0] : '');
 
 const HELP = `orchestrate-implementation driver — bookkeeping for a grill session.
@@ -3912,8 +4032,11 @@ driving the work out, after the grill:
   defect add|fixed|list     a failure that must not be forgotten: a sendback, a trespass, a red run,
                             a blocker, a bug found between sessions. Recorded automatically where
                             those happen; --all includes the fixed ones.
-  owed add|assign|done|list work only possible in a window between two pieces — record it, assign
-                            it, and close no round on top of it silently.
+  plan mv <old> <new>       repoint the record at a plan the tree moved, carrying its gaps and
+                            tasks across. Also: plan rm <path> [--force], plan list.
+  owed add|assign|edit|done|list  work only possible in a window between two pieces — record it,
+                            assign it, and close no round on top of it silently. edit amends a claim
+                            that turned out wrong, keeping the old value and the reason for the change.
   brief <key> [--stdout]    write the chip's brief to a file; print what to send. --all rewrites every one.
   chip <key> --id <task_id> [--worktree p] [--branch b]   record the chip, set held or ready.
                             --id is required the first time: it is how the record points at the
@@ -4004,6 +4127,7 @@ switch (cmd) {
   case 'doctor': cmdDoctor(); break;
   case 'archive': cmdArchive(flags); break;
   case 'owed': cmdOwed(rest.shift(), rest, flags); break;
+  case 'plan': cmdPlan(rest.shift(), rest, flags); break;
   case 'defect': cmdDefect(rest.shift(), rest, flags); break;
   case 'slot': cmdSlot(rest.shift(), rest, flags, raw); break;
   case 'frontier': cmdFrontier(); break;

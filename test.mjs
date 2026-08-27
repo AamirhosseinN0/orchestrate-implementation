@@ -1789,6 +1789,73 @@ say('verify is green on a recorded run nobody made up');
   ok('and fails on it', r.code !== 0);
 }
 
+// ----------------------------------------------- amending an owed item in place
+{
+  say('owed edit amends a claim that turned out wrong');
+  const d = box('owededit');
+  drv(d, ['owed', 'add', '--what', 'six call sites', '--why', 'needs the window', '--to', 't1']);
+  // was: add|assign|done|list only, so correcting a wrong claim meant
+  // supersede-and-close — one item became a chain of four.
+  const r1 = drv(d, ['owed', 'edit', 'o01', '--what', 'twelve call sites']);
+  ok('an amendment without a reason is refused', r1.code !== 0, r1.out);
+  ok('and it says why a reason is required', has(r1.out, 'why-changed'), r1.out);
+
+  const r2 = drv(d, ['owed', 'edit', 'o01', '--what', 'twelve call sites',
+    '--why-changed', 'counted them; the grep missed an aliased import']);
+  ok('an amendment with a reason lands', r2.code === 0, r2.out);
+  const o = ((reg(d) || {}).owed || [])[0] || {};
+  // Reached through empty defaults rather than indexed straight: against a
+  // driver with no amendments at all this is a failing check, not a stack
+  // trace that stops the sweep before the rest of it has run.
+  const am0 = (o.amendments || [])[0] || {};
+  ok('and the old value is kept, not overwritten', (am0.was || {}).what === 'six call sites');
+  ok('and the reason with it', has(am0.why || '', 'aliased import'));
+
+  drv(d, ['owed', 'edit', 'o01', '--load-bearing', '--why-changed', 'it blocks the round']);
+  const l = drv(d, ['owed', 'list']);
+  ok('owed list shows the churn rather than hiding it', has(l.out, 'amended 2'), l.out);
+  const r3 = drv(d, ['owed', 'edit', 'o01', '--what', 'twelve call sites', '--why-changed', 'again']);
+  ok('an amendment that changes nothing says so', has(r3.out, 'already said that'), r3.out);
+}
+
+// ------------------------------------------------------- repointing a moved plan
+{
+  say('a renamed plan is repointed, not appended beside itself');
+  const d = box('planmv');
+  // A phrase the scanner will actually catch, so the "no gap still points at
+  // the old path" check below cannot pass on an empty list.
+  fs.appendFileSync(path.join(d, 'docs/plans/p.md'), '\nTBD: which cache to use.\n');
+  drv(d, ['load', 'docs/plans/p.md']);
+  drv(d, ['scan']);
+  ok('the scan really found something to repoint', gapsOf(d).some((g) => g.plan === 'docs/plans/p.md'));
+  // was: cmdLoad matched on path and pushed when it did not match, and `load`
+  // was the only writer of reg.plans anywhere — so there was no way back.
+  fs.renameSync(path.join(d, 'docs/plans/p.md'), path.join(d, 'docs/plans/p-DONE.md'));
+  const r1 = drv(d, ['load', 'docs/plans/p-DONE.md']);
+  ok('load repoints when the content is identical and the old path is gone', has(r1.out, 'repointed'), r1.out);
+  ok('and does not leave two entries for one plan', (reg(d).plans || []).length === 2, JSON.stringify((reg(d).plans || []).map((x) => x.path)));
+  ok('and the gaps came with it', gapsOf(d).every((g) => g.plan !== 'docs/plans/p.md'));
+  ok('and the tasks came with it', tasksOf(d).every((t) => t.plan !== 'docs/plans/p.md'));
+  ok('so scan runs again', drv(d, ['scan']).code === 0);
+
+  // With an edit alongside the rename the content differs, so nothing can tell
+  // a move from a new plan. That is what `plan mv` is for.
+  fs.renameSync(path.join(d, 'docs/plans/p-DONE.md'), path.join(d, 'docs/plans/p-FINAL.md'));
+  fs.appendFileSync(path.join(d, 'docs/plans/p-FINAL.md'), 'and one more thing.\n');
+  const r2 = drv(d, ['scan']);
+  ok('scan refuses on a plan that is not on disk', r2.code !== 0, r2.out);
+  ok('and points at plan mv rather than at load', has(r2.out, 'plan mv'), r2.out);
+
+  const r3 = drv(d, ['plan', 'mv', 'docs/plans/p-DONE.md', 'docs/plans/p-FINAL.md']);
+  ok('plan mv repoints it', r3.code === 0, r3.out);
+  ok('and says what it carried across', has(r3.out, 'repointed'), r3.out);
+  ok('and scan runs', drv(d, ['scan']).code === 0);
+  ok('plan list shows the gaps and tasks each plan carries', has(drv(d, ['plan', 'list']).out, 'gap(s)'));
+  const r4 = drv(d, ['plan', 'rm', 'docs/plans/p-FINAL.md']);
+  ok('plan rm refuses while anything still points at it', r4.code !== 0, r4.out);
+  ok('and it goes with --force', drv(d, ['plan', 'rm', 'docs/plans/p-FINAL.md', '--force']).code === 0);
+}
+
 
 // ---------------------------------------------------------------------- report
 if (!KEEP) for (const d of boxes) { try { fs.rmSync(d, { recursive: true, force: true }); } catch { /* gone */ } }
@@ -1798,7 +1865,7 @@ else console.log('\nsandboxes kept: ' + boxes.join('\n                '));
 // an exception thrown before its first `ok`, a case quietly commented out — and
 // the suite still ends on "all green", because green is only ever measured
 // against however many checks happened to run.
-const EXPECTED = 290;   // every check above counts; raise it deliberately when you add one
+const EXPECTED = 311;   // every check above counts; raise it deliberately when you add one
 
 console.log('\n' + '-'.repeat(60));
 if (pass + failures.length !== EXPECTED)

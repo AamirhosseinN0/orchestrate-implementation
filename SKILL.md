@@ -280,6 +280,21 @@ node $DRV load docs/plans/
 Then **read every one in full**. The scanner below is a net for what you missed,
 not a substitute for reading.
 
+**When a plan is renamed, repoint the record — do not re-`load` it.** `load` matches
+plans by path, so re-loading a moved plan leaves a stale entry beside the new one, and
+`scan` then refuses on the half that is no longer on disk. Since a plan here is renamed
+when every piece of it lands, this happens as a matter of course:
+
+```bash
+node $DRV plan mv docs/plans/thing.md docs/plans/thing-DONE.md
+node $DRV plan list          # every plan, its gaps and tasks, and any not on disk
+```
+
+`plan mv` carries the plan's gaps and tasks across with it; a bare `load` on the new path
+does not, and orphans them. (`load` repoints by itself in the one unambiguous case: the
+old path is gone and the content is byte-identical. Any edit alongside the rename and it
+cannot tell a move from a new plan, so use `plan mv`.)
+
 ## 2. Find what is undecided
 
 ```bash
@@ -1006,6 +1021,8 @@ offered, because free-text notes die with contexts:
 node $DRV owed add --what "backfill the two rows 1.10a offered" \
   --why "0.14c's tree lacks the table" --window "before 1.10c merges" --load-bearing
 node $DRV owed assign o01 --to 1.10c    # and put it in that task's brief
+node $DRV owed edit o01 --what "twelve call sites, not six" \
+                        --why-changed "counted them; the grep missed the aliased import"
 ```
 
 `ci` lists every open owed item as it records — assign each to a task that can

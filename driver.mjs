@@ -1570,6 +1570,23 @@ function cmdTaskAdd() {
   }
   commit(r);
   for (const line of said) console.log(line);
+  // Waves are recomputed from `needs` on every call, so a task created with none
+  // joins round 1 however late it is — and the checkpoint filed when it lands
+  // then covers every task round 1 ever held. Adding work to an open round is
+  // legitimate; being unable to tell afterwards is not. So: warn, do not refuse.
+  const fresh = plans.filter((p) => p.at < 0 && !(p.it.needs || []).length).map((p) => p.it.key);
+  if (fresh.length) {
+    const w0 = waves(r).find((w) => w.wave === 0);
+    const landed = w0 ? w0.tasks.filter((t) => t.status === 'landed').map((t) => t.key) : [];
+    if (landed.length) {
+      console.log('\n⚠ ' + fresh.join(', ') + ' ' + (fresh.length > 1 ? 'have' : 'has') +
+        ' no `needs`, so ' + (fresh.length > 1 ? 'they join' : 'it joins') + ' round 1 — which already has ' +
+        landed.length + ' landed task(s). The checkpoint filed when ' +
+        (fresh.length > 1 ? 'they land' : 'it lands') + ' will re-cover ' + landed.join(', ') + '.');
+      console.log('  Give ' + (fresh.length > 1 ? 'them' : 'it') + ' `needs` naming the last landed task if ' +
+        (fresh.length > 1 ? 'they should be a round' : 'it should be a round') + ' of its own.');
+    }
+  }
   console.log(tasks(r).length + ' task(s) on record. Run `graph` to check nothing clashes.');
 }
 
@@ -3013,6 +3030,8 @@ function cmdCiList() {
       '  ' + (c.ref || '(no ref)'));
     console.log('     covers ' + (c.covers && c.covers.length ? c.covers.join(' ')
       : '(nothing — proves no task)' + (c.legacy ? ', imported history' : '')));
+    // recorded from c02 on; older checkpoints simply do not carry it
+    if (c.newly) console.log('     newly ' + (c.newly.length ? c.newly.join(' ') : '(nothing new)'));
     if (c.why) console.log('     ' + String(c.why).replace(/\s+/g, ' ').slice(0, 150));
   }
   const un = unprovenLanded(r);
@@ -3035,13 +3054,25 @@ function cmdCi(flags) {
         st.tasks.filter((t) => t.status !== 'landed').map((t) => t.key).join(' '));
   // resolved at write time: exactly which landed work this run saw
   const covers = st.tasks.filter((t) => t.status === 'landed').map((t) => t.key);
+  // A task added mid-run with no `needs` joins round 1, so when it lands the
+  // round is "all landed" again and a checkpoint is filed over every task that
+  // round ever held. Four checkpoints each claimed a whole round when three of
+  // them proved one late fix. The run genuinely did re-test all of it, so
+  // `covers` is not a lie — it is just uninformative, and repeated it reads as
+  // one. `newly` is the part that was not already proven green.
+  const proven = new Set(checkpoints(r).filter((c) => c.status === 'green').flatMap((c) => c.covers || []));
+  const newly = covers.filter((k) => !proven.has(k));
+  const already = covers.filter((k) => proven.has(k));
   const cp = { id: nextCheckpointId(r), status, ref: flags.ref || '', why: flags.why || '',
-               covers, mainSha: flags.sha || '', at: now() };
+               covers, newly, mainSha: flags.sha || '', at: now() };
   checkpoints(r).push(cp);
   commit(r);
   console.log(cp.id + ': round ' + (n + 1) + ' ' + status + (flags.ref ? '  ' + flags.ref : ''));
+  console.log('  newly proven: ' + (newly.length ? newly.join(' ') : '(nothing — every task here was already green)'));
   console.log('  covers ' + (covers.length ? covers.join(' ') : '(nothing landed)') +
               ' — filed against those, not against a round number that moves.');
+  if (already.length)
+    console.log('  ' + already.length + ' of those had already been proven by an earlier checkpoint: ' + already.join(' '));
   if (status === 'green' || status === 'skipped') {
     const nxt = waveState(r, n + 1);
     console.log(nxt ? 'Round ' + (n + 2) + ' may now be opened: ' + nxt.tasks.map((t) => t.key).join(' ')

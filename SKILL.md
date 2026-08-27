@@ -1013,6 +1013,15 @@ flight), a landing invalidates any CI result that predates it, and `red` means
 what it always meant: send the break back to whoever owns those files before
 anything else opens on top of it.
 
+**A checkpoint covers a round, and a round can grow after it starts.** Waves are computed
+from `needs` every time they are asked for, so a task added mid-run with no `needs` joins
+round 1 however late it is — and the checkpoint filed when it lands covers every task that
+round ever held. The run genuinely did re-test all of it, so `covers` is not a lie, but
+read four times over it looks like four rounds where there was one. `ci` prints **`newly
+proven`** first, which is the part that was not already green, and `task add` warns when a
+task with no `needs` joins a round that already has landed work. Give such a task `needs`
+naming the last landed task if it should be a round of its own.
+
 A checkpoint also must not close over work that only a window makes possible.
 When an agent offers something outside its scope, record it the moment it is
 offered, because free-text notes die with contexts:

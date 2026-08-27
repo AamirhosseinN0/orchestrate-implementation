@@ -1856,6 +1856,41 @@ say('verify is green on a recorded run nobody made up');
   ok('and it goes with --force', drv(d, ['plan', 'rm', 'docs/plans/p-FINAL.md', '--force']).code === 0);
 }
 
+// --------------------------------------------- what a checkpoint actually proves
+{
+  say('a checkpoint says which work it newly proves');
+  const d = box('ckpt');
+  const land = (k) => { drv(d, ['landed', k]); };
+  const forceLanded = (keys) => {
+    const r0 = reg(d);
+    for (const t of r0.tasks) if (keys.includes(t.key)) { t.status = 'landed'; t.landedAt = new Date().toISOString(); }
+    fs.writeFileSync(path.join(d, '.claude/orchestration/register.json'), JSON.stringify(r0, null, 2));
+  };
+  void land;
+  forceLanded(['t1', 't2']);
+  const c1 = drv(d, ['ci', '--status', 'green', '--ref', 'run/1']);
+  ok('the first checkpoint proves the round it closed', has(c1.out, 'newly proven: t1 t2'), c1.out);
+
+  // was: a task added mid-run with no needs joins round 1, so the checkpoint
+  // filed when it lands covers every task that round ever held — four
+  // checkpoints each claiming a whole round when three proved one late fix.
+  const a = drv(d, ['task', 'add'], { stdin: JSON.stringify({ key: 'late', title: 'late one', owns: ['src/late.py'] }) });
+  ok('task add warns a no-needs task is joining a round with landed work', has(a.out, 'joins round 1'), a.out);
+  ok('and says how to give it a round of its own', has(a.out, '`needs`'), a.out);
+  ok('but does not refuse it', a.code === 0);
+
+  forceLanded(['t1', 't2', 'late']);
+  const c2 = drv(d, ['ci', '--status', 'green', '--ref', 'run/2']);
+  ok('the next checkpoint newly proves only the late task', has(c2.out, 'newly proven: late'), c2.out);
+  ok('and says the rest was already green', has(c2.out, 'already been proven'), c2.out);
+  ok('while covers keeps its old meaning', has(c2.out, 'covers t1 t2 late'), c2.out);
+  ok('and ci list shows both', has(drv(d, ['ci', 'list']).out, 'newly late'));
+
+  const d2 = box('ckpt2');
+  const b = drv(d2, ['task', 'add'], { stdin: JSON.stringify({ key: 'early', title: 'e', owns: ['src/e.py'] }) });
+  ok('and there is no warning when the round has nothing landed yet', !has(b.out, 'joins round 1'), b.out);
+}
+
 
 // ---------------------------------------------------------------------- report
 if (!KEEP) for (const d of boxes) { try { fs.rmSync(d, { recursive: true, force: true }); } catch { /* gone */ } }
@@ -1865,7 +1900,7 @@ else console.log('\nsandboxes kept: ' + boxes.join('\n                '));
 // an exception thrown before its first `ok`, a case quietly commented out — and
 // the suite still ends on "all green", because green is only ever measured
 // against however many checks happened to run.
-const EXPECTED = 311;   // every check above counts; raise it deliberately when you add one
+const EXPECTED = 320;   // every check above counts; raise it deliberately when you add one
 
 console.log('\n' + '-'.repeat(60));
 if (pass + failures.length !== EXPECTED)

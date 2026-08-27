@@ -34,10 +34,11 @@ const has = (hay, needle) => String(hay).includes(needle);
 
 // Runs the driver and returns {code, out} with stdout and stderr joined, because
 // several commands say the important thing on stderr and exit non-zero.
-function drv(cwd, args, { stdin, timeout } = {}) {
+function drv(cwd, args, { stdin, timeout, env } = {}) {
   try {
     const out = execFileSync(process.execPath, [DRIVER, ...args],
-      { cwd, encoding: 'utf8', input: stdin, timeout, stdio: ['pipe', 'pipe', 'pipe'] });
+      { cwd, encoding: 'utf8', input: stdin, timeout, stdio: ['pipe', 'pipe', 'pipe'],
+        env: env ? { ...process.env, ...env } : process.env });
     return { code: 0, out };
   } catch (e) {
     return { code: e.status === undefined ? -1 : e.status, out: String(e.stdout || '') + String(e.stderr || '') };
@@ -1891,6 +1892,79 @@ say('verify is green on a recorded run nobody made up');
   ok('and there is no warning when the round has nothing landed yet', !has(b.out, 'joins round 1'), b.out);
 }
 
+// -------------------------------------------------- the two kind vocabularies
+{
+  say('say and heard name both kind vocabularies');
+  const d = box('kinds');
+  // was: `heard --kind question` worked and `say --kind question` did not, and
+  // SKILL.md listed neither vocabulary — only examples two lines apart.
+  const r1 = drv(d, ['say', 't1', '--kind', 'question', '--text', 'which base image?']);
+  ok('say --kind question is accepted', r1.code === 0, r1.out);
+  ok('and says the chip now owes an answer', has(r1.out, 'owes you'), r1.out);
+  const o1 = drv(d, ['outstanding']);
+  ok('outstanding lists it as a debt owed to you, not by you', has(o1.out, 'You asked these'), o1.out);
+  ok('and does not file it under things waiting on you', !has(o1.out.split('You asked these')[0], 't1  '), o1.out);
+  drv(d, ['heard', 't1', '--kind', 'note', '--text', 'node:22']);
+  ok('and anything coming back clears it', !has(drv(d, ['outstanding']).out, 'You asked these'));
+
+  const r2 = drv(d, ['say', 't1', '--kind', 'blocked', '--text', 'x']);
+  ok('a kind from the wrong direction is still refused', r2.code !== 0, r2.out);
+  ok('and the error prints both vocabularies', has(r2.out, 'checkin') && has(r2.out, 'release'), r2.out);
+  const r3 = drv(d, ['heard', 't1', '--kind', 'hold', '--text', 'x']);
+  ok('in both directions', r3.code !== 0 && has(r3.out, 'the other direction takes'), r3.out);
+}
+
+// -------------------------------------------- brief --all under a running agent
+{
+  say('brief --all can be asked what it would disturb');
+  const d = box('briefall');
+  drv(d, ['brief', 't1']);
+  drv(d, ['chip', 't1', '--id', 'task_x']);
+  drv(d, ['agent', 't1', '--name', 'holder-name']);
+  const before = tasksOf(d).find((t) => t.key === 't1');
+  drv(d, ['task', 'add'], { stdin: JSON.stringify({ key: 't1', verify: ['true', 'true'] }) });
+  // was: no way to see what a rewrite would move before moving it, and the
+  // changed line named nobody, so "tell the agent" needed a second lookup.
+  const dry = drv(d, ['brief', '--all', '--dry-run']);
+  ok('--dry-run says which briefs would move', has(dry.out, 'would change: t1'), dry.out);
+  ok('and who is holding each', has(dry.out, 'holder-name'), dry.out);
+  ok('and warns about a register snapshot in flight', has(dry.out, 'snapshot'), dry.out);
+  const after = tasksOf(d).find((t) => t.key === 't1');
+  ok('and writes nothing at all', after.briefSha === before.briefSha && after.briefAt === before.briefAt);
+
+  const real = drv(d, ['brief', '--all']);
+  ok('the real run names the agent to message', has(real.out, 'message holder-name'), real.out);
+  ok('and the brief actually moved', tasksOf(d).find((t) => t.key === 't1').briefSha !== before.briefSha);
+}
+
+// ------------------------------------------ the address, and who is really there
+{
+  say('agent checks the address against the task\'s worktree');
+  const d = box('addr');
+  const home = path.join(d, 'fakehome');
+  const sess = path.join(home, '.claude/sessions');
+  fs.mkdirSync(sess, { recursive: true });
+  const wt = path.join(d, 'wt-t1');
+  execFileSync('git', ['worktree', 'add', '-q', '-b', 'step/t1', wt], { cwd: d, stdio: 'ignore' });
+  fs.writeFileSync(path.join(sess, 'a.json'), JSON.stringify({ sessionId: 'a', cwd: wt, name: 'builder-3d6c4a-11' }));
+  fs.writeFileSync(path.join(sess, 'b.json'), JSON.stringify({ sessionId: 'b', cwd: d, name: 'observer-echo' }));
+  // was: cmdAgent recorded whatever --name it was given. The brief dictates the
+  // check-in sentence word for word, so an observer echoing it is identical at
+  // the message layer, and the wrong address is silent until a release goes
+  // nowhere. Both halves of this lookup already existed and were never joined.
+  const r1 = drv(d, ['agent', 't1', '--name', 'observer-echo'], { env: { HOME: home } });
+  ok('a name that is not in the worktree is refused', r1.code !== 0, r1.out);
+  ok('and the real builder is named', has(r1.out, 'builder-3d6c4a-11'), r1.out);
+  ok('and nothing was recorded', !tasksOf(d).find((t) => t.key === 't1').agent);
+  const r2 = drv(d, ['agent', 't1', '--name', 'builder-3d6c4a-11'], { env: { HOME: home } });
+  ok('the session actually in the worktree is taken', r2.code === 0, r2.out);
+  const r3 = drv(d, ['agent', 't1', '--name', 'observer-echo', '--force'], { env: { HOME: home } });
+  ok('--force takes it anyway', r3.code === 0, r3.out);
+  ok('and says it was forced', has(r3.out, 'forced'), r3.out);
+  const r4 = drv(d, ['agent', 't1', '--name', 'anything'], { env: { HOME: path.join(d, 'no-such-home') } });
+  ok('a lookup that cannot run does not block the run', r4.code === 0, r4.out);
+  ok('and says it could not check', has(r4.out, 'could not check'), r4.out);
+}
 
 // ---------------------------------------------------------------------- report
 if (!KEEP) for (const d of boxes) { try { fs.rmSync(d, { recursive: true, force: true }); } catch { /* gone */ } }
@@ -1900,7 +1974,7 @@ else console.log('\nsandboxes kept: ' + boxes.join('\n                '));
 // an exception thrown before its first `ok`, a case quietly commented out — and
 // the suite still ends on "all green", because green is only ever measured
 // against however many checks happened to run.
-const EXPECTED = 320;   // every check above counts; raise it deliberately when you add one
+const EXPECTED = 342;   // every check above counts; raise it deliberately when you add one
 
 console.log('\n' + '-'.repeat(60));
 if (pass + failures.length !== EXPECTED)

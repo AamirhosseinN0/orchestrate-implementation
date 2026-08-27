@@ -2222,20 +2222,50 @@ function cmdBrief(key, flags) {
   console.log('---8<---');
 }
 
-function cmdBriefAll() {
+function cmdBriefAll(flags) {
   const r = readReg();
   let n = 0;
   let same = 0;
+  const moved = [];
+  // "Run it after any correction" is safe advice only while nothing is holding a
+  // brief. A rewrite moves briefSha and briefAt under whoever has it, so an agent
+  // part-way through — one taking a snapshot of the register, in particular —
+  // finds its own copy no longer reproduces. --dry-run answers "what would this
+  // disturb" without disturbing it.
+  if (flags && flags['dry-run']) {
+    for (const t of tasks(r)) {
+      if (['cancelled', 'landed'].includes(t.status)) continue;
+      n++;
+      if (t.briefSha && t.briefSha !== briefSha(t, r)) moved.push(t);
+    }
+    console.log(n + ' live brief(s); ' + moved.length + ' would be rewritten. Nothing was written.');
+    for (const t of moved) console.log('  would change: ' + t.key + '  (' + t.status + ')' +
+      (t.agent ? '  — held by ' + t.agent : '  — not handed out'));
+    if (moved.some((t) => t.agent))
+      console.log('\nAn agent holding one of these has to be told to re-read it. If one is taking a\n' +
+                  'register snapshot right now, let it commit first — a snapshot has to be the last\n' +
+                  'thing it does before committing, or it cannot reproduce its own copy.');
+    return;
+  }
   for (const t of tasks(r)) {
     if (['cancelled', 'landed'].includes(t.status)) continue;
     const before = t.briefSha;
     cmdBriefQuiet(t.key);
     n++;
-    if (getTask(readReg(), t.key).briefSha === before) same++;
-    const now2 = getTask(readReg(), t.key).briefSha;
-    if (before && before !== now2) console.log('  changed: ' + t.key + '  → any chip already holding it is out of date');
+    const after = getTask(readReg(), t.key);
+    if (after.briefSha === before) same++;
+    // Naming the agent turns "somebody should be told" into an instruction that
+    // can be carried out without looking anything up.
+    else if (before) {
+      moved.push(after);
+      console.log('  changed: ' + t.key + '  → ' +
+        (after.agent ? 'message ' + after.agent + ' to re-read it' : 'not handed out yet, so nobody is holding it'));
+    }
   }
   console.log(n + ' brief(s) checked in ' + orchDir('briefs') + '; ' + (n - same) + ' rewritten, ' + same + ' already current.');
+  if (moved.some((t) => t.agent))
+    console.log('A held brief that moved is one its agent is no longer working from. Tell each named\n' +
+                'agent above; if one is mid-snapshot of the register, its copy will not reproduce.');
 }
 
 function cmdBriefQuiet(key) {
@@ -3182,9 +3212,52 @@ function cmdChip(key, flags) {
   }
 }
 
+// The brief dictates the exact check-in sentence, so two senders produce the
+// same bytes — and on a real run every chip checked in twice, once from the
+// builder and once from an observer echoing it verbatim. At the message layer
+// they cannot be told apart, and this command believed whichever arrived. The
+// discriminator is which session is sitting in the task's worktree, and both
+// halves of that lookup were already in this file, never called together:
+// worktreeFor() maps a branch to a worktree, cmdWhoami() reads the session
+// registry. Recording the wrong address is silent until a release goes nowhere.
+function sessionsIn(dir) {
+  const reg = path.join(process.env.HOME || '', '.claude', 'sessions');
+  if (!dir || !fs.existsSync(reg)) return null;
+  try {
+    const want = fs.realpathSync(dir);
+    const out = [];
+    for (const f of fs.readdirSync(reg)) {
+      if (!f.endsWith('.json')) continue;
+      let o; try { o = JSON.parse(fs.readFileSync(path.join(reg, f), 'utf8')); } catch { continue; }
+      if (!o || !o.cwd || !o.name) continue;
+      let c; try { c = fs.realpathSync(o.cwd); } catch { c = o.cwd; }
+      if (c === want || c.startsWith(want + path.sep)) out.push(o.name);
+    }
+    return out;
+  } catch { return null; }
+}
+
 function cmdAgent(key, flags) {
   const r = readReg(); const t = getTask(r, key);
   if (!flags.name) die('need --name <peer name it checked in from>');
+  const wt = worktreeFor(t);
+  const here = sessionsIn(wt);
+  // An unavailable check must not become a blocked run: no git, no session
+  // registry, no worktree yet — say so and take the name.
+  if (here === null || !wt) {
+    console.log('(could not check the address against a worktree' +
+      (wt ? ' — no session registry readable' : ' — no worktree recorded for ' + t.branch) + '; taking the name as given)');
+  } else if (!here.includes(flags.name) && !flags.force) {
+    die(flags.name + ' is not a session in ' + rel(wt) + ', which is where ' + key + ' is being built.\n' +
+        '       The brief dictates the check-in sentence word for word, so an observer echoing it\n' +
+        '       sends a message identical to the builder\'s. The worktree is what tells them apart.\n' +
+        (here.length ? '       Sessions actually in that worktree: ' + here.join(', ') + '\n'
+                     : '       No session is in that worktree yet — the chip may not have started.\n') +
+        '       Record one of those, or pass --force if you know this lookup is the thing that is wrong.');
+  } else if (!here.includes(flags.name)) {
+    console.log('⚠ forced: ' + flags.name + ' is not a session in ' + rel(wt) +
+      (here.length ? ' (those are: ' + here.join(', ') + ')' : ' (no session is in it)'));
+  }
   t.agent = flags.name;
   // heldNeeds treats a requirement that is not on record as unlanded and names
   // it. Reading it with getTask instead used to abort the whole command with
@@ -3704,16 +3777,25 @@ function cmdIngest(flags) {
   }
 }
 
-const OUT_KINDS = ['release', 'reply', 'sendback', 'note', 'hold', 'announce'];
+// The two vocabularies are deliberately different — you are never `blocked`,
+// a chip never puts you on `hold` — but `question` was missing from the
+// outbound half for no reason anyone stated, so asking a chip something had to
+// be logged as a `note` and vanished from every list that tracks a debt. The
+// asymmetry that remains is real; the one that bit was an oversight.
+const OUT_KINDS = ['release', 'reply', 'sendback', 'note', 'hold', 'announce', 'question'];
 const IN_KINDS = ['checkin', 'report', 'question', 'blocked', 'note'];
+const kindHelp = (mine, theirs, dir) => 'kind must be one of: ' + mine.join(', ') +
+  '\n       (those are the ' + dir + ' kinds; the other direction takes ' + theirs.join(', ') + ')';
 
 function cmdSay(key, flags) {
   const r = readReg(); const t = getTask(r, key);
   const kind = flags.kind || 'note';
-  if (!OUT_KINDS.includes(kind)) die('kind must be one of: ' + OUT_KINDS.join(', '));
+  if (!OUT_KINDS.includes(kind)) die(kindHelp(OUT_KINDS, IN_KINDS, 'say/outbound'));
   if (typeof flags.text !== 'string' || !flags.text.trim()) die('need --text "what you actually sent"');
   append({ dir: 'out', key, kind, agent: t.agent || '', text: flags.text });
   console.log('logged: → ' + key + ' [' + kind + ']');
+  if (kind === 'question')
+    console.log('  It now owes you an answer. `outstanding` says so until anything comes back from it.');
   if (kind === 'sendback') {
     const d = recordDefect(r, { task: key, kind: 'sendback', what: flags.text, evidence: '', blocking: true });
     commit(r);
@@ -3725,7 +3807,7 @@ function cmdSay(key, flags) {
 function cmdHeard(key, flags) {
   const r = readReg(); const t = getTask(r, key);
   const kind = flags.kind || 'note';
-  if (!IN_KINDS.includes(kind)) die('kind must be one of: ' + IN_KINDS.join(', '));
+  if (!IN_KINDS.includes(kind)) die(kindHelp(IN_KINDS, OUT_KINDS, 'heard/inbound'));
   const text = strFlag(flags, 'text', 'need --text "what they actually said"');
   append({ dir: 'in', key, kind, agent: t.agent || '', text });
   t.lastHeard = now();
@@ -3879,10 +3961,44 @@ function waitingOn(r, log) {
   return rows;
 }
 
+// The reverse debt. `outstanding` answers "who is waiting on me", and a question
+// you asked and never got an answer to is the other direction — so it gets its
+// own section rather than being filed under a heading that would make it false.
+// Anything at all coming back from the chip clears it: if it spoke after you
+// asked, you are no longer the one waiting, whatever it chose to say.
+function awaitingReply(r, log) {
+  const rows = [];
+  for (const t of tasks(r)) {
+    if (['landed', 'cancelled'].includes(t.status)) continue;
+    const mine = log.filter((e) => e.key === t.key);
+    const lastAsk = [...mine].reverse().find((e) => e.dir === 'out' && e.kind === 'question');
+    if (!lastAsk) continue;
+    if (mine.some((e) => e.dir === 'in' && e.at > lastAsk.at)) continue;
+    rows.push({ key: t.key, detail: String(lastAsk.text || '').slice(0, 90), since: lastAsk.at });
+  }
+  return rows;
+}
+
 function cmdOutstanding() {
   const r = readReg();
-  const rows = waitingOn(r, ledger());
-  if (!rows.length) return console.log('Nothing is waiting on you.');
+  const log = ledger();
+  const rows = waitingOn(r, log);
+  const asked = awaitingReply(r, log);
+  const showAsked = () => {
+    if (!asked.length) return;
+    console.log('\nYou asked these and have had nothing back:\n');
+    for (const x of asked) {
+      console.log('  ' + x.key.padEnd(10) + 'has not answered');
+      const d = String(x.detail || '').replace(/\s+/g, ' ').trim();
+      if (d) console.log('             \u201c' + d.slice(0, 110) + (d.length > 110 ? '\u2026\u201d' : '\u201d'));
+      if (x.since) console.log('             since ' + x.since.slice(0, 19).replace('T', ' '));
+    }
+    console.log('\n' + asked.length + ' unanswered question(s) you put.');
+  };
+  if (!rows.length) {
+    console.log('Nothing is waiting on you.');
+    return showAsked();
+  }
   console.log('These are waiting on you. Deal with each one — none of them will ask twice.\n');
   for (const x of rows) {
     console.log('  ' + x.key.padEnd(10) + x.why);
@@ -3894,6 +4010,7 @@ function cmdOutstanding() {
     if (x.since) console.log('             since ' + x.since.slice(0, 19).replace('T', ' '));
   }
   console.log('\n' + rows.length + ' outstanding.');
+  showAsked();
 }
 
 // ------------------------------------------------------------------- resume
@@ -4138,7 +4255,7 @@ switch (cmd) {
   case 'iam': { const r = readReg(); r.orchestrator = rest[0] || die('need a name'); commit(r); console.log('briefs will tell chips to report to ' + r.orchestrator); break; }
   case 'task': if (rest.shift() !== 'add') die('only `task add` is supported'); cmdTaskAdd(); break;
   case 'graph': cmdGraph(); break;
-  case 'brief': if (flags.all) cmdBriefAll(); else cmdBrief(rest[0], flags); break;
+  case 'brief': if (flags.all) cmdBriefAll(flags); else cmdBrief(rest[0], flags); break;
   case 'chip': cmdChip(rest[0], flags); break;
   case 'agent': cmdAgent(rest[0], flags); break;
   case 'release': cmdRelease(rest[0]); break;

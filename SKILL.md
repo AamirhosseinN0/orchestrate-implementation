@@ -172,6 +172,19 @@ node $DRV say   2.1 --kind reply    --text "my error, brief rewritten, re-read i
 node $DRV outstanding    # who is waiting on you, and since when
 ```
 
+**The two directions take different kinds, and the difference is deliberate.**
+
+| | kinds |
+|---|---|
+| `heard` (inbound) | `checkin` `report` `question` `blocked` `note` |
+| `say` (outbound) | `release` `reply` `sendback` `note` `hold` `announce` `question` |
+
+You are never `blocked` and a chip never puts you on `hold`, so those stay one-sided. Do
+not assume the rest mirror: pass a kind the other direction takes and the error prints
+both lists. `outstanding` reads both — an inbound `question` is a debt you owe, cleared
+only by a `reply`; an outbound `question` is a debt owed to you, listed separately and
+cleared by anything at all coming back.
+
 - **And do not rely on having remembered.** Logging by hand only works if you
   remember, and a compaction is exactly the event that makes you forget. You do
   not have to: Claude Code writes every turn to a transcript on disk, inbound
@@ -747,6 +760,19 @@ the brief itself is read from disk, from the main checkout, by absolute path.
 `brief --all` rewrites every live brief at once and names which changed — run it
 after any correction to the record.
 
+**Run it before you hand anything out, and think before you run it after.** A rewrite
+moves `briefSha` and `briefAt` under whoever is holding that brief. An agent part-way
+through its work is now working from a document that no longer matches the record, and
+one taking a snapshot of the register finds its own copy will not reproduce. So:
+
+- `brief --all --dry-run` first, whenever anything is running. It names which briefs
+  would move and which agent is holding each, and writes nothing.
+- Tell every named agent to re-read its brief. A moved brief nobody was told about is
+  worse than a stale one, because it looks current.
+- **A register snapshot has to be the last thing an agent does before it commits.** If a
+  chip is taking one now, let it finish. This was learned the hard way, by an agent that
+  correctly diagnosed its orchestrator for moving the ground under it.
+
 **Then `doctor`, before any chip exists.** A brief is handed to somebody who
 will believe it, so everything it cites that can be checked mechanically, is:
 
@@ -1149,9 +1175,16 @@ answer coming, and the agent is still waiting.
   these — that is what `serialises` is for, and pre-flight is where the unknown
   ones surface.
 - **A chip's copy of the repository gets a random name**, so you cannot work out
-  its address in advance. The check-in message is the only reliable way to get
-  it — which is why every brief demands one before the agent does anything else,
-  hold or no hold.
+  its address in advance. The check-in tells you an address is live — which is why
+  every brief demands one before the agent does anything else, hold or no hold —
+  but it does **not** tell you whose. The brief dictates that sentence word for
+  word, so anything echoing it sends identical bytes; on a real run every chip
+  checked in twice, once from the builder and once from an observer repeating it,
+  and a defect was opened on the first occurrence before the cause was understood.
+  **The worktree is the discriminator, not the message.** `agent` now checks the
+  name against the sessions actually sitting in the task's worktree and refuses one
+  that is not among them, printing the ones that are. If the lookup itself is what
+  is broken, `--force` takes the name anyway.
 - **`ListAgents` never shows you.** That is how you find your own name — it is
   the one in `~/.claude/sessions/*.json` for this directory that the listing
   does not have. A worktree session's name carries a two-character suffix; read

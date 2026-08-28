@@ -1245,13 +1245,25 @@ function decisionText(r, entry) {
 }
 function decisionsOf(r, t) { return (t.decisions || []).map((d) => decisionText(r, d)); }
 
+// Exactly the fields the brief's text is built from. `notes` and the pre-flight
+// notes are in it now BECAUSE they are rendered now — they were excluded on the
+// grounds that a notes-only change must not cry stale, which was true only while
+// the brief did not show them, and which meant every reader of this hash was
+// structurally unable to notice the omission. Editing a task's note to "the auth
+// check is inverted, do not ship" changed nothing anybody could see.
+//
+// `orchestrator` is NOT in it. `resume` reassigns that address after every
+// compaction — eleven times on one real run — and each reassignment marked all
+// 116 briefs stale at once for a reason that has nothing to do with any task,
+// forcing a rewrite of live briefs under the agents holding them. A handover is
+// worth surfacing; it is not a change to the work.
 function briefSha(t, r) {
-  // exactly the fields the brief's text is built from — no more (a notes-only
-  // change must not cry stale) and no less (a new orchestrator address must)
   return crypto.createHash('sha256').update(JSON.stringify({
     key: t.key, title: t.title, plan: t.plan, needs: t.needs, owns: t.owns,
     serialises: t.serialises || [], context: t.context, verify: t.verify,
-    decisions: r ? decisionsOf(r, t) : t.decisions, branch: t.branch, orchestrator: (r && r.orchestrator) || '',
+    decisions: r ? decisionsOf(r, t) : t.decisions, branch: t.branch,
+    notes: t.notes || '', preflightNotes: (t.preflight && t.preflight.notes) || '',
+    bundleOrder: t.bundleOrder || [],
   })).digest('hex').slice(0, 12);
 }
 
@@ -2256,6 +2268,26 @@ function cmdBrief(key, flags) {
     for (const d of decisionsOf(r, t)) B.push('- ' + d);
     B.push('');
   }
+  // `notes` and the pre-flight's own notes were the two fields nothing ever
+  // rendered. A pre-flight exists to find what the plan missed BEFORE anyone
+  // starts, and every word of what it found was landing in a field the brief did
+  // not print — so the agent it was written for never saw it. Two thirds of the
+  // tasks on a real run carried a note, including "you do not own the plans
+  // directory", and the orchestrator ended up hand-writing a second file beside
+  // the brief to carry them, which nothing in this tool knows how to keep current.
+  const notes = String(t.notes || '').trim();
+  const pfNotes = String((t.preflight && t.preflight.notes) || '').trim();
+  if (notes || pfNotes) {
+    B.push('**Read this before you start. It is here because somebody found it the hard way:**');
+    B.push('');
+    if (notes) { for (const line of notes.split('\n')) B.push(line); B.push(''); }
+    if (pfNotes) {
+      B.push('From the pre-flight agent that read this task against the real code:');
+      B.push('');
+      for (const line of pfNotes.split('\n')) B.push('> ' + line);
+      B.push('');
+    }
+  }
   B.push('**Build on what is already there. These exist — read them before you write anything that');
   B.push('overlaps, and use them rather than writing your own:**');
   B.push('');
@@ -2381,8 +2413,15 @@ function cmdBrief(key, flags) {
   console.log('the plan, the decisions already settled, what to build on, the only files you may');
   console.log('change, and what counts as proof. Nothing was left in a chat message.');
   console.log('');
-  console.log('It lives in the main checkout, so read it by that absolute path — it will not be');
-  console.log('inside your own copy of the repository.');
+  // Was: "it will not be inside your own copy of the repository." Nothing in
+  // this tool writes into a worktree, but something outside it copies
+  // `.claude/orchestration/` into each one — so there often IS a copy in there,
+  // it is a snapshot of the moment the chip opened, and no command can refresh
+  // it. Telling the agent the file is only over here made the stale copy in its
+  // own tree look like the same file. Say which one is authoritative instead.
+  console.log('Read it at that absolute path, in the main checkout. If a copy of it exists inside');
+  console.log('your own tree, it is a snapshot from when this chip opened and nothing updates it —');
+  console.log('the one above is the live one.');
   console.log('');
   console.log('Two things from it, up front, so you cannot miss them:');
   console.log('');
@@ -3433,6 +3472,19 @@ function cmdChip(key, flags) {
       console.error('  survive. It opens the moment ' + [...new Set(clashes.map((c) => c.o.key))].join('/') + ' lands — `frontier` will say.');
       process.exit(1);
     }
+  }
+  // The brief is the whole of what the agent is given, and this is the moment it
+  // is handed over — after which the agent is reading and building from it. A
+  // brief the record has moved past was reported by `doctor` and by nothing that
+  // could stop it being used: `chip` checked status, unmet needs and
+  // interference, and then said "can start now" over a brief that no longer
+  // matched the task. Refuse, and say the one command that fixes it.
+  if (t.briefSha && t.briefSha !== briefSha(t, r)) {
+    console.error('✗ ' + key + '\'s brief no longer matches the record — the task changed after it was');
+    console.error('  written, so what the agent would read is not what this task now says.');
+    console.error('  Run `brief ' + key + '` first. If an agent has already been given the old one,');
+    console.error('  tell it to read the file again — the path does not change.');
+    process.exit(1);
   }
   if (flags.id) t.chip = flags.id;
   if (flags.worktree) t.worktree = flags.worktree;

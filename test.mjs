@@ -849,10 +849,65 @@ say('a brief the record has moved past is called out');
   ok('changing what the brief is built from makes it stale',
      has(after, 'record changed after these briefs') && has(after, 't1'));
   ok('and doctor fails on it', drv(d, ['doctor']).code === 1);
-  drv(d, ['task', 'add'], { stdin: JSON.stringify([{ key: 't1', notes: 'a note changes nothing' }]) });
-  ok('a note-only change does not cry stale on its own',
+  drv(d, ['brief', 't1']);
+  // Was: notes were left out of the hash on the grounds that a note-only change
+  // must not cry stale — which held only while the brief did not show them, and
+  // meant every reader of this hash was structurally unable to notice that the
+  // note never reached the agent. The note is in the brief now, so it counts.
+  drv(d, ['task', 'add'], { stdin: JSON.stringify([{ key: 't1', notes: 'the auth check is inverted, do not ship' }]) });
+  ok('a note-only change makes the brief stale, because the note is in the brief',
+     has(drv(d, ['board']).out, 'record changed after these briefs'), drv(d, ['board']).out.slice(0, 300));
+  ok('and a rewrite carries the note into the file the agent reads',
      has(drv(d, ['brief', 't1']).out, 'wrote ') &&
-     !has(drv(d, ['board']).out, 'record changed after these briefs'));
+     has(readIf(path.join(d, '.claude/orchestration/briefs/t1.md')), 'the auth check is inverted'));
+  // Was: the orchestrator's own address was hashed too, so `resume` after every
+  // compaction — eleven times on one real run — marked every live brief stale at
+  // once, for a reason that has nothing to do with any task.
+  drv(d, ['iam', 'somebody-else']);
+  ok('a change of orchestrator does not make every brief stale',
+     !has(drv(d, ['board']).out, 'record changed after these briefs'), drv(d, ['board']).out.slice(0, 300));
+}
+
+// Was: cmdBrief rendered neither the task's own `notes` nor the pre-flight's
+// notes, so a pre-flight — which exists to find what the plan missed before
+// anyone starts — wrote its findings into a field the brief did not print. On a
+// real run two thirds of tasks carried a note and every pre-flight finding was
+// invisible to the agent it was written for.
+say('a brief carries the notes the record holds for that task');
+{
+  const d = box('briefnotes');
+  drv(d, ['task', 'add'], { stdin: JSON.stringify([
+    { key: 't1', notes: 'YOU DO NOT OWN THE PLANS DIRECTORY — only your own plan document.' },
+  ]) });
+  const rep = path.join(d, '.claude/orchestration/preflight/t1.json');
+  fs.mkdirSync(path.dirname(rep), { recursive: true });
+  fs.writeFileSync(rep, JSON.stringify({ missing: [], serialises: [], verify: [],
+    notes: 'THE SHARPEST THING I FOUND: the enum and its check constraint disagree.' }) + '\n');
+  drv(d, ['preflight', 'done', 't1']);
+  drv(d, ['brief', 't1']);
+  const brief = readIf(path.join(d, '.claude/orchestration/briefs/t1.md'));
+  ok('the task note reaches the file the agent is told to read',
+     has(brief, 'YOU DO NOT OWN THE PLANS DIRECTORY'), brief.slice(0, 200));
+  ok('and so does what the pre-flight found',
+     has(brief, 'THE SHARPEST THING I FOUND'), brief.slice(0, 200));
+  ok('and the pre-flight is marked as coming from the pre-flight',
+     has(brief, 'From the pre-flight agent'));
+}
+
+// Was: chip checked status, unmet needs and interference, and then said "can
+// start now" over a brief the record had moved past — the one moment where the
+// agent is about to start reading it. doctor said so and nothing stopped it.
+say('chip will not hand over a brief the record has moved past');
+{
+  const d = box('chipstale');
+  drv(d, ['brief', 't1']);
+  drv(d, ['task', 'add'], { stdin: JSON.stringify([{ key: 't1', title: 'rewritten after briefing' }]) });
+  const out = drv(d, ['chip', 't1', '--id', 'chip-t1']);
+  ok('it refuses', out.code !== 0 && has(out.out, 'no longer matches the record'), out.out.split('\n')[0]);
+  ok('and names the command that fixes it', has(out.out, 'brief t1'), out.out);
+  ok('and no chip was recorded', !tasksOf(d).find((t) => t.key === 't1')?.chip);
+  drv(d, ['brief', 't1']);
+  ok('after re-briefing it opens', drv(d, ['chip', 't1', '--id', 'chip-t1']).code === 0);
 }
 
 // --------------------------------------------------------------- the grill, in full
@@ -2206,7 +2261,7 @@ else console.log('\nsandboxes kept: ' + boxes.join('\n                '));
 // an exception thrown before its first `ok`, a case quietly commented out — and
 // the suite still ends on "all green", because green is only ever measured
 // against however many checks happened to run.
-const EXPECTED = 374;   // every check above counts; raise it deliberately when you add one
+const EXPECTED = 383;   // every check above counts; raise it deliberately when you add one
 
 console.log('\n' + '-'.repeat(60));
 if (pass + failures.length !== EXPECTED)

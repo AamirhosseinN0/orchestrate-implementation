@@ -193,6 +193,32 @@ function writeReg(r) {
     fs.writeFileSync(REG_PATH + '.tmp', next);
     fs.renameSync(REG_PATH + '.tmp', REG_PATH);
   }
+  writeStamp(next);
+}
+
+// What the register looked like when this tool last wrote it. Kept beside the
+// register rather than inside it: a field within would never be set by `replay`,
+// so `verify` would report it as drift for ever unless `verify` and `rebuild`
+// both grew an exception for it — the many-sites special-casing the event log
+// exists to avoid.
+function stampPath() { return path.resolve(CWD, REG_PATH) + '.stamp'; }
+const registerStamp = (text) => crypto.createHash('sha256').update(text).digest('hex').slice(0, 16);
+function writeStamp(text) {
+  try {
+    const tmp = stampPath() + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify({ sha: registerStamp(text), at: now() }) + '\n');
+    fs.renameSync(tmp, stampPath());        // by rename: readers are not locked
+  } catch { /* the stamp is evidence, not state — never fail a write over it */ }
+}
+// Did anything change the register other than this tool? Returns null when there
+// is nothing to compare — a first run, a register from before stamping, a stamp
+// swept by a cleaner — because "cannot tell" and "was edited" are different
+// answers and only one of them is worth interrupting somebody for.
+function stampSaysEdited(text) {
+  let st = null;
+  try { st = JSON.parse(fs.readFileSync(stampPath(), 'utf8')); } catch { return null; }
+  if (!st || typeof st.sha !== 'string') return null;
+  return st.sha !== registerStamp(text);
 }
 const rel = (p) => path.relative(CWD, p) || p;
 function nextId(r) {
@@ -364,8 +390,26 @@ function replay(events) {
 // which nothing can repair.
 function commit(r, why) {
   const f = eventsPath();
-  let before = {};
-  try { before = JSON.parse(fs.readFileSync(path.resolve(CWD, REG_PATH), 'utf8')); } catch { /* first write */ }
+  let before = {}, beforeText = null;
+  try { beforeText = fs.readFileSync(path.resolve(CWD, REG_PATH), 'utf8'); before = JSON.parse(beforeText); }
+  catch { /* first write */ }
+  // The register is a projection, and this diffs against whatever is on disk. So
+  // anything that edited it outside this tool — an editor, a stray script, a
+  // half-finished merge — became the trusted baseline at the very next command,
+  // and the divergence was never recorded, never healed and never mentioned.
+  // Only a hand-run `verify` ever saw it. Not fatal: a crash between writing the
+  // register and writing its stamp would otherwise brick every later command,
+  // making a bug in this tool indistinguishable from somebody's edit.
+  if (beforeText !== null && stampSaysEdited(beforeText) === true) {
+    console.log('⚠ ' + rel(REG_PATH) + ' changed since this tool last wrote it.');
+    console.log('  Taking it as it stands — but the record never learned whatever that was.');
+    console.log('  Run `verify` to see the difference before it is built on further.');
+    recordDefect(r, { task: '', kind: 'record',
+      what: 'the register was changed outside the tool',
+      evidence: 'detected by ' + (why || CMDNAME || 'a command') + ' at ' + now() +
+                '; the edit itself is not in the record. `verify` names the fields.',
+      blocking: false });
+  }
   const { events, problems, bytesGood } = readEvents();
   // A register with content sitting on top of an empty log is a hole in the
   // history, and appending only the delta to it is the worst of both worlds: the
@@ -413,6 +457,13 @@ function cmdRebuild(flags) {
   const maxSeq = events.reduce((m, e) => Math.max(m, e.seq || 0), 0);
   const to = numFlag(flags, 'to', { min: 1, max: maxSeq,
     what: 'a sequence number from 1 to ' + maxSeq + ' (the record ends there)' });
+  // A rewind cuts the record, and left no trace of itself in what remained. The
+  // only sign one had happened was a `.before-rewind-` file sitting beside it,
+  // and no command will diff that for you — so on a real run eight `bundle`
+  // calls and a chip id vanished with nothing accounting for them.
+  if (to !== undefined && !flags.check && (typeof flags.why !== 'string' || !flags.why.trim()))
+    die('rebuild --to needs --why "..." — a rewind removes events, and the record\n' +
+        '       has to be able to say why it is shorter than it was.');
   const upto = to === undefined ? Infinity : to;
   const use = events.filter((e) => (e.seq || 0) <= upto);
   const { state, problems: rp, lastSeq } = replay(use);
@@ -431,9 +482,26 @@ function cmdRebuild(flags) {
     console.error('    log reseed         the record lost its tail; take the register as truth');
     process.exit(1);
   }
+  // `verify` offers `rebuild` as one of two opposite fixes and says nothing can
+  // tell them apart for you. Choosing it overwrites the register from the record
+  // — so anything the record never learned is about to go, and this said the
+  // opposite: "nothing was thrown away", which is true of backups/ and false of
+  // the file it is replacing. Show the ground it is about to take.
+  let losing = [];
+  try { losing = diffOps(state, JSON.parse(fs.readFileSync(path.resolve(CWD, REG_PATH), 'utf8'))); }
+  catch { /* no register yet — nothing to lose */ }
+  if (losing.length) {
+    console.log('This replaces ' + losing.length + ' thing(s) the register holds and the record never learned:');
+    for (const o of losing.slice(0, 12))
+      console.log('    ' + o.p.join('.') + (o.d ? '  (only in the record)' : '  → ' + JSON.stringify(o.v).slice(0, 70)));
+    if (losing.length > 12) console.log('    …and ' + (losing.length - 12) + ' more');
+    console.log('  If any of that is real work, stop: `log reseed` is the other fix, and it keeps');
+    console.log('  the register instead. This keeps the record.');
+  }
   writeReg(state);
   console.log('rebuilt ' + rel(REG_PATH) + ' from ' + use.length + ' event(s) (seq ' + lastSeq + ').');
-  console.log('The previous file was kept in backups/ — nothing was thrown away.');
+  console.log('The register as it stood is in backups/' +
+    (losing.length ? ' — the ' + losing.length + ' thing(s) above exist only there now.' : '.'));
   // Rewinding the register while leaving the record at full length leaves the run
   // permanently drifted: the register says seq N, the log says seq maxSeq, and
   // every `verify` from then on reports the difference as damage. The two halves
@@ -452,6 +520,14 @@ function cmdRebuild(flags) {
       console.log('The record was cut to the same point, so the two stay in step.');
       console.log('The full record as it was is kept at ' + rel(keep) + ' — ' +
         (events.length - use.length) + ' event(s) beyond seq ' + lastSeq + ' are only there now.');
+      // Append the rewind itself, so the record accounts for its own gap rather
+      // than simply being shorter than it was.
+      const rec = { seq: lastSeq + 1, at: now(), cmd: 'rebuild --to', argv: CMDLINE,
+        rewind: { to: upto, cut: events.length - use.length, kept: rel(keep) },
+        why: flags.why, ops: [] };
+      sealLastLine(f);
+      fs.appendFileSync(f, JSON.stringify(rec) + '\n');
+      console.log('The rewind is itself on the record now, at seq ' + rec.seq + '.');
     }
   }
 }
@@ -2885,6 +2961,23 @@ function cmdDoctor() {
     if (orphans.length > 20) console.log('    … and ' + (orphans.length - 20) + ' more.');
     console.log('    What the agent found is sitting on disk where nothing reads it.');
   }
+  // The backups are described as a second net, and on a gitignored register they
+  // are the only one. Their depth is counted in writes, not in time, so a busy
+  // run silently thins the net: thirty states covered one hour and three quarters
+  // of a seventy-hour run, which is why the drift that run carried could no
+  // longer be dated. Say what the net actually reaches.
+  try {
+    const bdir = path.join(path.dirname(path.resolve(CWD, REG_PATH)), 'backups');
+    const bs = fs.readdirSync(bdir).filter((f) => f.startsWith('register-')).sort();
+    if (bs.length >= 30) {
+      const oldest = fs.statSync(path.join(bdir, bs[0])).mtimeMs;
+      const hrs = (Date.now() - oldest) / 3600000;
+      const span = hrs < 2 ? Math.round(hrs * 60) + ' minutes' : Math.round(hrs) + ' hours';
+      console.log('· the backup ring is full (' + bs.length + ' states) and reaches back ' + span + '.');
+      console.log('    Depth is counted in writes, not time — a busy run thins it without saying so.');
+      console.log('    If the register is gitignored, that is the whole of its history.');
+    }
+  } catch { /* no backups yet */ }
   // `refined` was set by an older driver that kept no report, and by this one
   // which does. Nothing distinguished them, so "refined, and the evidence
   // predates the log" read exactly like "marked refined, never actually done".
@@ -4236,6 +4329,23 @@ function cmdHeard(key, flags) {
 // what is waiting on me" — a few hundred words, not a 1 MB register. Meant to
 // be injected by a SessionStart hook (matcher compact|resume) as well as read
 // by hand.
+// One line about whether the record and the register still agree, cheap enough
+// to run wherever the run is being summarised. Returns null when they do.
+function driftLines(r) {
+  try {
+    const { events, problems } = readEvents();
+    if (problems.some((x) => x.fatal))
+      return '**The record is damaged.** `verify` names the line. Nothing should be built on this until it is settled.';
+    if (!events.length) return null;
+    const { state } = replay(events);
+    const drift = diffOps(state, r);
+    if (!drift.length) return null;
+    return '**The register and the record disagree in ' + drift.length + ' place(s)** — ' +
+      drift.slice(0, 3).map((o) => o.p.join('.')).join(', ') + (drift.length > 3 ? ', …' : '') +
+      '. Run `verify`; it names them and says what the two opposite fixes are.';
+  } catch { return null; }
+}
+
 function cmdDigest() {
   const r = readReg();
   const T = tasks(r);
@@ -4279,6 +4389,13 @@ function cmdDigest() {
     for (const o of owed.slice(0, 5)) L.push('- ' + o.id + ' ' + String(o.what).slice(0, 60) + (o.to ? ' → ' + o.to : ' → **nobody**'));
   }
   const unproven = unprovenLanded(r).length;
+  // SKILL.md says "the digest reports drift too" and it did not: `replay` was
+  // reached from exactly one place, inside `rebuild`. That matters more than a
+  // wrong sentence, because `hook-install` fires this at every SessionStart —
+  // so the one moment the orchestrator has lost its own memory is the moment it
+  // was handed a state summary with the integrity check quietly missing.
+  const drifted = driftLines(r);
+  if (drifted) L.push('\n⚠ ' + drifted);
   if (unproven) L.push('\n**' + unproven + ' landing(s) since the last CI checkpoint.**' + (unproven >= 5 ? ' That is a lot of unproven main line.' : ''));
   L.push('');
   L.push('**Next:** `frontier` (what can open) · `outstanding` (who is waiting) · `board` (everything).');

@@ -312,6 +312,67 @@ say('the lock still holds against a live holder');
   ok('and neither does one that fails', !fs.existsSync(lockPath));
 }
 
+// Was: an edit to register.json from outside the tool became the trusted
+// baseline at the very next command — commit() diffs against whatever is on
+// disk — so the divergence was never recorded, never healed and never mentioned.
+// Only a hand-run `verify` ever saw it.
+say('an edit from outside the tool is noticed rather than absorbed');
+{
+  const d = box('stamp');
+  const p = path.join(d, '.claude/orchestration/register.json');
+  const r = JSON.parse(fs.readFileSync(p, 'utf8'));
+  r.tasks.find((t) => t.key === 't1').title = 'edited by hand, behind the tool';
+  fs.writeFileSync(p, JSON.stringify(r, null, 2) + '\n');
+  const next = drv(d, ['iam', 'boss2']);
+  ok('the next command says so', has(next.out, 'changed since this tool last wrote it'), next.out.split('\n')[0]);
+  ok('and points at verify', has(next.out, 'verify'), next.out);
+  ok('and files it so it survives the scrollback',
+     (reg(d).defects || []).some((x) => x.kind === 'record'), JSON.stringify((reg(d).defects || []).map((x) => x.kind)));
+  ok('but does not refuse to work', next.code === 0);
+  // Was: SKILL.md says "the digest reports drift too" and it did not — replay
+  // was reached from one place, inside rebuild. hook-install fires digest at
+  // every SessionStart, which is exactly when nobody is able to ask.
+  ok('and the digest says it too', has(drv(d, ['digest']).out, 'disagree in'), drv(d, ['digest']).out.slice(0, 400));
+}
+
+// Was: `rebuild` is one of the two opposite fixes `verify` offers, and it
+// overwrites the register from the record — then said "nothing was thrown away",
+// which is true of backups/ and false of the file it just replaced.
+say('rebuild names the ground it is about to take');
+{
+  const d = box('rebuildloss');
+  const p = path.join(d, '.claude/orchestration/register.json');
+  const r = JSON.parse(fs.readFileSync(p, 'utf8'));
+  r.tasks.find((t) => t.key === 't1').notes = 'a hand-written note the record never learned';
+  fs.writeFileSync(p, JSON.stringify(r, null, 2) + '\n');
+  const out = drv(d, ['rebuild']);
+  ok('it names what only the register held', has(out.out, 'the record never learned') && has(out.out, 'notes'),
+     out.out.slice(0, 400));
+  ok('and points at the other fix', has(out.out, 'log reseed'), out.out);
+  ok('and does not claim nothing was thrown away', !has(out.out, 'nothing was thrown away'), out.out);
+}
+
+// Was: the backups are described as a second net, and on a gitignored register
+// they are the only one — but their depth is counted in writes, not time, so a
+// busy run silently thins the net. On a real run thirty states covered half an
+// hour of three days, which is why the drift it carried could not be dated.
+say('doctor says how far back the backup ring actually reaches');
+{
+  const d = box('backupspan');
+  const bdir = path.join(d, '.claude/orchestration/backups');
+  fs.mkdirSync(bdir, { recursive: true });
+  const old = Date.now() - 90 * 60000;
+  for (let i = 0; i < 30; i++) {
+    const f = path.join(bdir, 'register-fixture-' + String(i).padStart(2, '0') + '.json');
+    fs.writeFileSync(f, '{}\n');
+    fs.utimesSync(f, new Date(old + i * 1000), new Date(old + i * 1000));
+  }
+  const out = drv(d, ['doctor']).out;
+  ok('it says the ring is full and how far it reaches',
+     has(out, 'backup ring is full') && has(out, 'reaches back'), out.slice(0, 300));
+  ok('and that depth is counted in writes, not time', has(out, 'counted in writes'), out.slice(0, 300));
+}
+
 // Was: r.ci held eight real results that no reader could reach any more.
 say('legacy CI results become readable history and prove nothing');
 {
@@ -375,7 +436,7 @@ say('archiving shrinks the register without breaking the record');
   drv(d, ['brief', 't3']);
   ok('an open task’s brief is unchanged',
      fs.readFileSync(path.join(d, '.claude/orchestration/briefs/t3.md'), 'utf8') === before);
-  drv(d, ['rebuild', '--to', String(seq)]);
+  drv(d, ['rebuild', '--to', String(seq), '--why', 'winding back to the pre-archive state']);
   ok('the record replays the pre-archive register exactly',
      fs.readFileSync(path.join(d, '.claude/orchestration/register.json'), 'utf8') === snap);
 }
@@ -456,8 +517,17 @@ say('rewinding the record moves both halves together');
   drv(d, ['done', 't1'], { stdin: '{"verified":"ran true","outcome":"passed"}' });
   const seq = Number((/seq (\d+)/.exec(drv(d, ['verify']).out) || [0, 0])[1]);
   ok('there is a record to rewind into', seq > 3, 'seq ' + seq);
-  drv(d, ['rebuild', '--to', String(seq - 2)]);
+  // Was: a rewind cut the record and left no trace of itself in what remained,
+  // so the only sign one had happened was a `.before-rewind-` file beside it and
+  // no command will diff that for you. On a real run eight `bundle` calls and a
+  // chip id vanished with nothing accounting for them.
+  const noWhy = drv(d, ['rebuild', '--to', String(seq - 2)]);
+  ok('a rewind without a reason is refused', noWhy.code !== 0 && has(noWhy.out, '--why'), noWhy.out.split('\n')[0]);
+  const rew = drv(d, ['rebuild', '--to', String(seq - 2), '--why', 'checking a partial rebuild']);
   ok('verify is still green after a partial rebuild', has(drv(d, ['verify']).out, 'agree exactly'));
+  ok('and the rewind is itself on the record', has(rew.out, 'rewind is itself on the record'), rew.out);
+  const tail = readIf(path.join(d, '.claude/orchestration/events.jsonl')).trim().split('\n').slice(-1)[0];
+  ok('with the reason it was given', has(tail, 'checking a partial rebuild') && has(tail, 'rewind'), tail);
 }
 
 // Was: the event's cmd column held the raw argv, and an argv leading with
@@ -2347,7 +2417,7 @@ else console.log('\nsandboxes kept: ' + boxes.join('\n                '));
 // an exception thrown before its first `ok`, a case quietly commented out — and
 // the suite still ends on "all green", because green is only ever measured
 // against however many checks happened to run.
-const EXPECTED = 397;   // every check above counts; raise it deliberately when you add one
+const EXPECTED = 410;   // every check above counts; raise it deliberately when you add one
 
 console.log('\n' + '-'.repeat(60));
 if (pass + failures.length !== EXPECTED)

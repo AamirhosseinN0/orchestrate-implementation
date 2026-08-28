@@ -3235,6 +3235,14 @@ function slotTryTake(name, task, { manual = false } = {}) {
 // beside it, which is the crash this whole mechanism exists to prevent. So the
 // liveness question is asked FIRST, and the time limit applies only to a holder
 // whose liveness cannot be established — a different host, or no pid to check.
+// Can the holder be positively shown to be running? Not the negation of
+// staleness: "cannot tell" is false here, so the time limit still reaches a
+// claim from another host or one taken by hand, exactly as documented.
+function slotAlive(lock) {
+  const h = slotHolder(lock);
+  if (!h || !h.pid || h.host !== os.hostname()) return false;
+  try { process.kill(h.pid, 0); return true; } catch (e) { return e.code !== 'ESRCH'; }
+}
 function slotIsStale(lock, staleMs) {
   const h = slotHolder(lock);
   if (!h) { try { return Date.now() - fs.statSync(lock).mtimeMs > 10000; } catch { return false; } }
@@ -3308,6 +3316,22 @@ function bashCommandLine(raw) {
   return out.join(' ');
 }
 
+// Everything the slot does happens on the filesystem and cleans itself up, so a
+// contention incident left no trace anywhere: `events`, `digest` and `verify`
+// cannot see it, and the only surviving account of a real ninety-minute stall
+// was an agent happening to narrate it in a message. Deliberately NOT an event —
+// slot commands never touch the register, which is what keeps waiting on a slot
+// from blocking everybody else's bookkeeping. An ordinary append-only line
+// beside the locks costs nothing and answers "what happened on this machine".
+function slotLogAppend(name, what) {
+  try {
+    const d = path.join(path.dirname(path.resolve(CWD, REG_PATH)), 'slots');
+    fs.mkdirSync(d, { recursive: true });
+    fs.appendFileSync(path.join(d, 'slot.log'),
+      JSON.stringify({ at: now(), slot: name, what, pid: process.pid }) + '\n');
+  } catch { /* a log of the queue must never be able to stop the queue */ }
+}
+
 function cmdSlot(sub, rest, flags, raw) {
   const name = rest[0] || 'ci';
   const lock = slotLockPath(name);
@@ -3316,8 +3340,21 @@ function cmdSlot(sub, rest, flags, raw) {
   if (sub === 'status') {
     const d = path.dirname(lock);
     const all = fs.readdirSync(d).filter((f) => f.endsWith('.lock'));
-    if (!all.length) return console.log('no slot is held.');
+    if (!all.length) console.log('no slot is held.');
     for (const f of all) console.log(f.replace(/\.lock$/, '') + ': ' + describeHolder(path.join(d, f)));
+    // The queue used to be entirely present-tense: whatever was holding a slot
+    // right now, and nothing at all about what had happened. A ninety-minute
+    // stall left no trace anywhere once it cleared.
+    let log = [];
+    try { log = fs.readFileSync(path.join(d, 'slot.log'), 'utf8').split('\n').filter(Boolean); } catch { /* none yet */ }
+    if (log.length) {
+      const n = numFlag(flags, 'n', { min: 1, what: 'a whole number of lines' }) ?? 10;
+      console.log('\nwhat has happened here (' + log.length + ' line(s), last ' + Math.min(n, log.length) + '):');
+      for (const l of log.slice(-n)) {
+        let e; try { e = JSON.parse(l); } catch { continue; }
+        console.log('  ' + String(e.at).slice(0, 19).replace('T', ' ') + '  ' + e.slot + '  ' + e.what);
+      }
+    }
     return;
   }
   if (sub === 'free') {
@@ -3349,22 +3386,39 @@ function cmdSlot(sub, rest, flags, raw) {
     if (sub === 'run' && !raw.length) die('slot run ' + name + ' -- <command> — the command goes after the --');
     const timeoutMs = (Number(flags.timeout) > 0 ? Number(flags.timeout) : 90) * 60000;
     const t0 = Date.now();
-    let told = false;
+    let told = false, toldLong = false;
     let mine = null;
     for (;;) {
       mine = slotTryTake(name, flags.task);
       if (mine) break;
       const held = slotHolder(lock);
       if (slotIsStale(lock, staleMs)) {
-        if (slotSteal(lock, held && held.token))
+        if (slotSteal(lock, held && held.token)) {
+          slotLogAppend(name, 'stole a stale claim from ' + (held && held.task ? held.task : 'an unknown holder'));
           console.error('slot ' + name + ': holder is gone, or unreachable and over the ' +
                         Math.round(staleMs / 60000) + ' min limit — taking over.');
+        }
         continue;
       }
-      if (Date.now() - t0 > timeoutMs)
+      // SKILL.md and the README both promise that a holder whose process is
+      // still there is waited on however long it runs — a suite that legitimately
+      // outlasts any limit is still running, and starting a second one beside it
+      // is the crash this whole mechanism exists to prevent. The waiter applied
+      // its timeout regardless, so the guarantee held everywhere except where it
+      // mattered. The limit belongs to a holder whose liveness cannot be
+      // established, which is the same rule `slotIsStale` already follows.
+      if (Date.now() - t0 > timeoutMs && !slotAlive(lock))
         die('slot ' + name + ' still ' + describeHolder(lock) + ' after ' + Math.round(timeoutMs / 60000) +
             ' min.\n       Something is wedged — check `slot status` and talk to the orchestrator. Do NOT run without the slot.');
-      if (!told) { console.error('slot ' + name + ': ' + describeHolder(lock) + ' — waiting, checking every ~10s.'); told = true; }
+      if (Date.now() - t0 > timeoutMs && !toldLong) {
+        console.error('slot ' + name + ': past the ' + Math.round(timeoutMs / 60000) +
+                      ' min mark, but its holder is alive — still waiting, as promised.');
+        toldLong = true;
+      }
+      if (!told) {
+        slotLogAppend(name, 'waiting: ' + describeHolder(lock) + (flags.task ? ' (for ' + flags.task + ')' : ''));
+        console.error('slot ' + name + ': ' + describeHolder(lock) + ' — waiting, checking every ~10s.'); told = true;
+      }
       // ~10s with jitter, so a crowd of waiters does not stampede the same instant
       try { execSync('sleep ' + (8 + Math.floor(Math.random() * 5))); } catch { /* keep waiting */ }
     }
@@ -3376,8 +3430,10 @@ function cmdSlot(sub, rest, flags, raw) {
     for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(sig, () => { free(); process.exit(130); });
     const q = bashCommandLine(raw);
     console.error('slot ' + name + ': taken — running: ' + raw.join(' '));
+    slotLogAppend(name, 'took it' + (told ? ' after waiting' : '') + (flags.task ? ' for ' + flags.task : ''));
     const res = spawnSync('/bin/bash', ['-c', q], { stdio: 'inherit', cwd: process.cwd() });
     free();
+    slotLogAppend(name, 'freed after ' + Math.round((Date.now() - t0) / 1000) + 's, exit ' + res.status);
     console.error('slot ' + name + ': freed.');
     process.exit(res.status === null ? 1 : res.status);
   }

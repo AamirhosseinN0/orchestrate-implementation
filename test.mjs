@@ -1883,6 +1883,38 @@ say('slot run executes behind the slot and a stale holder is taken over');
     pid: null, host: os.hostname(), task: 'ghost', since: '2020-01-01T00:00:00.000Z' }));
   const steal = drv(d, ['slot', 'run', 'ci', '--', 'true']);
   ok('a stale holder is taken over', steal.code === 0);
+  // Was: every take, steal, wait and free happened on the filesystem and cleaned
+  // itself up, so a contention incident left no trace anywhere — `events`,
+  // `digest` and `verify` all blind to it. The only surviving account of a real
+  // ninety-minute stall was an agent happening to mention it in a message.
+  const status = drv(d, ['slot', 'status']);
+  ok('the slot says what has happened on it, not only what holds it now',
+     has(status.out, 'what has happened here') && has(status.out, 'freed after'), status.out.slice(0, 400));
+  ok('including the claim it took over', has(status.out, 'stole a stale claim'), status.out.slice(0, 400));
+  // Deliberately not events: slot commands never take the register lock, which
+  // is what stops waiting on a slot from blocking everyone else's bookkeeping.
+  ok('and none of it went through the register',
+     !has(drv(d, ['events', '--n', '40']).out, 'slot'), drv(d, ['events', '--n', '40']).out.slice(0, 200));
+  ok('the record still agrees', has(drv(d, ['verify']).out, 'agree exactly'));
+}
+
+// Was: SKILL.md and the README both promise a holder whose process is still
+// there is waited on however long it runs — a suite that legitimately outlasts
+// any limit is still running, and starting a second beside it is the crash the
+// slot exists to prevent. The waiter applied its timeout regardless, so the
+// guarantee held everywhere except the case it was written for.
+say('a slot holder that is alive is waited on past the limit, as promised');
+{
+  const d = box('slotpatient');
+  const lock = path.join(d, '.claude/orchestration/slots/ci.lock');
+  fs.mkdirSync(lock, { recursive: true });
+  fs.writeFileSync(path.join(lock, 'holder.json'), JSON.stringify({ token: 'live', manual: false,
+    pid: process.pid, host: os.hostname(), task: 'a suite that runs long', since: new Date().toISOString() }));
+  // 0.01 min: the limit is passed on the very first look, so what happens after
+  // it is the whole question. Killed from outside, because it will not give up.
+  const waited = drv(d, ['slot', 'wait', 'ci', '--timeout', '0.01'], { timeout: 20000 });
+  ok('it says it is still waiting', has(waited.out, 'still waiting, as promised'), waited.out.slice(0, 300));
+  ok('and does not declare it wedged', !has(waited.out, 'Something is wedged'), waited.out.slice(0, 300));
 }
 
 // --------------------------------------------------------- bundle carries a preflight
@@ -2417,7 +2449,7 @@ else console.log('\nsandboxes kept: ' + boxes.join('\n                '));
 // an exception thrown before its first `ok`, a case quietly commented out — and
 // the suite still ends on "all green", because green is only ever measured
 // against however many checks happened to run.
-const EXPECTED = 410;   // every check above counts; raise it deliberately when you add one
+const EXPECTED = 416;   // every check above counts; raise it deliberately when you add one
 
 console.log('\n' + '-'.repeat(60));
 if (pass + failures.length !== EXPECTED)

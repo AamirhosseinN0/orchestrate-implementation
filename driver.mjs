@@ -63,6 +63,7 @@ function readRegRO() {
 // the orchestrator writes releases. One directory-based lock serialises every
 // command; a holder dead longer than 15s is stolen.
 let HAS_LOCK = false;
+let LOCK_TOKEN = null;
 function lockDir() { return REG_PATH + '.lock'; }
 function acquireLock() {
   if (HAS_LOCK) return;
@@ -76,9 +77,33 @@ function acquireLock() {
       fs.mkdirSync(lockDir(), { recursive: false });
       // Say who holds it, so a stale lock can be told from a slow one by asking
       // the operating system rather than by guessing from a timestamp.
-      try { fs.writeFileSync(path.join(lockDir(), 'holder.json'),
-        JSON.stringify({ pid: process.pid, host: os.hostname(), since: now() })); } catch { /* best effort */ }
-      HAS_LOCK = true; process.on('exit', releaseLock); return;
+      //
+      // This used to be best-effort, and the failure it swallowed is the one
+      // that matters: a lock directory with no holder inside it is invisible to
+      // `lockIsDead`, which then falls back to a bare fifteen-second age test
+      // and declares a process that is very much alive to be dead. Written by
+      // rename so a reader never sees half of it, and if it cannot be written
+      // at all the claim is given back rather than held anonymously.
+      LOCK_TOKEN = crypto.randomBytes(9).toString('hex') + '-' + process.pid;
+      try {
+        const tmp = lockDir() + '.holder.tmp';
+        fs.writeFileSync(tmp, JSON.stringify({ token: LOCK_TOKEN, pid: process.pid,
+          started: procStartTime(process.pid), host: os.hostname(), since: now() }));
+        fs.renameSync(tmp, path.join(lockDir(), 'holder.json'));
+      } catch (e) {
+        try { fs.rmSync(lockDir(), { recursive: true, force: true }); } catch { /* gone */ }
+        die('took the register lock and could not say who holds it (' + (e && e.code) + ').\n' +
+            '       An unmarked lock reads as an abandoned one to the next process along, so it\n' +
+            '       has been given back rather than held anonymously.');
+      }
+      HAS_LOCK = true;
+      process.on('exit', releaseLock);
+      // The slot next door has had these since it was written. The register lock
+      // — which guards more — had only `exit`, so a holder killed from outside
+      // left its claim behind to be aged out rather than dropped at once.
+      for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP'])
+        process.on(sig, () => { releaseLock(); process.exit(130); });
+      return;
     } catch (e) {
       // Only EEXIST means somebody else holds it. A permission error, a full
       // disk or a missing parent are not contention and waiting will not help.
@@ -91,7 +116,30 @@ function acquireLock() {
   die('another driver process has held the register lock for a while: ' + rel(lockDir()) +
       '\n       If nothing is actually running, remove that directory.');
 }
-function releaseLock() { if (HAS_LOCK) { try { fs.rmSync(lockDir(), { recursive: true, force: true }); } catch { /* gone */ } HAS_LOCK = false; } }
+// Free only what we still hold. This deleted whatever was at the path, so a
+// process whose lock had been taken from it — rightly or wrongly — went on to
+// delete the lock of whoever had replaced it, and two writers proceeded into one
+// register. The slot has judged its claims by an unguessable token since it was
+// written; so does this now.
+function releaseLock() {
+  if (!HAS_LOCK) return;
+  HAS_LOCK = false;
+  let h = null;
+  try { h = JSON.parse(fs.readFileSync(path.join(lockDir(), 'holder.json'), 'utf8')); } catch { /* gone */ }
+  if (h && h.token && LOCK_TOKEN && h.token !== LOCK_TOKEN) return;   // not ours any more
+  try { fs.rmSync(lockDir(), { recursive: true, force: true }); } catch { /* gone */ }
+}
+
+// When a process began, so a recycled pid can be told from the process that
+// really holds the lock. Linux keeps it in field 22 of /proc/<pid>/stat, in
+// clock ticks since boot; where that cannot be read there is simply no extra
+// evidence and the pid check stands on its own, exactly as it did before.
+function procStartTime(pid) {
+  try {
+    const stat = fs.readFileSync('/proc/' + pid + '/stat', 'utf8');
+    return Number(stat.slice(stat.lastIndexOf(')') + 2).split(' ')[19]) || null;
+  } catch { return null; }
+}
 
 // A holder whose process is gone is dead however recently it started. A holder
 // that is alive is not stale however long it has run — a command that legitimately
@@ -103,7 +151,15 @@ function lockIsDead() {
     try { return Date.now() - fs.statSync(lockDir()).mtimeMs > 15000; } catch { return false; }
   }
   if (h.host && h.host !== os.hostname()) return Date.now() - Date.parse(h.since || 0) > 15 * 60000;
-  try { process.kill(h.pid, 0); return false; } catch (e) { return e.code === 'ESRCH'; }
+  try { process.kill(h.pid, 0); } catch (e) { return e.code === 'ESRCH'; }
+  // The pid is alive — but pids are reused, and this branch had no other
+  // evidence and no time limit at all, so an unrelated process inheriting a dead
+  // holder's number wedged the lock for good rather than for a while. If we know
+  // when the holder started and the process sitting on that pid started at a
+  // different moment, it is not the holder.
+  const started = procStartTime(h.pid);
+  if (h.started && started && h.started !== started) return true;
+  return false;
 }
 
 function writeReg(r) {

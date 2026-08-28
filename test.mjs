@@ -294,6 +294,22 @@ say('the lock still holds against a live holder');
   ok('a live holder is not robbed', drv(d, ['iam', 'x']).code !== 0);
   holdLock(d, 0x7ffffff);
   ok('a dead holder is taken over', drv(d, ['iam', 'x']).code === 0);
+  // Was: the same-host branch asked only whether the pid was alive, with no
+  // other evidence and no time limit at all — so an unrelated process that
+  // inherited a dead holder's number wedged the lock for good rather than for a
+  // while. A holder that records when it started can be told from its ghost.
+  const lock = holdLock(d, process.pid);
+  fs.writeFileSync(path.join(lock, 'holder.json'), JSON.stringify({
+    pid: process.pid, started: 1, host: os.hostname(), since: new Date().toISOString() }));
+  ok('a live pid that is not the process which took the lock is taken over',
+     drv(d, ['iam', 'y']).code === 0);
+  // Whatever it did with somebody else's claim, it must not leave its own
+  // behind — a lock nobody holds is the next process's six-second wait.
+  const lockPath = path.join(d, '.claude/orchestration/register.json.lock');
+  drv(d, ['iam', 'z']);
+  ok('a command that succeeds leaves no lock behind', !fs.existsSync(lockPath));
+  drv(d, ['show', 'nosuchgap']);
+  ok('and neither does one that fails', !fs.existsSync(lockPath));
 }
 
 // Was: r.ci held eight real results that no reader could reach any more.
@@ -2331,7 +2347,7 @@ else console.log('\nsandboxes kept: ' + boxes.join('\n                '));
 // an exception thrown before its first `ok`, a case quietly commented out — and
 // the suite still ends on "all green", because green is only ever measured
 // against however many checks happened to run.
-const EXPECTED = 394;   // every check above counts; raise it deliberately when you add one
+const EXPECTED = 397;   // every check above counts; raise it deliberately when you add one
 
 console.log('\n' + '-'.repeat(60));
 if (pass + failures.length !== EXPECTED)

@@ -96,14 +96,26 @@ log with a hole in it. A missing `events.jsonl` is not treated as an empty one
 either: `rebuild` will not empty a full register on the strength of a record
 that is not there.
 
-`events --task <key>` is worth trusting now. Every event records the subcommand
-that made it — `chip 0.12.C`, `preflight done 0.12.C`, `owed assign o23` — so
-the filter finds the ones that touched a task, and each line says which command
-did it. It did not before: most events carried no command at all, and this line
-promised something the record could not answer. `--grep`, `--since` and `--n`
-narrow it the same way.
+`events --task <key>` finds a task's own history. An event names a task by its
+position in the register — `tasks.3.status` — never by its key, so the filter
+resolves those positions by replaying the record, and also catches the four
+places a key travels as a value: a defect filed against it, an owed item pointed
+at it, another task's `needs`, and what a bundle absorbed it into. It used to
+match on the key appearing anywhere in the event's text, which on a real record
+found about one event in seven and was wrong about half of what it did find.
+
+Where a record predates commands recording which one they were, some old events
+can still only be matched by the words in their command line, and a task not
+named there cannot be found. The footer says so when that applies — a partial
+answer printing a bare count reads exactly like a complete one. `--grep`,
+`--since` and `--n` narrow it the same way.
 
 The backups are a second net — thirty states, a no-op write burning no slot.
+**Thirty writes, not thirty of anything you can feel.** A busy run thins the net
+without saying so: on a real three-day run those thirty states covered the last
+half hour of it, which is why a drift that run carried could no longer be dated.
+`doctor` reports how far back the ring actually reaches once it is full.
+
 They are the *only* net if the register is not in the project's history, and
 nothing here puts it there or keeps it out. Decide which, once, at the start:
 
@@ -115,9 +127,17 @@ Ignoring it is the usual choice — it is one run's working state, not the
 project. Say so to the user rather than assuming it, because if it is ignored
 and the backups are swept, the run is gone.
 
-Every driver command locks the register first, and the lock asks the operating
-system whether its holder is alive, so a slow command is never mistaken for a
-dead one. `rebuild`, `verify` and `log reseed` take that lock too.
+Every driver command that writes locks the register first, and where the lock's
+holder is on record the lock asks the operating system whether that process is
+alive, so a slow command is never mistaken for a dead one — and where the pid is
+alive it also checks the process started when the holder did, so a recycled pid
+does not wedge the lock for good. A claim it cannot identify at all falls back to
+a fifteen-second age test, which is the only case a live holder can still be
+taken from. `rebuild`, `verify` and `log reseed` take that lock too.
+
+`ingest` is the exception, deliberately: it only reads, and walking every
+transcript on disk can take far longer than the lock's staleness window, so
+holding the write lock there is how two processes end up believing they hold it.
 
 A long run makes the register large — most of it finished detail on tasks nobody
 will read again. `archive` moves that out, and the record still holds it, so
@@ -569,6 +589,11 @@ The fields it reads are `title`, `plan`, `needs`, `owns`, `serialises`,
 `context`, `verify`, `decisions`, `notes` and `branch`. Anything else is named
 back to you as ignored rather than saved.
 
+`notes` is rendered into the brief, under a heading telling the agent it is
+there because somebody found it the hard way, and so is whatever a pre-flight
+wrote in its own `notes`. Both count towards whether a brief is stale, so
+editing one and not re-briefing is caught rather than passing unnoticed.
+
 **A new task may not claim a path a live task already owns.** `task add` refuses
 the whole batch and saves nothing, naming which task holds it. That is the one
 failure this arrangement exists to prevent, and this is the cheapest moment to
@@ -726,12 +751,18 @@ error: chip 2.1 --id <task_id> — the chip id is how the record points at the r
        the copy it works in is not the branch's own worktree.
 ```
 
-That refusal is not paperwork. Every interference check below runs **only on a
-task's first chip** — the run where `--id` is being set. Call `chip` without it
-and the command stops before the checks; call it a second time on a task that
-already has an id and the checks are skipped, because the chip already exists.
-So the one call that decides whether this work may open is the one that carries
-`--id`, and there is exactly one of them per task.
+That refusal is not paperwork, and it is not the whole of the gate either.
+**Every interference check below runs on every `chip` call, first or later.** It
+has to: what a task owns can widen after its first chip — by `preflight done`,
+or by a later `task add` — and the second call is exactly when the answer may
+have changed. A `chip` without `--id` stops before the checks only because there
+would be nothing to point the record at.
+
+`chip` also refuses a brief the record has moved past. It is the handover: after
+it the agent is reading that file and building from it, so a brief written before
+the task changed is the one thing that must not be handed over. Run `brief <key>`
+and try again — and if an agent already has the old one, tell it to read the file
+again, because the path does not change.
 
 `--worktree` is where its copy of the repository actually sits — pass it when
 that is not the branch's own worktree, or `guard` will not find it later.
@@ -781,9 +812,29 @@ node $DRV doctor
 ```
 
 Every cited path must exist, every verify command's binary must resolve, no
-brief may be stale. It exits 1 otherwise. And never put a number in a brief that
-the run itself can change — a test count, a baseline. Write where to look it up
-instead.
+brief may be stale. It exits 1 otherwise. Paths are judged against the project
+the register belongs to, not the directory you happen to be standing in. And
+never put a number in a brief that the run itself can change — a test count, a
+baseline. Write where to look it up instead.
+
+It also names things nothing else looks at: two open chips holding one
+serialisation point, a pre-flight report written but never folded in, a plan
+marked refined with no report behind it, and how far back the backup ring
+reaches. Some of that is damage rather than a decision, and `--repair` mends
+what can be mended without inventing anything:
+
+```bash
+node $DRV doctor --repair            # says what it would do, writes nothing
+node $DRV doctor --repair --write    # does it, and records each one
+```
+
+It folds an unfolded pre-flight report, and repoints an ownership claim left on
+a plan path that a rename moved — saying which of the two it is inferring. It
+reports drift between the record and the register and stops there, because
+choosing `rebuild` over `log reseed` is choosing which copy to destroy. And it
+drops the whole batch rather than leave two open tasks claiming one path:
+widening what a task owns can create the one collision this all exists to
+prevent.
 
 **Every brief opens by telling the agent to check in** — one message, sent
 before it reads anything. That message is the only way you learn where to reach
@@ -904,7 +955,15 @@ waiting however long the run takes — a suite that legitimately runs past any
 limit is still running, and starting a second one beside it is the crash this
 whole thing exists to stop. The 30-minute limit applies only where liveness
 cannot be established: a claim from another machine, or one taken by hand, which
-records no process to ask about.
+records no process to ask about. (The waiter used to apply its timeout regardless,
+so this held everywhere except the case it was written for.)
+
+`slot status` also reads a log kept beside the locks — every take, steal, wait
+and free. The queue is otherwise entirely present-tense, and a contention
+incident that has cleared leaves nothing behind to explain a stall afterwards.
+It is deliberately not part of the record: slot commands never touch the
+register, which is what stops waiting on a slot from blocking everybody else's
+bookkeeping.
 
 Every brief wires this in: a wrapper script is generated into
 `.claude/orchestration/bin/with-ci-slot`, and **the heavy half** of that brief's
@@ -1024,7 +1083,7 @@ once.
 
 ```bash
 node $DRV wave                                   # the dependency layer in flight
-node $DRV ci --status green --ref gh-run-4471
+node $DRV ci --status green --ref gh-run-4471 --sha $(git rev-parse --short main)
 node $DRV ci --status red --why "two migration heads on the joined tree"
 node $DRV ci --status skipped --why "the runner is down until Monday"
 node $DRV ci list                                # every checkpoint, oldest first
@@ -1047,6 +1106,14 @@ read four times over it looks like four rounds where there was one. `ci` prints 
 proven`** first, which is the part that was not already green, and `task add` warns when a
 task with no `needs` joins a round that already has landed work. Give such a task `needs`
 naming the last landed task if it should be a round of its own.
+
+**Give `ci` the `--sha` the run actually tested.** `covers` is otherwise every task
+the round holds that has landed by the time you record it — so a task that lands while
+CI is running is written down as proven by a run that never contained its code, and
+under ordinary use (land, kick CI, land again, record) that is not a risk, it is what
+happens. With `--sha`, a task whose own landing is not an ancestor of that commit is
+left out and named as still unproven. It is the same `--sha` you gave `landed`, which
+is where each task's own commit comes from.
 
 A checkpoint also must not close over work that only a window makes possible.
 When an agent offers something outside its scope, record it the moment it is
@@ -1231,9 +1298,9 @@ answer coming, and the agent is still waiting.
   holder; talk to that agent, and only once you know its run is gone,
   `slot free ci --force`.
 - **`chip` says "--id <task_id>"**: it is the first chip for that task and the
-  id is required. Every interference check runs on that call, so passing it is
-  what arms them — `chip <key>` alone is not a smaller version of the same
-  command, it is nothing happening.
+  id is required. The interference checks run on every `chip` call, not only that
+  one — `chip <key>` alone is not a smaller version of the same command, it is
+  nothing happening, because there is no id to point the record at.
 - **`task add` says "claims <path>, which is already owned"**: nothing was
   saved, including the other items in the batch. Two live tasks may not own one
   path. Narrow one, or make one wait and split the file — do not widen the other.
@@ -1248,6 +1315,18 @@ answer coming, and the agent is still waiting.
 - **`guard` says "changed nothing at all against main"**: the agent reported
   finished but its branch is empty. Either it committed to the wrong branch or it
   never committed. Ask which — do not go looking in its worktree yourself.
+- **`landed` says "open blocking defect(s) against it"**: something on record says
+  this work is known to be wrong — settle each with `defect fixed <id>`, or land it
+  anyway with `--force` if landing over a known break is the decision you mean to
+  make. It also says when no `guard` was ever recorded; run one while the copy it
+  would judge still exists.
+- **`chip` says "its brief no longer matches the record"**: the task changed after
+  the brief was written, so what the agent would read is not what the task now says.
+  `brief <key>`, then chip. If an agent already has the old one, tell it to read the
+  file again — the path does not change.
+- **`rebuild --to` says it needs `--why`**: a rewind removes events, and the record
+  has to be able to say why it is shorter than it was. The reason is appended to the
+  record it just cut.
 - **`guard` says "cannot find a copy of the repository on branch X"**: the
   worktree was never recorded. `chip <key> --worktree <path>` fixes it.
 - **`refine done` says "no report at … and nothing on stdin"**: the agent has not

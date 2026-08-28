@@ -102,7 +102,16 @@ smaller than the post-image alternative this note's §1 implies.
 Snapshots were **not** built. Replay of a few thousand events is 30–60 ms, well
 under the node startup this tool already pays; and a `_seq` field in the register
 would defeat the no-op guard in `writeReg`, burning a backup slot on every write.
-The 30-deep backup ring is kept as a second net against a bug in replay itself.
+The 30-deep backup ring is kept as a second net against a bug in replay itself —
+though its depth is counted in writes rather than time, so on a busy run it can
+cover a much shorter stretch than thirty states sounds like, and `doctor` says
+how far back it reaches.
+
+That argument against a `_seq` field is also why the tamper marker went beside the
+register instead of inside it. `register.json.stamp` records what this tool last
+wrote, so a command that finds something else can say so; a field within would
+never be set by `replay`, and `verify` would have reported it as drift for ever
+unless both `verify` and `rebuild` grew an exception for it.
 
 Also fixed on the way, both found by adversarial review of the above:
 `brief --all` stamped every task on every run, so twenty tasks burned twenty of

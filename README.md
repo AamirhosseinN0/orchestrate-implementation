@@ -363,6 +363,7 @@ node driver.mjs            # every command
   events.jsonl           the record: every change, append-only, never rewritten
   register.json          every decision, gap and task — a projection of the above
   backups/               the last 30 states of it, kept on every write
+  register.json.stamp    what this tool last wrote, so an edit from outside is visible
   archive/tasks-NN.json  finished detail moved off closed tasks
   refine/<plan>.json     what each refining agent found
   preflight/<key>.json   what each pre-flight agent found
@@ -382,7 +383,9 @@ without the register and its own history drifting apart.
 The register is one run's working state rather than part of the project, so it
 is usually kept out of the project's history. Nothing here does that for you:
 decide it once, and remember that if it is ignored, the 30-deep backup ring is
-the only history the run has.
+the only history the run has — and that its depth is counted in writes, not in
+time, so a busy run thins it without saying so. `doctor` reports how far back it
+actually reaches.
 
 Work that is only possible in a window between two pieces gets a first-class
 record (`owed`) — a round refuses to close silently on top of one, and when the

@@ -482,6 +482,28 @@ say('one path has one owner, and task add is where that is cheap to fix');
   ]) });
   ok('two tasks in one batch may not claim one path', same.code !== 0 && has(same.out, 'already owned'));
   ok('and nothing was saved from the batch', !tasksOf(d).some((t) => t.key === 'x1'));
+  // Was: ownership was compared by string with three cosmetic strips, so one
+  // file written two ways collided with nothing — including with itself.
+  for (const spelling of ['src/./shared2.py', 'src//shared2.py', 'src/sub/../shared2.py']) {
+    const dodge = drv(d, ['task', 'add'], { stdin: JSON.stringify([
+      { key: 'y1', title: 'a', plan: 'docs/plans/p.md', owns: ['src/shared2.py'], needs: [] },
+      { key: 'y2', title: 'b', plan: 'docs/plans/p.md', owns: [spelling], needs: [] },
+    ]) });
+    ok('one file spelled ' + spelling + ' is the same file',
+       dodge.code !== 0 && has(dodge.out, 'already owned'), dodge.out.split('\n')[1]);
+  }
+  // An absolute path passes every shape test — the file really is there — and
+  // then matches nothing, because ownership is compared as repository-relative
+  // text. It is the spelling that quietly opts a task out of the whole rule.
+  const abs = drv(d, ['task', 'add'], { stdin: JSON.stringify([
+    { key: 'y3', title: 'c', plan: 'docs/plans/p.md', owns: [path.join(d, 'src/a.py')], needs: [] },
+  ]) });
+  ok('an absolute path is refused where ownership is claimed',
+     abs.code !== 0 && has(abs.out, 'absolute path'), abs.out.split('\n')[1]);
+  ok('and so is one that climbs out of the repository',
+     drv(d, ['task', 'add'], { stdin: JSON.stringify([
+       { key: 'y4', title: 'd', plan: 'docs/plans/p.md', owns: ['../elsewhere/x.py'], needs: [] },
+     ]) }).code !== 0);
   const under = drv(d, ['task', 'add'], { stdin: JSON.stringify([
     { key: 'x3', title: 'z', plan: 'docs/plans/p.md', owns: ['src'], needs: [] },
   ]) });
@@ -1532,6 +1554,23 @@ say('two chips may not take one serialisation point, and doctor says when they h
      has(out.out, 't1') && has(out.out, 't2') && has(out.out, 'Alembic-Head'), out.out.slice(0, 400));
 }
 
+// Was: every path the register holds was resolved against whatever directory the
+// command was run from, not against the project the register describes. Point
+// --register at a project and stand somewhere else and doctor invents a "does
+// not exist" failure for every plan and context path in a perfectly sound tree.
+say('doctor judges paths against the project, not the shell');
+{
+  const d = box('doctorcwd');
+  drv(d, ['task', 'add'], { stdin: JSON.stringify([
+    { key: 't1', context: [{ path: 'docs/plans/p.md', what: 'the plan' }] },
+  ]) });
+  const abs = path.join(d, '.claude/orchestration/register.json');
+  const here = drv(d, ['doctor', '--register', abs]).out;
+  const away = drv(os.tmpdir(), ['doctor', '--register', abs]).out;
+  ok('from the project root it finds every cited path', !has(here, 'does not exist'), here.slice(0, 300));
+  ok('and from anywhere else it says the same thing', !has(away, 'does not exist'), away.slice(0, 300));
+}
+
 // Was: a pre-flight report is an ordinary file, and nothing but a person running
 // `preflight done` folds it in. That step is required nowhere, so a report could
 // be written and simply never acted on — 25 of 53 were, on a real run.
@@ -2016,6 +2055,14 @@ say('verify is green on a recorded run nobody made up');
   ok('and the gaps came with it', gapsOf(d).every((g) => g.plan !== 'docs/plans/p.md'));
   ok('and the tasks came with it', tasksOf(d).every((t) => t.plan !== 'docs/plans/p.md'));
   ok('so scan runs again', drv(d, ['scan']).code === 0);
+  // Was: `plan mv` repointed `plan` on gaps and tasks and left `owns` behind —
+  // and `owns` is the one the collision check actually reads. A renamed plan
+  // left its task claiming a path that is gone and NOT claiming the file it now
+  // edits, so two chips could both take the new path with nothing objecting.
+  drv(d, ['task', 'add'], { stdin: JSON.stringify([
+    { key: 'mv1', title: 'owns its plan', plan: 'docs/plans/p-DONE.md',
+      owns: ['docs/plans/p-DONE.md'], needs: [] },
+  ]) });
 
   // With an edit alongside the rename the content differs, so nothing can tell
   // a move from a new plan. That is what `plan mv` is for.
@@ -2028,6 +2075,13 @@ say('verify is green on a recorded run nobody made up');
   const r3 = drv(d, ['plan', 'mv', 'docs/plans/p-DONE.md', 'docs/plans/p-FINAL.md']);
   ok('plan mv repoints it', r3.code === 0, r3.out);
   ok('and says what it carried across', has(r3.out, 'repointed'), r3.out);
+  {
+    const t = tasksOf(d).find((x) => x.key === 'mv1');
+    ok('the ownership claim moves with the plan too',
+       (t?.owns || []).includes('docs/plans/p-FINAL.md') && !(t?.owns || []).includes('docs/plans/p-DONE.md'),
+       JSON.stringify(t?.owns));
+    ok('and it says how many it moved', has(r3.out, 'ownership claim'), r3.out);
+  }
   ok('and scan runs', drv(d, ['scan']).code === 0);
   ok('plan list shows the gaps and tasks each plan carries', has(drv(d, ['plan', 'list']).out, 'gap(s)'));
   const r4 = drv(d, ['plan', 'rm', 'docs/plans/p-FINAL.md']);
@@ -2152,7 +2206,7 @@ else console.log('\nsandboxes kept: ' + boxes.join('\n                '));
 // an exception thrown before its first `ok`, a case quietly commented out — and
 // the suite still ends on "all green", because green is only ever measured
 // against however many checks happened to run.
-const EXPECTED = 365;   // every check above counts; raise it deliberately when you add one
+const EXPECTED = 374;   // every check above counts; raise it deliberately when you add one
 
 console.log('\n' + '-'.repeat(60));
 if (pass + failures.length !== EXPECTED)

@@ -166,6 +166,28 @@ function getGap(r, id) {
 // cannot resolve differently on replay. There is nothing to re-derive.
 function eventsPath() { return path.join(path.dirname(path.resolve(CWD, REG_PATH)), 'events.jsonl'); }
 
+// Every path in the register — a plan, a context entry, a file a task owns — is
+// relative to the project the register describes, and was being resolved against
+// whatever directory the command happened to be run from. Point `--register` at
+// a project and stand somewhere else and `doctor` invents dozens of "path does
+// not exist" failures against a tree that is perfectly sound.
+//
+// The register lives at <root>/.claude/orchestration/register.json, so when it
+// is in that shape the root is knowable and used. A register somewhere else —
+// a copy taken aside to inspect — has no project to point at, and falls back to
+// where the command was run, which is what every path did before.
+let PROJECT_ROOT = null;
+function projectRoot() {
+  if (PROJECT_ROOT) return PROJECT_ROOT;
+  const dir = path.dirname(path.resolve(CWD, REG_PATH));
+  const up = path.resolve(dir, '..', '..');
+  PROJECT_ROOT = (path.basename(dir) === 'orchestration' && path.basename(path.dirname(dir)) === '.claude')
+    ? up : CWD;
+  return PROJECT_ROOT;
+}
+// A path the record holds, made absolute against the project rather than the shell.
+const inProject = (p) => path.resolve(projectRoot(), p);
+
 function diffOps(a, b, at = [], out = []) {
   if (a === b) return out;
   const prim = (v) => v === null || typeof v !== 'object';
@@ -664,7 +686,7 @@ function cmdLoad(args) {
     // left nine stale entries beside nine live ones, with nothing able to tell
     // them apart afterwards and `scan` refusing on the stale half.
     const moved = reg.plans.findIndex((x) => x.sha === entry.sha &&
-      !fs.existsSync(path.resolve(CWD, x.path)));
+      !fs.existsSync(inProject(x.path)));
     if (moved >= 0) {
       const was = reg.plans[moved].path;
       for (const g of reg.gaps) if (g.plan === was) g.plan = entry.path;
@@ -692,7 +714,7 @@ function cmdScan() {
   if (!reg.plans.length) die('no plans loaded');
   let added = 0;
   for (const p of reg.plans) {
-    for (const h of scanFile(path.resolve(CWD, p.path))) {
+    for (const h of scanFile(inProject(p.path))) {
       if (reg.gaps.some((g) => g.plan === p.path && g.line === h.line && g.marker === h.kind)) continue;
       reg.gaps.push({
         id: nextId(reg), plan: p.path, line: h.line, marker: h.kind, why: h.why,
@@ -731,7 +753,7 @@ function cmdSilence() {
   console.log('Categories a plan never mentions at all. Each is a gap by silence —');
   console.log('confirm by reading, then add it with `add`.\n');
   for (const p of reg.plans) {
-    const missing = silenceFile(path.resolve(CWD, p.path));
+    const missing = silenceFile(inProject(p.path));
     console.log(p.path);
     if (!missing.length) console.log('  — mentions all eight');
     for (const c of missing) console.log('  ✗ never says ' + c.ask + '  [' + c.id + ']');
@@ -1125,9 +1147,22 @@ function cmdPlan(sub, rest, flags) {
     const ref = planRefs(r, was);
     for (const g of ref.gaps) g.plan = newPath;
     for (const t of ref.tasks) t.plan = newPath;
+    // `owns` is a back-reference too, and the one the collision check actually
+    // reads. Leaving it behind meant a renamed plan left its task claiming a
+    // path that no longer exists and NOT claiming the file it now edits — so two
+    // chips could both take the new path with nothing objecting. Scan every
+    // task, not just the ones whose `plan` matched: the two fields move
+    // independently, and on a real record six tasks had them disagreeing.
+    let owned = 0;
+    for (const t of tasks(r)) {
+      const owns = t.owns || [];
+      for (let i = 0; i < owns.length; i++)
+        if (norm(owns[i]) === norm(was) && !owns.some((o) => norm(o) === norm(newPath))) { owns[i] = newPath; owned++; }
+    }
     commit(r);
     console.log(was + '  →  ' + newPath);
     console.log('  ' + ref.gaps.length + ' gap(s) and ' + ref.tasks.length + ' task(s) repointed' +
+      (owned ? ', ' + owned + ' ownership claim(s) moved with it' : '') +
       (clash ? '; the duplicate entry a previous `load` appended was folded in' : '') + '.');
   } else if (sub === 'rm') {
     const [which] = rest;
@@ -1146,7 +1181,7 @@ function cmdPlan(sub, rest, flags) {
   } else if (sub === 'list' || sub === undefined) {
     if (!r.plans.length) return console.log('no plans loaded.');
     for (const p of r.plans) {
-      const there = fs.existsSync(path.resolve(CWD, p.path));
+      const there = fs.existsSync(inProject(p.path));
       const ref = planRefs(r, p.path);
       console.log((there ? '  ' : '✗ ') + p.path.padEnd(50) +
         String(ref.gaps.length).padStart(3) + ' gap(s) ' + String(ref.tasks.length).padStart(3) + ' task(s)' +
@@ -1410,10 +1445,24 @@ function getTask(r, k) {
 }
 
 // Two tasks may not touch one file. Ownership is declared, and checked.
+// Every ownership question comes down to "are these two strings the same file",
+// and this was answering it by string equality with three cosmetic strips. So
+// `apps/api/x.py` did not collide with `apps/api//x.py`, with `apps/api/./x.py`,
+// with `apps/api/sub/../x.py`, or — the one that reached a real record — with an
+// absolute spelling of itself. Each of those defeats the gate the whole parallel
+// arrangement rests on: same file means one waits.
+//
+// Deliberately NOT trimmed, and deliberately not case-folded. Two of the callers
+// compare against git's own output, where a name may legitimately carry a space
+// and where git is case-sensitive whatever the filesystem underneath; a compare
+// function that quietly equated those would make `guard` accept a file that is
+// not the one it was shown. Whitespace is trimmed where paths are authored.
 function norm(p) {
   let x = String(p).replace(/\/+$/, '').replace(/\/\*+$/, '');
   while (x.startsWith('./')) x = x.slice(2);
-  return x;
+  // after the strips, not before: normalize leaves a trailing slash alone
+  x = path.posix.normalize(x);
+  return x === '.' ? '' : x.replace(/\/+$/, '');
 }
 // one-directional: does the owned entry `own` cover the path `p`?
 function coveredBy(own, p) { const o = norm(own), x = norm(p); return x === o || x.startsWith(o + '/'); }
@@ -1429,7 +1478,7 @@ function coveredBy(own, p) { const o = norm(own), x = norm(p); return x === o ||
 function pathProblem(s) {
   const v = String(s).trim();
   if (!v) return 'is empty';
-  try { if (fs.existsSync(path.resolve(CWD, v))) return null; } catch { /* unreadable is not proof */ }
+  try { if (fs.existsSync(inProject(v))) return null; } catch { /* unreadable is not proof */ }
   if (/\s[—–]\s|\s--\s/.test(v)) return 'contains an em-dash clause — that is prose, not a path';
   if (/["'`$=]/.test(v)) return 'contains quote or shell characters';
   if (/:\d+/.test(v)) return 'carries a :line suffix — ownership is whole files';
@@ -1501,6 +1550,22 @@ function taskProblems(it, isNew) {
     probs.push('owns cannot be empty — ownership is the load-bearing rule, and an empty list disarms it');
   if (isNew && it.owns === undefined)
     probs.push('declares no files it owns — two tasks may not touch one file, so ownership is not optional');
+  // `pathProblem` guards the pre-flight intake and backstops in `doctor`, but
+  // never ran here — the primary way a path reaches `owns`. Shape is checked
+  // there; what has to be checked HERE is that the spelling can be compared:
+  // ownership is matched between tasks as repository-relative text, so an
+  // absolute path silently collides with nothing, including its own relative
+  // twin. It passes `pathProblem` too, because the file it names really exists.
+  for (const k of ['owns', 'context'])
+    for (const e of (Array.isArray(it[k]) ? it[k] : [])) {
+      const v = typeof e === 'string' ? e : (e && e.path);
+      if (typeof v !== 'string' || !v.trim()) continue;
+      if (path.isAbsolute(v.trim()))
+        probs.push(k + ' entry "' + v.trim().slice(0, 60) + '" is an absolute path — ownership is compared ' +
+          'between tasks as repository-relative text, so this matches nothing, not even the same file written the usual way');
+      else if (norm(v.trim()).split('/').includes('..'))
+        probs.push(k + ' entry "' + v.trim().slice(0, 60) + '" climbs out of the repository');
+    }
   if (isNew && (typeof it.title !== 'string' || !it.title.trim())) probs.push('needs a title');
   if (!isNew && it.title !== undefined && (typeof it.title !== 'string' || !it.title.trim()))
     probs.push('title cannot be blanked');
@@ -1525,6 +1590,13 @@ function cmdTaskAdd() {
     const probs = taskProblems(it, at < 0);
     const label = 'item ' + (i + 1) + (it && it.key ? ' ("' + it.key + '")' : '');
     if (probs.length) { for (const x of probs) errs.push(label + ' ' + x); continue; }
+    // Trim here, where a path is authored, rather than in the compare function —
+    // a file may legitimately carry a leading or trailing space, and `guard` and
+    // `board` compare against git's own output, where quietly equating "x.py "
+    // with "x.py" would accept a file that is not the one they were shown.
+    if (Array.isArray(it.owns)) it.owns = it.owns.map((o) => o.trim());
+    if (Array.isArray(it.context)) it.context = it.context.map((c) => ({ ...c, path: String(c.path).trim() }));
+    if (Array.isArray(it.serialises)) it.serialises = it.serialises.map((s) => s.trim());
     plans.push({ it, at, label });
   }
   // "two tasks may not touch one file" was asserted in the message above and
@@ -1856,7 +1928,7 @@ function cmdBundle(sub, rest, flags) {
       const keys = bundleOrder(g.members).map((t) => t.key);
       const owns = new Set(g.members.flatMap((t) => t.owns || []));
       let planBytes = 0;
-      try { planBytes = fs.statSync(path.resolve(CWD, g.plan)).size; } catch { /* gone */ }
+      try { planBytes = fs.statSync(inProject(g.plan)).size; } catch { /* gone */ }
       saved += planBytes * (g.members.length - 1);
       console.log('  ' + g.plan.replace(/^docs\/plans\//, ''));
       console.log('    ' + keys.join(' ') + '   → one chip, ' + owns.size + ' file(s)');
@@ -2169,7 +2241,7 @@ function cmdBrief(key, flags) {
   if (t.plan) {
     B.push('**The plan.** Read it in full before writing anything:');
     B.push('');
-    B.push('    ' + path.resolve(CWD, t.plan));
+    B.push('    ' + inProject(t.plan));
     B.push('');
     B.push('That is the **main checkout**, not your copy. It has to be, because the plan was rewritten');
     B.push('against the real code after you were queued — the copy in your own tree may be the older');
@@ -2397,7 +2469,7 @@ function cmdPreflightBrief(key) {
   B.push('anywhere, and the one file you write is your report.');
   B.push('');
   B.push('**The task:** ' + t.key + ' — ' + t.title);
-  if (t.plan) B.push('**Its plan, read it in full:** ' + path.resolve(CWD, t.plan));
+  if (t.plan) B.push('**Its plan, read it in full:** ' + inProject(t.plan));
   B.push('**What the record says it may change:** ' + (t.owns || []).join(', '));
   B.push('**What the record says it builds on:** ' + ((t.context || []).map((c) => c.path).join(', ') || '(nothing)'));
   B.push('**How it says it will be proved:** ' + ((t.verify || []).join('  ·  ') || '(nothing)'));
@@ -2609,10 +2681,10 @@ function cmdDoctor() {
     if (['landed', 'cancelled'].includes(t.status)) continue;
     checked++;
     const probs = [];
-    if (t.plan && !fs.existsSync(path.resolve(CWD, t.plan))) probs.push('its plan does not exist: ' + t.plan);
+    if (t.plan && !fs.existsSync(inProject(t.plan))) probs.push('its plan does not exist: ' + t.plan);
     for (const c of t.context || []) {
       if (!c || typeof c !== 'object' || typeof c.path !== 'string') { probs.push('a context entry is not {path, what} — fix the record'); continue; }
-      if (!fs.existsSync(path.resolve(CWD, c.path))) probs.push('told to build on a path that does not exist: ' + c.path);
+      if (!fs.existsSync(inProject(c.path))) probs.push('told to build on a path that does not exist: ' + c.path);
     }
     const vlist = Array.isArray(t.verify) ? t.verify : (t.verify ? [String(t.verify)] : []);
     for (const v of vlist) {

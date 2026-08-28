@@ -2923,7 +2923,7 @@ function cmdArchive(flags) {
   console.log('exactly as it was. `verify` still passes, because a removal is recorded like any other change.');
 }
 
-function cmdDoctor() {
+function cmdDoctor(flags = {}) {
   const r = readReg();
   const binCache = {};
   const binOk = (b) => {
@@ -3091,8 +3091,86 @@ function cmdDoctor() {
   console.log('not started), and any number quoted in a note. Run each verify once by hand before a');
   console.log('brief asserts it, and never put a number in a brief that the run itself can change —');
   console.log('write where to read it instead.');
+  if (flags.repair) { repair(r, flags); return; }
   if (bad) { console.error('\n' + bad + ' problem(s). Fix the record (`brief --all` after), reassign or settle any shut\n' +
     'owed item, then run doctor again.'); process.exit(1); }
+}
+
+// Some of what `doctor` reports is damage a bug left behind, and saying so over
+// and over does not clear it. This mends the two kinds that can be mended
+// without guessing, and says plainly what it is inferring where it infers
+// anything. Dry by default: it prints what it would do and writes nothing until
+// asked, because a repair is a write to somebody's record on the strength of a
+// reading of it.
+function repair(r, flags) {
+  const write = !!flags.write;
+  const did = [];
+
+  // Exact. A report on disk, a task by that key, and nothing folded in.
+  for (const t of tasks(r)) {
+    const src = preflightReportPath(t.key);
+    if (!fs.existsSync(src) || (t.preflight && t.preflight.at)) continue;
+    let rep = null;
+    try { rep = JSON.parse(fs.readFileSync(src, 'utf8')); } catch { /* not usable */ }
+    if (!rep || typeof rep !== 'object' || Array.isArray(rep)) {
+      console.log('· ' + t.key + ': its pre-flight report is not readable — send it back, do not fold it.');
+      continue;
+    }
+    did.push({ what: 'fold the pre-flight report into ' + t.key, apply: () => {
+      t.preflight = { at: now(), missing: rep.missing || [], verify: rep.verify || [], notes: rep.notes || '' };
+      for (const x of rep.serialises || []) { (t.serialises ||= []); if (!t.serialises.includes(x)) t.serialises.push(x); }
+    } });
+  }
+
+  // Inferred, and said so. `plan mv` used to repoint a task's `plan` and leave
+  // its `owns` claim on the old path — so the tell is an owned path that is not
+  // on disk while a plan on record differs from it only in the part that names
+  // the plan's status. Only where exactly one plan matches; otherwise it is a
+  // guess and gets reported instead.
+  const stem = (x) => x.replace(/--[^/]*$/, '');
+  for (const t of tasks(r)) {
+    for (let i = 0; i < (t.owns || []).length; i++) {
+      const o = t.owns[i];
+      if (fs.existsSync(inProject(o))) continue;
+      const cands = (r.plans || []).filter((pl) =>
+        stem(pl.path) === stem(o) && pl.path !== o && fs.existsSync(inProject(pl.path)));
+      if (cands.length !== 1) {
+        console.log('· ' + t.key + ' owns ' + o + ', which is not on disk, and nothing on record clearly replaces it.');
+        continue;
+      }
+      const to = cands[0].path;
+      did.push({ what: t.key + ': repoint owns ' + o + ' → ' + to + '  (inferred: same plan, renamed)',
+        apply: () => { t.owns[i] = to; } });
+    }
+  }
+
+  if (!did.length) { console.log('\nNothing here can be mended without guessing.'); return; }
+  console.log('\n' + did.length + ' thing(s) can be mended:');
+  for (const x of did) console.log('    ' + x.what);
+  if (!write) {
+    console.log('\nNothing was written. Run it again with --write to apply.');
+    return;
+  }
+  for (const x of did) x.apply();
+
+  // A repair that widens or repoints ownership can create the very collision
+  // this tool exists to prevent, so the result is judged before it is kept.
+  const open = tasks(r).filter((t) => !DEAD_STATUS.includes(t.status));
+  const clash = [];
+  for (let i = 0; i < open.length; i++) for (let j = i + 1; j < open.length; j++) {
+    const o = overlap(open[i], open[j]);
+    if (o.length) clash.push(open[i].key + ' ↔ ' + open[j].key + '   ' + o.join('; '));
+  }
+  if (clash.length) {
+    console.error('\n✗ that would leave ' + clash.length + ' pair(s) of open tasks claiming one path:');
+    for (const x of clash.slice(0, 10)) console.error('    ' + x);
+    console.error('  Nothing was written. Settle the ownership by hand — a repair may not create');
+    console.error('  the one collision this whole arrangement exists to prevent.');
+    process.exit(1);
+  }
+  commit(r, 'doctor --repair');
+  console.log('\nDone. ' + did.length + ' thing(s) mended, and each is on the record.');
+  console.log('Run `brief --all` — a task whose ownership moved has a brief that no longer matches.');
 }
 
 // --------------------------------------------------------------------- owed
@@ -4762,7 +4840,7 @@ const flags = {}; const rest = [];
 // wrote one that began with a dash, and silently ate a positional whenever a
 // boolean was not on the short list. Both failures reported success.
 const BOOL_FLAGS = new Set(['stdout', 'all', 'load-bearing', 'not-load-bearing', 'dry-run', 'force',
-  'not-blocking', 'reclean', 'check']);
+  'not-blocking', 'reclean', 'check', 'repair', 'write']);
 const VALUE_FLAGS = new Set(['base', 'branch', 'evidence', 'from', 'grep', 'id', 'into', 'key',
   'kind', 'n', 'name', 'note', 'out', 'plan', 'ref', 'register', 'scope', 'session',
   'sha', 'since', 'stale', 'status', 'subject', 'task', 'text', 'timeout', 'title',
@@ -4962,7 +5040,7 @@ switch (cmd) {
     else die('preflight brief <key>|done <key>|check [--wave n]');
     break;
   }
-  case 'doctor': cmdDoctor(); break;
+  case 'doctor': cmdDoctor(flags); break;
   case 'archive': cmdArchive(flags); break;
   case 'owed': cmdOwed(rest.shift(), rest, flags); break;
   case 'plan': cmdPlan(rest.shift(), rest, flags); break;

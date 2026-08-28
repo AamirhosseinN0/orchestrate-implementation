@@ -1859,6 +1859,47 @@ say('doctor names a pre-flight report nobody folded in');
   ok('and it counts as a problem', out.code !== 0);
 }
 
+// Some of what doctor reports is damage a bug left behind, and saying so again
+// does not clear it. Repair mends what can be mended without guessing — and
+// refuses to mend anything into the one collision this all exists to prevent.
+say('doctor can mend what it reports, and will not mend it into a collision');
+{
+  const d = box('repair');
+  const rep = path.join(d, '.claude/orchestration/preflight/t2.json');
+  fs.mkdirSync(path.dirname(rep), { recursive: true });
+  fs.writeFileSync(rep, JSON.stringify({ missing: [], serialises: ['alembic-head'],
+    verify: [], notes: 'what the pre-flight found' }) + '\n');
+  const dry = drv(d, ['doctor', '--repair']);
+  ok('a dry run says what it would do', has(dry.out, 'fold the pre-flight report into t2'), dry.out.slice(-400));
+  ok('and writes nothing', has(dry.out, 'Nothing was written') &&
+     !(tasksOf(d).find((t) => t.key === 't2')?.preflight?.at));
+  const done = drv(d, ['doctor', '--repair', '--write']);
+  ok('--write applies it', has(done.out, 'mended') &&
+     !!tasksOf(d).find((t) => t.key === 't2')?.preflight?.at, done.out.slice(-300));
+  ok('and it went on the record, not just into the file', has(drv(d, ['verify']).out, 'agree exactly'));
+  ok('and it says the briefs need rewriting after it', has(done.out, 'brief --all'), done.out.slice(-300));
+  ok('and what it folded reaches the brief',
+     has(readIf(path.join(d, '.claude/orchestration/briefs/t2.md')) ||
+         (drv(d, ['brief', 't2']), readIf(path.join(d, '.claude/orchestration/briefs/t2.md'))),
+        'what the pre-flight found'));
+
+  // The guardrail: a repair that widens ownership onto a path another open task
+  // already holds must not be kept. Confirmed on a real register, where folding
+  // its 23 unfolded reports would have created four such pairs.
+  const d2 = box('repairclash');
+  const rep2 = path.join(d2, '.claude/orchestration/preflight/t2.json');
+  fs.mkdirSync(path.dirname(rep2), { recursive: true });
+  fs.writeFileSync(rep2, JSON.stringify({ missing: [], serialises: [], verify: [], notes: 'x' }) + '\n');
+  const p2 = path.join(d2, '.claude/orchestration/register.json');
+  const rr = JSON.parse(fs.readFileSync(p2, 'utf8'));
+  rr.tasks.find((t) => t.key === 't2').owns = ['src/b.py', 'src/a.py'];   // t1 already owns src/a.py
+  fs.writeFileSync(p2, JSON.stringify(rr, null, 2) + '\n');
+  const clash = drv(d2, ['doctor', '--repair', '--write']);
+  ok('it refuses to leave two open tasks on one path',
+     clash.code !== 0 && has(clash.out, 'claiming one path'), clash.out.slice(-400));
+  ok('and wrote nothing when it refused', !tasksOf(d2).find((t) => t.key === 't2')?.preflight?.at);
+}
+
 // Was: `refined` was set both by an older driver that kept no report and by this
 // one, which does. Nothing told them apart, so "the evidence predates this log"
 // read exactly like "marked refined, never actually done" — half the plans on a
@@ -2511,7 +2552,7 @@ else console.log('\nsandboxes kept: ' + boxes.join('\n                '));
 // an exception thrown before its first `ok`, a case quietly commented out — and
 // the suite still ends on "all green", because green is only ever measured
 // against however many checks happened to run.
-const EXPECTED = 423;   // every check above counts; raise it deliberately when you add one
+const EXPECTED = 431;   // every check above counts; raise it deliberately when you add one
 
 console.log('\n' + '-'.repeat(60));
 if (pass + failures.length !== EXPECTED)

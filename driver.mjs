@@ -565,7 +565,12 @@ function cmdEvents(flags) {
   let show = events;
   const since = numFlag(flags, 'since', { min: 0 });
   if (since !== undefined) show = show.filter((e) => (e.seq || 0) > since);
-  if (typeof flags.task === 'string') show = show.filter((e) => JSON.stringify(e.ops).includes('"' + flags.task + '"') || cmdLabel(e).includes(flags.task));
+  let partial = false;
+  if (typeof flags.task === 'string') {
+    const { keep, unlabelled } = eventsTouching(events, flags.task);
+    show = show.filter((e) => keep.has(e));
+    partial = unlabelled;
+  }
   if (typeof flags.grep === 'string') show = show.filter((e) => JSON.stringify(e).includes(flags.grep));
   const n = numFlag(flags, 'n', { min: 1 }) ?? 40;
   for (const e of show.slice(-n)) {
@@ -575,6 +580,69 @@ function cmdEvents(flags) {
     if (e.ops.length > 4) console.log('        …' + (e.ops.length - 4) + ' more change(s)');
   }
   console.log('\n' + show.length + ' of ' + events.length + ' event(s)' + (show.length > n ? ', last ' + n + ' shown' : '') + '.');
+  if (partial)
+    console.log('Some of this record predates commands recording which one they were, so a few older\n' +
+                'events can only be matched by the words in their command line. Where a task is not\n' +
+                'named there, its events cannot be found — read around the sequence numbers instead.');
+}
+
+// Which events touched a task. The old filter stringified the whole ops array —
+// paths AND values — and asked whether the key appeared anywhere in it, then
+// also matched the command label. Measured against a real 2,078-event record
+// that found 15% of a task's events and was wrong about half of what it did
+// find, while the footer printed a bare count that made a partial answer look
+// like a complete one.
+//
+// An op's path names a task by its position, never by its key — `tasks.3.status`
+// — so the positions have to be resolved. That is safe: `r.tasks` is only ever
+// appended to, never spliced or reordered, and a key is never reassigned. One
+// forward pass with the same `applyOps` the replay uses, so a root-level reseed
+// event (which re-seats every task at once) is handled by construction rather
+// than by pattern-matching paths.
+//
+// A key also travels as a VALUE in four places, and those are exactly the
+// questions people open this command to ask — what was filed against this task,
+// who is waiting on it — so resolving positions alone would have traded one kind
+// of blindness for another.
+const KEY_BEARING = [['defects', 'task'], ['owed', 'to'], ['tasks', 'bundledInto']];
+function eventsTouching(events, key) {
+  const keep = new Set();
+  let unlabelled = false;
+  let state = {};
+  for (const e of events) {
+    state = applyOps(state, e.ops);
+    const tasks = (state && state.tasks) || [];
+    let hit = false;
+    for (const op of (e.ops || [])) {
+      const p = op.p || [];
+      if (!p.length) { hit = hit || tasks.some((t) => t && t.key === key); continue; }  // a reseed re-seats everything
+      if (String(p[0]) === 'tasks' && p.length >= 2) {
+        const t = tasks[Number(p[1])];
+        if (t && t.key === key) { hit = true; continue; }
+      }
+      for (const [top, field] of KEY_BEARING)
+        if (String(p[0]) === top && namesKey(op.v, field, key)) hit = true;
+      if (String(p[0]) === 'tasks' && namesKey(op.v, 'needs', key)) hit = true;
+    }
+    if (!hit && !e.argv && cmdLabel(e).includes(key)) { hit = true; }
+    if (!e.argv) unlabelled = true;
+    if (hit) keep.add(e);
+  }
+  return { keep, unlabelled };
+}
+// Does this op's value name the key at the given field? The value can be the key
+// itself (`owed.3.to` set to it), the object holding it (a whole defect pushed),
+// or the whole collection (the first defect creates the array), so this has to
+// look through what it is given rather than assume a shape.
+function namesKey(v, field, key, depth = 0) {
+  if (v === key) return true;
+  if (depth > 4 || v === null || typeof v !== 'object') return false;
+  if (Array.isArray(v)) return v.some((x) => namesKey(x, field, key, depth + 1));
+  if (Object.prototype.hasOwnProperty.call(v, field)) {
+    const f = v[field];
+    if (f === key || (Array.isArray(f) && f.includes(key))) return true;
+  }
+  return Object.values(v).some((x) => x !== null && typeof x === 'object' && namesKey(x, field, key, depth + 1));
 }
 
 function cmdLogReseed(flags) {
@@ -986,6 +1054,19 @@ const JARGON = ['idempoten', 'schema', 'endpoint', 'api', 'rls', 'jwt', 'oauth',
   'namespace', 'mutation', 'immutab', 'idempotent', 'invariant', 'heuristic', 'deterministic',
   'stochastic', 'quantis', 'quantiz', 'vectoris', 'vectoriz', 'embedding', 'tokenis', 'tokeniz',
   'algorithm', 'implementation', 'architecture', 'infrastructure', 'configuration', 'authenticat',
+  // Every remaining term reference/plain-words.md names, from both of its
+  // tables. `lintText` cites that file as the authority for what it refuses,
+  // and was catching eighteen of its thirty-two words — so a question could
+  // reach the user saying "add a soft delete and a throttle, using RBAC to
+  // gate it" and be told it passed the plain-words rules. A method's real
+  // name is the same failure wearing a lab coat: "FSRS" tells somebody who
+  // is not an engineer exactly as little as "RBAC" does.
+  'route', 'permission model', 'rbac', 'cache invalidation', 'marshal', 'eventual consistency',
+  'configurable', 'retention policy', 'rate limit', 'throttl', 'optimistic locking',
+  'audit trail', 'soft delete', 'partition', 'schema-on-read', 'parameteris', 'parameteriz',
+  'fsrs', 'sm-17', 'sm-2', 'leitner', 'glicko', 'item response theory',
+  'bayesian knowledge tracing', 'operational transform', 'exponential backoff',
+  'bloom filter', 'token bucket', 'write-ahead log',
   'authoris', 'authoriz', 'provision', 'orchestrat', 'instantiat', 'parameteris', 'parameteriz'];
 
 // Each entry above is a STEM, and a stem only counts where a word starts. Held
@@ -996,8 +1077,13 @@ const JARGON = ['idempoten', 'schema', 'endpoint', 'api', 'rls', 'jwt', 'oauth',
 // to the end of that word, it catches the growths a stem is there for
 // ("schema" in schemas, "authoris" in authorisation) and reports the word the
 // writer actually used.
+// Short names that are also the start of ordinary words. A stem grows to the end
+// of the word it begins, which is what makes "schema" catch "schemas" — and what
+// would make "elo" catch "eloquent". These are matched whole and nothing else.
+const JARGON_EXACT = ['elo'];
 const JARGON_RE = new RegExp(
-  '\\b(?:' + JARGON.map((j) => j.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|') + ')[a-z]*', 'i');
+  '\\b(?:' + JARGON.map((j) => j.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|') + ')[a-z]*' +
+  '|\\b(?:' + JARGON_EXACT.join('|') + ')\\b', 'i');
 
 const PATHY = /(^|\s|\()[\w.\-/]*\/[\w.\-/]+|\b\w+\.(md|ts|tsx|js|mjs|py|json|sql|toml|yaml|yml|sh|rs|go|java|rb)\b|`[^`]+`/i;
 

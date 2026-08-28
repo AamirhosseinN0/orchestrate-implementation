@@ -1445,9 +1445,71 @@ say('events filters by task, grep and since');
   const g = drv(d, ['events', '--grep', 'rewritten']);
   ok('events --grep finds the event', g.code === 0 && has(g.out, 'rewritten'));
   const t = drv(d, ['events', '--task', 't1']);
-  ok('events --task narrows to that task', t.code === 0 && has(t.out, 't1'));
+  ok('events --task narrows to that task', t.code === 0 && has(t.out, 'event(s)') &&
+     /(\d+) of \d+ event/.test(t.out), t.out.split('\n').slice(-1)[0]);
   const s = drv(d, ['events', '--since', '0']);
   ok('events --since is accepted', s.code === 0 && has(s.out, 'event(s)'));
+
+  // Was: the filter stringified the whole ops array — paths AND values — and
+  // asked whether the key appeared anywhere in it. An op names a task by its
+  // position (`tasks.3.status`), never by its key, so most of a task's own
+  // history was invisible while other tasks' events that happened to mention it
+  // were pulled in. Measured on a real record: 15% found, half of that wrong.
+  drv(d, ['task', 'add'], { stdin: JSON.stringify([{ key: 't2', title: 'only t2 changes here' }]) });
+  const only1 = drv(d, ['events', '--task', 't1', '--n', '200']).out;
+  ok('an edit to another task is not filed under this one',
+     !has(only1, 'only t2 changes here'), only1.slice(-600));
+  drv(d, ['task', 'add'], { stdin: JSON.stringify([{ key: 't1', title: 'renamed again' }]) });
+  ok('and an edit to this one is found by position, not by spelling',
+     has(drv(d, ['events', '--task', 't1', '--n', '200']).out, 'renamed again'),
+     drv(d, ['events', '--task', 't1', '--n', '200']).out.slice(-600));
+  // A key also travels as a value, and those are the questions people open this
+  // command to ask: what was filed against it, who is waiting on it.
+  drv(d, ['defect', 'add', '--task', 't1', '--kind', 'bug', '--what', 'a break filed against t1',
+          '--evidence', 'the suite']);
+  ok('a defect filed against it is its history too',
+     has(drv(d, ['events', '--task', 't1', '--n', '200']).out, 'defect add'),
+     drv(d, ['events', '--task', 't1', '--n', '200']).out.slice(-600));
+  drv(d, ['owed', 'add', '--to', 't1', '--what', 'an owed item pointed at t1', '--why', 'the window']);
+  ok('and so is an owed item pointed at it',
+     has(drv(d, ['events', '--task', 't1', '--n', '200']).out, 'owed add'),
+     drv(d, ['events', '--task', 't1', '--n', '200']).out.slice(-600));
+}
+
+// Was: `lintText` names reference/plain-words.md as the authority for what it
+// refuses, and was catching eighteen of the thirty-two words that file forbids.
+// A question could reach the user saying "add a soft delete and a throttle,
+// using RBAC to gate it" and be told it passed the plain-words rules.
+say('the plain-words filter refuses every word its own reference forbids');
+{
+  const d = planBox('jargondoc', '# p\n\n## What is open\n\nThe retry limit is TBD.\n');
+  drv(d, ['scan']);
+  const g = gapsOf(d)[0].id;
+  drv(d, ['set', g, 'scope=in']);
+  const ask = (text) => drv(d, ['question', g], { stdin: JSON.stringify({ text,
+    options: [{ label: 'Yes', gain: 'simpler for them', cost: 'more to build', recommended: true },
+              { label: 'No', gain: 'less to build', cost: 'they ask for it later' }] }) });
+  // Every term the doc names, read out of the doc itself so the two cannot drift
+  // apart again without this failing.
+  const doc = fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)),
+    'reference/plain-words.md'), 'utf8');
+  const terms = [];
+  for (const line of doc.split('\n')) {
+    const m = /^\|\s*([^|]+?)\s*\|/.exec(line);
+    if (!m) continue;
+    const cell = m[1].trim();
+    if (!cell || /^-+$/.test(cell) || cell === "Don't say" || cell === 'Real name') continue;
+    for (const t of cell.split(/,| \/ /)) if (t.trim()) terms.push(t.trim());
+  }
+  ok('the reference really does name a vocabulary', terms.length >= 30, terms.length + ' term(s)');
+  // Both the refusal and the pass mention plain-words.md, so the message cannot
+  // tell them apart — the exit code can. A refused question is not asked.
+  const waved = terms.filter((t) => ask('Should we use ' + t + ' here?').code === 0);
+  ok('and not one of them passes the lint', waved.length === 0, waved.join(' | '));
+  // and ordinary English is still ordinary English
+  ok('a plain question still passes',
+     has(ask('Should a student be able to hide a card they have finished with?').out, 'passes the plain-words rules'),
+     ask('Should a student be able to hide a card they have finished with?').out.slice(0, 200));
 }
 
 // ---------------------------------------------------- lint with nothing to say
@@ -2449,7 +2511,7 @@ else console.log('\nsandboxes kept: ' + boxes.join('\n                '));
 // an exception thrown before its first `ok`, a case quietly commented out — and
 // the suite still ends on "all green", because green is only ever measured
 // against however many checks happened to run.
-const EXPECTED = 416;   // every check above counts; raise it deliberately when you add one
+const EXPECTED = 423;   // every check above counts; raise it deliberately when you add one
 
 console.log('\n' + '-'.repeat(60));
 if (pass + failures.length !== EXPECTED)

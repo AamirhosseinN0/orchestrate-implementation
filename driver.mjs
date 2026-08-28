@@ -777,6 +777,16 @@ function cmdShow(id) {
   console.log(JSON.stringify(g, null, 2));
 }
 
+// "answered" with nothing recorded under it is a claim with no evidence, and
+// every reader that trusts the status and reaches for `g.answer.choice` breaks
+// on it. `check` and `render` each grew their own copy of this test; `refine
+// brief` never did, and threw a raw TypeError out of the driver instead. One
+// definition, so the next reader cannot be the one that forgot.
+function hollowGaps(gaps) {
+  return gaps.filter((g) => g.status === 'answered' &&
+    !(g.answer && typeof g.answer.choice === 'string' && g.answer.choice.trim()));
+}
+
 function cmdSet(id, pairs) {
   const reg = readReg(); const g = getGap(reg, id);
   const OK = ['status', 'scope', 'title', 'why', 'plan', 'line', 'section'];
@@ -787,6 +797,12 @@ function cmdSet(id, pairs) {
     if (!OK.includes(k)) die('cannot set "' + k + '" (allowed: ' + OK.join(', ') + ')');
     if (k === 'scope' && !['in', 'out', 'unset'].includes(v)) die('scope must be in|out|unset');
     if (k === 'status' && !['candidate', 'gap', 'dropped', 'asked', 'batched', 'answered', 'deferred'].includes(v)) die('bad status');
+    // This is where a gap became "answered" with nothing under it — the state
+    // that then broke `refine brief` and that `check` and `render` both refuse.
+    // A status is a claim; `answer` is what records the evidence for it.
+    if (k === 'status' && v === 'answered' && hollowGaps([{ ...g, status: 'answered' }]).length)
+      die('cannot set ' + g.id + ' answered here — nothing would be recorded under it.\n' +
+          '       A status is a claim; the answer is the evidence. Run: answer ' + g.id);
     g[k] = k === 'line' ? Number(v) : v;
   }
   commit(reg);
@@ -963,10 +979,7 @@ function cmdCheck() {
   const cand = reg.gaps.filter((g) => g.status === 'candidate');
   const unset = reg.gaps.filter((g) => g.scope === 'unset' && !['dropped', 'candidate'].includes(g.status));
   const open = reg.gaps.filter((g) => g.scope === 'in' && !['answered', 'dropped'].includes(g.status));
-  // "answered" with nothing recorded under it is the state `render` cannot
-  // read. A status is a claim; the answer is the evidence for it.
-  const hollow = reg.gaps.filter((g) => g.status === 'answered' &&
-    !(g.answer && typeof g.answer.choice === 'string' && g.answer.choice.trim()));
+  const hollow = hollowGaps(reg.gaps);
   let fail = false;
   if (!reg.plans.length) { console.error('✗ no plans loaded — nothing has been read, so nothing can be finished. Run `load`.'); fail = true; }
   else if (!reg.scannedAt) {
@@ -996,7 +1009,7 @@ function cmdRender(flags) {
   if (!done.length) die('nothing answered yet');
   // Belt as well as braces: `check` refuses these now, but `render` can be run
   // without it, and a raw TypeError deep in the writer says nothing useful.
-  const hollow = done.filter((g) => !(g.answer && typeof g.answer.choice === 'string' && g.answer.choice.trim()));
+  const hollow = hollowGaps(done);
   if (hollow.length)
     die(hollow.length + ' gap(s) are marked answered with no answer recorded: ' +
         hollow.map((g) => g.id).join(', ') + '\n       Record each with `answer <id>`, or set it back to gap.');
@@ -1210,6 +1223,15 @@ function briefSha(t, r) {
 function cmdRefineBrief(needle) {
   const r = readReg(); const p = planEntry(r, needle);
   const mine = r.gaps.filter((g) => g.status === 'answered' && g.plan === p.path);
+  // Was a raw TypeError out of the driver: this reads g.answer.choice below and
+  // was the one such reader with no check that there is an answer to read. Say
+  // which gaps, and what fixes them, the way `check` and `render` already do.
+  const hollow = hollowGaps(mine);
+  if (hollow.length)
+    die(hollow.length + ' gap(s) on this plan are marked answered with nothing recorded under them,\n' +
+        '       so the brief cannot say what was settled:\n' +
+        hollow.map((g) => '         ' + g.id + '  ' + (g.title || g.quote.slice(0, 60)) +
+                          '   — run `answer ' + g.id + '`').join('\n'));
   const B = [];
   B.push('Refine one implementation plan so it can be built from, without anyone having to guess.');
   B.push('');
@@ -1280,14 +1302,16 @@ function cmdRefineBrief(needle) {
 function cmdRefineDone(needle, flags) {
   const r = readReg(); const p = planEntry(r, needle);
   const src = flags.from ? path.resolve(CWD, flags.from) : reportPath(p.path);
-  let rep;
+  let rep, source;
   if (fs.existsSync(src)) {
+    source = 'file';
     try { rep = JSON.parse(fs.readFileSync(src, 'utf8')); }
     catch (e) { die('the report at ' + rel(src) + ' is not valid JSON: ' + e.message + '\n       Send it back to the agent — do not retype it yourself.'); }
     console.log("read the agent's own report: " + rel(src));
   } else {
     // Older flow, and the escape hatch: JSON piped in. Still works, but the file
     // is better — it cannot lose a line to a compaction on the way here.
+    source = 'stdin';
     let raw = '';
     try { raw = fs.readFileSync(0, 'utf8'); } catch { /* no stdin */ }
     if (!raw.trim()) die('no report at ' + rel(src) + ' and nothing on stdin.\n' +
@@ -1297,7 +1321,14 @@ function cmdRefineDone(needle, flags) {
     console.log('⚠ took the report from stdin, not from the agent\'s own file.');
     console.log('  It passed through your context to get here, so check nothing was lost.');
   }
-  p.refined = true; p.refinedAt = now(); p.refineSummary = rep.summary || '';
+  // Which of the two routes a report came in by is a fact about how much to
+  // trust it — the file cannot lose a line to a compaction, stdin can. It was
+  // said once on the console and then thrown away, so afterwards the two were
+  // indistinguishable. `refined` on its own is also indistinguishable from a
+  // plan marked refined by an older driver that kept no report at all; naming
+  // the source is what lets `doctor` tell those apart.
+  p.refined = true; p.refinedAt = now(); p.refineSource = source;
+  p.refineSummary = rep.summary || '';
   p.builtOn = rep.builtOn || [];
   let added = 0;
   for (const g of rep.newGaps || []) {
@@ -1542,6 +1573,30 @@ function cmdTaskAdd() {
       if (clashes.length)
         errs.push(label + ' claims ' + own + ', which is already owned: ' + [...new Set(clashes)].join('; ') +
           ' — two tasks may not touch one file. Narrow one of them, or make one wait for the other and split the file.');
+    }
+  }
+  // The same question for serialisation points, which had no version of it at
+  // all. `owns` gained this check because a widening update could hand two open
+  // chips one file; `serialises` can hand two open chips one invariant the same
+  // way, and that is the thing only one of them may move. Judged against work
+  // that is actually in flight — two PLANNED tasks naming a point is ordinary,
+  // and `chip` is what refuses to open the second of them.
+  const flying = new Map();
+  for (const t of tasks(r)) if (OPEN_STATUSES.includes(t.status))
+    flying.set(t.key, (t.serialises || []).map(normPoint));
+  for (const { it, at, label } of plans) {
+    if (it.serialises === undefined) continue;
+    if (at < 0 || !OPEN_STATUSES.includes(tasks(r)[at].status)) continue;   // not in flight: chip will judge it
+    const held = new Set((tasks(r)[at].serialises || []).map(normPoint));
+    for (const s of it.serialises) {
+      if (held.has(normPoint(s))) continue;                                 // already theirs
+      for (const [key, points] of flying) {
+        if (key === it.key) continue;
+        if (points.includes(normPoint(s)))
+          errs.push(label + ' takes the serialisation point "' + s + '", which ' + key +
+            ' is holding while it runs — a point is the thing only one of them may move.' +
+            ' Wait for ' + key + ' to land, or take the point off one of them.');
+      }
     }
   }
   if (errs.length) die('nothing was saved:\n       ' + errs.join('\n       '));
@@ -2409,7 +2464,20 @@ function cmdPreflightDone(key) {
       bad.push('verify must be a list of {command, runnable, why}');
   }
   if (bad.length) die('the report at ' + rel(src) + ' is not usable — send it back rather than fixing it here:\n       ' + bad.join('\n       '));
-  t.preflight = { at: now(), missing: rep.missing || [], verify: rep.verify || [], notes: rep.notes || '' };
+  // A second pre-flight used to replace the first outright, so a gap the first
+  // run found and nobody has closed yet simply vanished — and `preflight check`
+  // then went green on the loss. Carry forward anything the new report does not
+  // mention and `owns` does not already cover: a gap stops being owed because it
+  // was settled, not because it was left out of the next report.
+  const fresh = rep.missing || [];
+  const named = new Set(fresh.map((m) => m.path));
+  const kept = ((t.preflight && t.preflight.missing) || []).filter((m) =>
+    !named.has(m.path) && !(t.owns || []).some((o) => coveredBy(o, m.path)));
+  t.preflight = { at: now(), missing: [...fresh, ...kept],
+    verify: rep.verify || [], notes: rep.notes || '' };
+  if (kept.length)
+    console.log('carried forward ' + kept.length + ' gap(s) the earlier pre-flight found and this one does not mention: ' +
+      kept.map((m) => m.path).join(' '));
   for (const x of rep.serialises || []) { (t.serialises ||= []); if (!t.serialises.includes(x)) t.serialises.push(x); }
   commit(r);
   console.log(key + ' pre-flighted: ' + t.preflight.missing.length + ' gap(s), ' +
@@ -2607,6 +2675,59 @@ function cmdDoctor() {
     for (const [, e] of lone) console.log('    ' + [...e.spellings][0] + '   (' + [...e.keys][0] + ' alone)');
     console.log('    A point nobody else claims gates nothing. Either another task should be naming');
     console.log('    it — check the spelling against theirs — or it does not belong in `serialises`.');
+  }
+  // The other half of the same question, and the one that is actually a breach.
+  // Two tasks may both NAME a point — that is what a point is for. What may not
+  // happen is both being in flight at once, because a point is the thing only
+  // one of them may move. `chip` refuses to open the second, but `task add` and
+  // `preflight done` can widen `serialises` on a task that is already running,
+  // and nothing looked afterwards. Only the lone case was ever reported.
+  const flying = tasks(r).filter((t) => OPEN_STATUSES.includes(t.status));
+  const shared = new Map();
+  for (const t of flying) for (const s of t.serialises || []) {
+    const e = shared.get(normPoint(s)) || { keys: new Set(), spellings: new Set() };
+    e.keys.add(t.key); e.spellings.add(s);
+    shared.set(normPoint(s), e);
+  }
+  const contended = [...shared.entries()].filter(([, e]) => e.keys.size > 1);
+  if (contended.length) {
+    bad += contended.length;
+    console.log('✗ ' + contended.length + ' serialisation point(s) held by more than one chip at once:');
+    for (const [, e] of contended)
+      console.log('    ' + [...e.spellings].join(' ≈ ') + '   (' + [...e.keys].join(' ↔ ') + ')');
+    console.log('    A point is the thing only one of them may move. Whichever was opened second');
+    console.log('    should not have been — hold it until the other lands.');
+  }
+  // A pre-flight report is an ordinary file an agent writes; nothing folds it
+  // into the record but a person running `preflight done`. That step is not
+  // required anywhere, so a report can be written and simply never acted on —
+  // on a real run 25 of 53 were, eight of them still naming load-bearing gaps.
+  const orphans = [];
+  try {
+    for (const f of fs.readdirSync(orchDir('preflight'))) {
+      if (!f.endsWith('.json')) continue;
+      const t = tasks(r).find((x) => fileKey(x.key) + '.json' === f);
+      if (!t) { orphans.push(f + '  (no task by that key)'); continue; }
+      if (!(t.preflight && t.preflight.at)) orphans.push(f + '  → ' + t.key + ' — run `preflight done ' + t.key + '`');
+    }
+  } catch { /* no preflight dir yet */ }
+  if (orphans.length) {
+    bad += orphans.length;
+    console.log('✗ ' + orphans.length + ' pre-flight report(s) written but never folded into the record:');
+    for (const x of orphans.slice(0, 20)) console.log('    ' + x);
+    if (orphans.length > 20) console.log('    … and ' + (orphans.length - 20) + ' more.');
+    console.log('    What the agent found is sitting on disk where nothing reads it.');
+  }
+  // `refined` was set by an older driver that kept no report, and by this one
+  // which does. Nothing distinguished them, so "refined, and the evidence
+  // predates the log" read exactly like "marked refined, never actually done".
+  const unevidenced = (r.plans || []).filter((p) => p.refined && !p.refineSource &&
+    !fs.existsSync(reportPath(p.path)));
+  if (unevidenced.length) {
+    console.log('· ' + unevidenced.length + ' plan(s) marked refined with no report on disk and no source recorded:');
+    for (const p of unevidenced) console.log('    ' + p.path);
+    console.log('    Either the refining predates this record, or it never happened. Nothing here can');
+    console.log('    tell you which — re-run `refine brief` on any you cannot vouch for.');
   }
   // An owed item outlives the task it was assigned to, and nothing else looks.
   const shut = allShutWindows(r);
@@ -4151,6 +4272,11 @@ const VALUE_FLAGS = new Set(['base', 'branch', 'evidence', 'from', 'grep', 'id',
   'kind', 'n', 'name', 'note', 'out', 'plan', 'ref', 'register', 'scope', 'session',
   'sha', 'since', 'stale', 'status', 'subject', 'task', 'text', 'timeout', 'title',
   'to', 'wave', 'what', 'why', 'why-changed', 'window', 'worktree']);
+// The value flags that carry a sentence rather than a token. These are the ones
+// a lost quote silently truncates to its first word, and the only ones for which
+// a bare word following the value is certainly part of it.
+const PROSE_FLAGS = new Set(['evidence', 'note', 'subject', 'text', 'title', 'what', 'why',
+  'why-changed', 'window']);
 const flagName = (s) => s.startsWith('--') ? s.slice(2).split('=')[0] : null;
 const isKnownFlag = (s) => {
   const k = flagName(s);
@@ -4177,6 +4303,23 @@ for (let i = 0; i < argv.length; i++) {
     if (i + 1 >= argv.length || argv[i + 1] === '--' || isKnownFlag(argv[i + 1]))
       die('--' + k + ' needs a value.\n       If the value itself starts with --, write it as --' + k + '="--like this".');
     v = argv[++i];
+    // A value flag takes exactly one word, and the words after it fall through
+    // to the positionals, where every command that wants a fixed number of them
+    // ignores the rest. So `--what a long sentence` recorded "a", said nothing,
+    // and reported success — losing a quote is the commonest way a long value
+    // is written wrong, and it was the one mistake this parser did not catch.
+    //
+    // Only for the flags that carry a sentence. A positional after a flag is
+    // perfectly ordinary otherwise — `--register <path> iam <name>` is the
+    // documented leading-flag form — so the general rule would refuse the very
+    // invocation the docs teach.
+    const stray = PROSE_FLAGS.has(k) ? [] : null;
+    if (stray) for (let j = i + 1; j < argv.length && argv[j] !== '--' && !argv[j].startsWith('--'); j++) stray.push(argv[j]);
+    if (stray && stray.length)
+      die('--' + k + ' takes one word, and ' + stray.length + ' more followed it: ' +
+          stray.slice(0, 6).map((s) => JSON.stringify(s)).join(' ') + (stray.length > 6 ? ' …' : '') +
+          '\n       They would have been dropped and the command would have reported success.' +
+          '\n       Quote the whole value: --' + k + ' "' + v + ' ' + stray.join(' ') + '"');
   }
   flags[k] = v;
 }

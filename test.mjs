@@ -78,6 +78,17 @@ function sandbox(name) {
 }
 const boxes = [];
 const box = (n) => { const d = sandbox(n); boxes.push(d); return d; };
+// "answered" with nothing recorded under it. `set` refuses to mint it now, so
+// the only honest way to test the readers that must survive it is to write the
+// state the register actually holds when it arrives — from an older driver, or
+// from somebody's editor.
+function forceHollow(d, id) {
+  const p = path.join(d, '.claude/orchestration/register.json');
+  const r = JSON.parse(fs.readFileSync(p, 'utf8'));
+  const g = r.gaps.find((x) => x.id === id);
+  g.status = 'answered'; g.answer = null;
+  fs.writeFileSync(p, JSON.stringify(r, null, 2) + '\n');
+}
 const say = (m) => console.log('\n· ' + m);
 
 // An empty directory with nothing but a name — for the cases that need to build
@@ -355,6 +366,22 @@ say('the parser keeps what was written, and says so when it cannot');
   drv(d, ['defect', 'add', '--task', 't1', '--kind', 'bug', '--what', 'w', '--evidence=--force']);
   ok('--flag=value survives when the value itself starts with --',
      (reg(d).defects || []).slice(-1)[0]?.evidence === '--force');
+  // Was: a value flag takes one word, and the rest fell through to the
+  // positionals, where every command ignores what it does not want. So a lost
+  // quote recorded the first word, dropped the sentence, and said it worked.
+  const lost = drv(d, ['owed', 'add', '--what', 'the', 'brief', 'renderer', 'drops', 'notes',
+                       '--why', 'because']);
+  ok('a sentence that lost its quotes is refused, not truncated to one word',
+     lost.code !== 0 && has(lost.out, 'takes one word'), lost.out.split('\n')[0]);
+  ok('and the refusal shows the whole value quoted',
+     has(lost.out, '--what "the brief renderer drops notes"'), lost.out);
+  const kept = drv(d, ['owed', 'add', '--what', 'the brief renderer drops notes', '--why', 'because']);
+  ok('the same value quoted is recorded whole', kept.code === 0 &&
+     (reg(d).owed || []).slice(-1)[0]?.what === 'the brief renderer drops notes');
+  // A positional after a flag's value is ordinary — this is the documented
+  // leading-flag form, and the general rule would have refused it.
+  ok('--register before the subcommand still works',
+     drv(d, ['--register', path.join(d, '.claude/orchestration/register.json'), 'iam', 'probe']).code === 0);
   const mis = drv(d, ['defect', 'list', '--alll']);
   ok('a misspelled flag is reported, not ignored', mis.code !== 0 && has(mis.out, 'unknown flag --alll'));
   const noval = drv(d, ['board', '--register']);
@@ -659,7 +686,13 @@ say('check will not call a session finished on a claim');
   drv(d, ['scan']);
   const g = gapsOf(d)[0]?.id;
   drv(d, ['set', g, 'scope=in']);
-  drv(d, ['set', g, 'status=answered']);
+  // `set` used to mint this state itself. It refuses now — but the state still
+  // exists in registers written before that gate, and can be reached by hand, so
+  // force it the way it actually persists and check the readers still refuse it.
+  const minted = drv(d, ['set', g, 'status=answered']);
+  ok('set will not mint a claim with no evidence under it',
+     minted.code !== 0 && has(minted.out, 'the answer is the evidence'), minted.out.split('\n')[0]);
+  forceHollow(d, g);
   const hollow = drv(d, ['check']);
   ok('and so is a gap marked answered with no answer under it',
      hollow.code !== 0 && has(hollow.out, 'no answer recorded'));
@@ -916,6 +949,26 @@ say('refine done falls back to stdin and says the file is better');
   const out = drv(d, ['refine', 'done', 'plan'], { stdin: JSON.stringify({ summary: 'ok', builtOn: [], tasks: [], newGaps: [] }) }).out;
   ok('it took the report from stdin', has(out, 'from stdin'));
   ok('and marked the plan refined', (reg(d).plans || [])[0]?.refined === true);
+  // Was: which route the report came in by was said once on the console and then
+  // thrown away, so afterwards a report that could not lose a line and one that
+  // passed through somebody's context looked identical on the record.
+  ok('and recorded which route it came in by', (reg(d).plans || [])[0]?.refineSource === 'stdin');
+}
+
+// Was: `refine brief` reads g.answer.choice and was the one such reader with no
+// check that there is an answer to read, so a gap marked answered with nothing
+// under it threw a raw TypeError out of the driver.
+say('refine brief names a hollow claim rather than throwing');
+{
+  const d = planBox('refhollow', '# a plan\n\n## What is open\n\nThe retry limit is TBD.\n');
+  drv(d, ['scan']);
+  const g = gapsOf(d)[0].id;
+  drv(d, ['set', g, 'scope=in']);
+  forceHollow(d, g);
+  const out = drv(d, ['refine', 'brief', 'plan']);
+  ok('it refuses', out.code !== 0);
+  ok('it says which gap and what fixes it', has(out.out, g) && has(out.out, 'answer ' + g), out.out.split('\n')[1]);
+  ok('and no stack trace reaches the user', !traced(out.out), out.out.slice(0, 200));
 }
 
 // ---------------------------------------------------------------- pre-flight
@@ -939,6 +992,17 @@ say('pre-flight finds what the record missed and gates the round');
   ok('preflight done records the gaps', done.code === 0 && has(done.out, 'Load-bearing gaps'));
   const r = reg(d);
   ok('the task carries a preflight', (r.tasks || []).find((t) => t.key === '1.1')?.preflight?.missing?.length === 1);
+  // Was: a second report replaced the first outright, so a gap the first run
+  // found and nobody has closed yet simply vanished — and `preflight check`
+  // then went green on the loss.
+  fs.writeFileSync(rep, JSON.stringify({ missing: [{ path: 'src/c.js', why: 'another one', evidence: 'src/a.js:9', loadBearing: true }],
+    serialises: [], verify: [], notes: '' }) + '\n');
+  const again = drv(d, ['preflight', 'done', '1.1']);
+  const missing = (reg(d).tasks || []).find((t) => t.key === '1.1')?.preflight?.missing || [];
+  ok('a second pre-flight keeps the gap the first found',
+     missing.some((m) => m.path === 'src/b.js') && missing.some((m) => m.path === 'src/c.js'),
+     missing.map((m) => m.path).join(' '));
+  ok('and says it carried it forward', has(again.out, 'carried forward'), again.out.split('\n')[0]);
   // The load-bearing gap is not in owns yet, so the round is still not ready.
   ok('preflight check still refuses the load-bearing gap', drv(d, ['preflight', 'check']).code !== 0);
 }
@@ -1341,7 +1405,7 @@ say('render refuses an empty register and a hollow answer');
   const none = drv(d, ['render']);
   ok('render with nothing answered says so', none.code !== 0 && has(none.out, 'nothing answered yet'));
   const g = gapsOf(d)[0].id;
-  drv(d, ['set', g, 'status=answered']);   // a claim with no answer under it
+  forceHollow(d, g);                       // a claim with no answer under it
   const hollow = drv(d, ['render']);
   ok('render refuses a hollow answered claim', hollow.code !== 0 && has(hollow.out, 'no answer recorded'));
 }
@@ -1438,6 +1502,65 @@ say('doctor reports a serialisation point nobody shares');
   drv(d, ['task', 'add'], { stdin: JSON.stringify([{ key: 't1', serialises: ['alembic-head'] }]) });
   const out = drv(d, ['doctor']);
   ok('doctor names the lone serialisation point', has(out.out, 'only one task names') && has(out.out, 'alembic-head'));
+}
+
+// Was: doctor computed exactly this and then reported only the lone case — the
+// inverse question. `chip` refuses to open a second task on a point somebody
+// holds, but `task add` can widen `serialises` on a task already in flight, and
+// nothing looked afterwards.
+say('two chips may not take one serialisation point, and doctor says when they have');
+{
+  const d = box('doctorshared');
+  drv(d, ['chip', 't1', '--id', 'chip-t1']);
+  drv(d, ['chip', 't2', '--id', 'chip-t2']);
+  drv(d, ['task', 'add'], { stdin: JSON.stringify([{ key: 't1', serialises: ['alembic-head'] }]) });
+  // Widening a running task's points is the path the chip gate never sees, and
+  // `owns` grew a check for exactly this shape while `serialises` had none.
+  const taken = drv(d, ['task', 'add'], { stdin: JSON.stringify([{ key: 't2', serialises: ['Alembic-Head'] }]) });
+  ok('task add refuses to hand a running chip a point another one holds',
+     taken.code !== 0 && has(taken.out, 'only one of them may move'), taken.out.split('\n')[1]);
+  ok('and nothing was saved', !((reg(d).tasks || []).find((t) => t.key === 't2')?.serialises || []).length);
+  // Registers written before that gate still hold the state, so doctor must see
+  // it too — force it the way it persists.
+  const p = path.join(d, '.claude/orchestration/register.json');
+  const r = JSON.parse(fs.readFileSync(p, 'utf8'));
+  r.tasks.find((t) => t.key === 't2').serialises = ['Alembic-Head'];
+  fs.writeFileSync(p, JSON.stringify(r, null, 2) + '\n');
+  const out = drv(d, ['doctor']);
+  ok('doctor names the contended point', has(out.out, 'more than one chip at once'), out.out.slice(0, 400));
+  ok('and names both chips holding it, whichever way it is spelled',
+     has(out.out, 't1') && has(out.out, 't2') && has(out.out, 'Alembic-Head'), out.out.slice(0, 400));
+}
+
+// Was: a pre-flight report is an ordinary file, and nothing but a person running
+// `preflight done` folds it in. That step is required nowhere, so a report could
+// be written and simply never acted on — 25 of 53 were, on a real run.
+say('doctor names a pre-flight report nobody folded in');
+{
+  const d = box('doctororphan');
+  const rep = path.join(d, '.claude/orchestration/preflight/t2.json');
+  fs.mkdirSync(path.dirname(rep), { recursive: true });
+  fs.writeFileSync(rep, JSON.stringify({ missing: [], serialises: [], verify: [], notes: 'nobody read this' }) + '\n');
+  const out = drv(d, ['doctor']);
+  ok('doctor names the unfolded report',
+     has(out.out, 'never folded into the record') && has(out.out, 't2'), out.out.slice(0, 300));
+  ok('and it counts as a problem', out.code !== 0);
+}
+
+// Was: `refined` was set both by an older driver that kept no report and by this
+// one, which does. Nothing told them apart, so "the evidence predates this log"
+// read exactly like "marked refined, never actually done" — half the plans on a
+// real run were in that state and nothing said so.
+say('doctor names a plan marked refined with nothing behind it');
+{
+  const d = box('doctorrefined');
+  const p = path.join(d, '.claude/orchestration/register.json');
+  const r = JSON.parse(fs.readFileSync(p, 'utf8'));
+  r.plans[0].refined = true;                       // as an older driver left it
+  fs.writeFileSync(p, JSON.stringify(r, null, 2) + '\n');
+  const out = drv(d, ['doctor']).out;
+  ok('doctor names it', has(out, 'marked refined with no report on disk') && has(out, r.plans[0].path),
+     out.slice(0, 300));
 }
 
 // --------------------------------------------------------------- ci next round
@@ -2029,7 +2152,7 @@ else console.log('\nsandboxes kept: ' + boxes.join('\n                '));
 // an exception thrown before its first `ok`, a case quietly commented out — and
 // the suite still ends on "all green", because green is only ever measured
 // against however many checks happened to run.
-const EXPECTED = 347;   // every check above counts; raise it deliberately when you add one
+const EXPECTED = 365;   // every check above counts; raise it deliberately when you add one
 
 console.log('\n' + '-'.repeat(60));
 if (pass + failures.length !== EXPECTED)

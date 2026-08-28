@@ -3246,7 +3246,13 @@ function cmdSlot(sub, rest, flags, raw) {
 // actually covered, which stays true no matter what is added later.
 function checkpoints(r) { return (r.checkpoints ||= []); }
 function nextCheckpointId(r) {
-  const n = checkpoints(r).reduce((m, c) => Math.max(m, parseInt(String(c.id).slice(1), 10) || 0), 0);
+  // Only the real ones. `ci import-legacy` mints `l01…` into the same array and
+  // numbers itself correctly, but this counted every id whatever its prefix — so
+  // importing five rounds of history made the first checkpoint that actually
+  // proves something `c06`, which is exactly the "these are separate" the import
+  // exists to say.
+  const n = checkpoints(r).reduce((m, c) =>
+    /^c/.test(String(c.id)) ? Math.max(m, parseInt(String(c.id).slice(1), 10) || 0) : m, 0);
   return 'c' + String(n + 1).padStart(2, '0');
 }
 // A task is proven when a green checkpoint covering it was recorded after it
@@ -3361,7 +3367,27 @@ function cmdCi(flags) {
     die('round ' + (n + 1) + ' has not all landed yet, so this cannot close it:\n       ' +
         st.tasks.filter((t) => t.status !== 'landed').map((t) => t.key).join(' '));
   // resolved at write time: exactly which landed work this run saw
-  const covers = st.tasks.filter((t) => t.status === 'landed').map((t) => t.key);
+  // What the run actually saw, not what the bookkeeping happens to say now.
+  // `covers` was every task the round holds that has landed, resolved at the
+  // moment the checkpoint is filed — so a task that landed WHILE CI was running
+  // was written down as proven by a run that never contained its code. Under
+  // ordinary use — land, kick CI, land again, record — that is not a risk, it is
+  // what happens. `--sha` names the commit the run tested; a task whose own
+  // landing is not an ancestor of it was not in it.
+  let covers = st.tasks.filter((t) => t.status === 'landed').map((t) => t.key);
+  const outran = [];
+  if (flags.sha) {
+    const inRun = (t) => {
+      if (!t.landedSha) return null;                 // nothing to compare — leave it be
+      try { gitZ(['merge-base', '--is-ancestor', t.landedSha, flags.sha], CWD); return true; }
+      catch (e) { return e && e.status === 1 ? false : null; }   // 1 = not an ancestor; anything else = cannot tell
+    };
+    const keep = [];
+    for (const t of st.tasks.filter((x) => x.status === 'landed')) {
+      if (inRun(t) === false) outran.push(t.key); else keep.push(t.key);
+    }
+    covers = keep;
+  }
   // A task added mid-run with no `needs` joins round 1, so when it lands the
   // round is "all landed" again and a checkpoint is filed over every task that
   // round ever held. Four checkpoints each claimed a whole round when three of
@@ -3381,6 +3407,12 @@ function cmdCi(flags) {
               ' — filed against those, not against a round number that moves.');
   if (already.length)
     console.log('  ' + already.length + ' of those had already been proven by an earlier checkpoint: ' + already.join(' '));
+  if (outran.length) {
+    console.log('\n⚠ ' + outran.length + ' landed task(s) are NOT covered: they landed after ' + flags.sha +
+                ', so this run did not contain them:');
+    console.log('    ' + outran.join(' '));
+    console.log('  They are still unproven. Run CI again on the main line as it stands now.');
+  }
   if (status === 'green' || status === 'skipped') {
     const nxt = waveState(r, n + 1);
     console.log(nxt ? 'Round ' + (n + 2) + ' may now be opened: ' + nxt.tasks.map((t) => t.key).join(' ')
@@ -3716,6 +3748,13 @@ function cmdGuard(key, flags) {
     console.log('  writing it in the one place that has to stay able to judge it.');
     process.exit(1);
   }
+  // A clean guard used to write nothing at all, so afterwards there was no way
+  // to ask whether it had ever run — and `landed` could not check. Record what
+  // was judged and against what, so the answer survives the scrollback.
+  t.guardedAt = now();
+  t.guardedBase = base;
+  t.guardedFiles = changed.length;
+  commit(r);
   console.log('\n✓ everything it changed was its to change. Safe to join up.');
 }
 
@@ -3732,6 +3771,23 @@ function cmdLanded(key, flags) {
     console.error('  the requirement is not real.');
     process.exit(1);
   }
+  // A blocking defect is the record saying this work is known to be wrong. It
+  // was checked nowhere on the way in, so a task could land over its own open
+  // guard failure — and `board`, unlike `digest` and `outstanding`, showed
+  // nothing amiss afterwards.
+  const blocking = openDefects(r, key).filter((d) => d.blocking !== false);
+  if (blocking.length && !flags.force) {
+    console.error('✗ ' + key + ' has ' + blocking.length + ' open blocking defect(s) against it:');
+    for (const d of blocking) console.error('    ' + d.id + '  ' + d.kind + '  ' + String(d.what).slice(0, 90));
+    console.error('  Settle each with `defect fixed <id>`, or land it anyway with --force and say why');
+    console.error('  in the record — landing over a known break is a decision, not a formality.');
+    process.exit(1);
+  }
+  // Not a refusal: a guard is run against a worktree, and by the time some work
+  // lands the copy may be gone. But nothing recorded it either way, so say so.
+  if (!t.guardedAt)
+    console.log('⚠ no guard was ever recorded for ' + key + ' — nothing checked that what it changed\n' +
+                '  was its to change. Run `guard ' + key + '` before this, while the copy still exists.');
   t.status = 'landed'; t.landedAt = now();
   t.landedSha = flags.sha || '';
   // No checkpoint is destroyed by a landing. The new work is simply not covered

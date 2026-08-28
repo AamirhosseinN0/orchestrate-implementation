@@ -319,6 +319,19 @@ say('legacy CI results become readable history and prove nothing');
   ok('their reasoning survived', has(drv(d, ['ci', 'list']).out, 'a real run'));
   ok('running it twice does nothing', has(drv(d, ['ci', 'import-legacy']).out, 'nothing to import'));
   ok('the record still agrees', has(drv(d, ['verify']).out, 'agree exactly'));
+  // Was: the next id was computed by stripping the first character off EVERY
+  // checkpoint, so imported `l01`/`l02` pushed the first checkpoint that proves
+  // something to `c03` — undercutting the one thing the import means to say,
+  // that this history is separate and covers nothing.
+  drv(d, ['chip', 't1', '--id', 'c1']);
+  drv(d, ['done', 't1'], { stdin: '{"verified":"ran true","outcome":"passed"}' });
+  drv(d, ['landed', 't1', '--sha', 'abc']);
+  drv(d, ['chip', 't2', '--id', 'c2']);
+  drv(d, ['done', 't2'], { stdin: '{"verified":"ran true","outcome":"passed"}' });
+  drv(d, ['landed', 't2', '--sha', 'abc']);
+  ok('the first real checkpoint after an import is c01',
+     has(drv(d, ['ci', '--status', 'green', '--ref', 'run-3']).out, 'c01:'),
+     (reg(d).checkpoints || []).map((c) => c.id).join(' '));
 }
 
 // The archive is only safe because a removal is recorded like any other change.
@@ -576,6 +589,14 @@ say('the guard sees a file renamed out of somewhere the task does not own');
   const derived = drv(g, ['guard', '1.1']);
   ok('the base branch is asked for, not assumed to be main', has(derived.out, 'other/config.ts'),
      derived.out.split('\n')[0]);
+  // Was: a clean guard wrote nothing, so nothing could ask afterwards whether
+  // one had run — which is why `landed` could not check.
+  drv(g, ['task', 'add'], { stdin: JSON.stringify([{ key: '1.1', owns: ['src', 'other/config.ts'] }]) });
+  const clean = drv(g, ['guard', '1.1', '--base', 'trunk']);
+  ok('a clean guard passes', clean.code === 0 && has(clean.out, 'Safe to join up'), clean.out.split('\n').slice(-2).join(' '));
+  ok('and leaves a trace that it ran',
+     !!(reg(g).tasks || []).find((t) => t.key === '1.1')?.guardedAt,
+     JSON.stringify((reg(g).tasks || []).find((t) => t.key === '1.1')?.guardedAt));
 }
 
 // Was: the diff was built as a shell string, so a branch name was a command.
@@ -1515,6 +1536,55 @@ say('graph names a shared serialisation point');
   ok('graph names the shared point', out.code !== 0 && has(out.out, 'serialisation point'));
 }
 
+// Was: `covers` was every landed task in the round, resolved when the checkpoint
+// was filed — so a task that landed WHILE CI was running was written down as
+// proven by a run that never contained its code. Under ordinary use (land, kick
+// CI, land again, record) that is not a risk, it is what happens.
+say('a checkpoint proves only the work the run actually contained');
+{
+  const d = box('cisha');
+  const git = (...a) => execFileSync('git', ['-c', 'user.email=a@b.c', '-c', 'user.name=a', ...a],
+    { cwd: d, encoding: 'utf8' }).trim();
+  drv(d, ['chip', 't1', '--id', 'c1']);
+  drv(d, ['done', 't1'], { stdin: '{"verified":"ran true","outcome":"passed"}' });
+  fs.writeFileSync(path.join(d, 'src/a.py'), 'what t1 did\n');
+  git('add', '-A'); git('commit', '-qm', 't1');
+  const shaA = git('rev-parse', 'HEAD');
+  drv(d, ['landed', 't1', '--sha', shaA]);
+  drv(d, ['chip', 't2', '--id', 'c2']);
+  drv(d, ['done', 't2'], { stdin: '{"verified":"ran true","outcome":"passed"}' });
+  fs.writeFileSync(path.join(d, 'src/b.py'), 'what t2 did, after CI had started\n');
+  git('add', '-A'); git('commit', '-qm', 't2');
+  drv(d, ['landed', 't2', '--sha', git('rev-parse', 'HEAD')]);
+  // The run tested shaA. t2 landed after it.
+  const out = drv(d, ['ci', '--status', 'green', '--ref', 'run-1', '--sha', shaA]);
+  const cp = (reg(d).checkpoints || []).slice(-1)[0] || {};
+  ok('the checkpoint covers what the run contained', (cp.covers || []).includes('t1'), JSON.stringify(cp.covers));
+  ok('and not what landed after it', !(cp.covers || []).includes('t2'), JSON.stringify(cp.covers));
+  ok('and it says so rather than staying quiet',
+     has(out.out, 'NOT covered') && has(out.out, 't2'), out.out);
+}
+
+// Was: `landed` checked unmet needs and nothing else, so a task could land on
+// top of its own open guard failure — and a clean guard wrote nothing at all, so
+// afterwards there was no way to ask whether one had ever run.
+say('nothing lands over a known break, and a guard leaves a trace');
+{
+  const d = box('landguard');
+  drv(d, ['chip', 't1', '--id', 'c1']);
+  drv(d, ['done', 't1'], { stdin: '{"verified":"ran true","outcome":"passed"}' });
+  drv(d, ['defect', 'add', '--task', 't1', '--kind', 'bug', '--what', 'the suite is red',
+          '--evidence', 'two failures in test_sync']);
+  const blocked = drv(d, ['landed', 't1', '--sha', 'abc']);
+  ok('it refuses while a blocking defect is open',
+     blocked.code !== 0 && has(blocked.out, 'open blocking defect'), blocked.out.split('\n')[0]);
+  ok('and names the defect', has(blocked.out, 'the suite is red'), blocked.out);
+  ok('and t1 did not land', tasksOf(d).find((t) => t.key === 't1')?.status === 'reported');
+  const forced = drv(d, ['landed', 't1', '--sha', 'abc', '--force']);
+  ok('--force lands it deliberately', forced.code === 0);
+  ok('and says no guard was ever recorded', has(forced.out, 'no guard was ever recorded'), forced.out);
+}
+
 // ------------------------------------------------------------- frontier, unproven
 // A landing with no CI checkpoint is reported as unproven drift.
 say('frontier reports landings beyond the last checkpoint');
@@ -2261,7 +2331,7 @@ else console.log('\nsandboxes kept: ' + boxes.join('\n                '));
 // an exception thrown before its first `ok`, a case quietly commented out — and
 // the suite still ends on "all green", because green is only ever measured
 // against however many checks happened to run.
-const EXPECTED = 383;   // every check above counts; raise it deliberately when you add one
+const EXPECTED = 394;   // every check above counts; raise it deliberately when you add one
 
 console.log('\n' + '-'.repeat(60));
 if (pass + failures.length !== EXPECTED)

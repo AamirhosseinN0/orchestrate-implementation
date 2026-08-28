@@ -1000,6 +1000,28 @@ say('bundle suggest names the siblings worth merging');
   ok('bundle suggest proposes a group', has(drv(d, ['bundle', 'suggest']).out, 'one chip'));
 }
 
+// Was: members were stored in whatever order the command line gave, and the
+// brief printed the host first whether or not it was first — so a step could be
+// listed above the step it needs. `bundle suggest` built its suggestion from
+// discovery order too, and so suggested a command line with the same fault.
+say('a bundled brief lists a step after the step it needs');
+{
+  const d = box('bundleorder');
+  drv(d, ['task', 'add'], { stdin: JSON.stringify([
+    { key: 'b1', title: 'the base', plan: 'docs/plans/p.md', needs: [], owns: ['src/x.py'], verify: ['true'] },
+    { key: 'b2', title: 'built on the base', plan: 'docs/plans/p.md', needs: ['b1'], owns: ['src/y.py'], verify: ['true'] },
+  ]) });
+  // --into names which task survives, not which is done first: the host here is
+  // the dependent, and it used to be printed above its own dependency.
+  drv(d, ['bundle', 'b2', 'b1', '--into', 'b2']);
+  drv(d, ['brief', 'b2']);
+  const brief = readIf(path.join(d, '.claude/orchestration/briefs/b2.md'));
+  const first = brief.indexOf('- b1 —'), second = brief.indexOf('- b2 —');
+  ok('both steps are listed', first >= 0 && second >= 0, brief.slice(0, 400));
+  ok('the dependency comes first', first >= 0 && second >= 0 && first < second,
+     'b1 at ' + first + ', b2 at ' + second);
+}
+
 // --------------------------------------------------------------- hook install
 // The SessionStart hook rewrites settings.json; installing twice is a no-op.
 say('hook-install writes a SessionStart hook and is idempotent');
@@ -1363,6 +1385,23 @@ say('frontier reports landings beyond the last checkpoint');
   ok('frontier names the unproven landing', has(drv(d, ['frontier']).out, 'since the last CI checkpoint'));
 }
 
+// Was: `unblocks N` counted every task naming this one in `needs`, whatever its
+// status — so work absorbed by `bundle` (which cancels rather than deletes) kept
+// inflating the count AND the sort that decides what to offer opening next.
+say('unblocks does not count work that has been absorbed');
+{
+  const d = box('unblockdead');
+  drv(d, ['task', 'add'], { stdin: JSON.stringify([
+    { key: 'u1', title: 'the base', plan: 'docs/plans/p.md', needs: [], owns: ['src/u1.py'], verify: ['true'] },
+    { key: 'u2', title: 'needs the base', plan: 'docs/plans/p.md', needs: ['u1'], owns: ['src/u2.py'], verify: ['true'] },
+  ]) });
+  const before = drv(d, ['frontier']).out.split('\n').find((l) => l.trim().startsWith('u1'));
+  ok('u1 unblocks u2 while u2 is live', before && has(before, 'unblocks'), before);
+  drv(d, ['bundle', 'u1', 'u2', '--into', 'u1']);   // u2 is cancelled, absorbed into u1
+  const after = drv(d, ['frontier']).out.split('\n').find((l) => l.trim().startsWith('u1'));
+  ok('and stops once u2 is cancelled', after && !has(after, 'unblocks'), after);
+}
+
 // ------------------------------------------------------------------ whoami here
 // whoami lists the sessions for this directory.
 say('whoami lists the sessions for this directory');
@@ -1437,6 +1476,22 @@ say('board flags both stale briefs and a main-checkout trespass');
   fs.writeFileSync(path.join(d, 'src/a.py'), 'changed\n');
   const out = drv(d, ['board']).out;
   ok('board names the trespass', has(out, 'main checkout has changes') && has(out, 'src/a.py'));
+}
+
+// Was: trespass matched a dirty file against tasks of any status, so every edit
+// to a file after its task had landed was reported as a violation — and the
+// remedy it printed, "let t1 do it in its own copy", named a copy that no
+// longer exists.
+say('a file edited after its task landed is not a trespass');
+{
+  const d = box('trespassdone');
+  drv(d, ['chip', 't1', '--id', 'chip-t1']);
+  drv(d, ['done', 't1'], { stdin: '{"commit":"abc","verified":"ran true; it said true","outcome":"passed"}' });
+  drv(d, ['landed', 't1', '--sha', 'abc']);
+  fs.writeFileSync(path.join(d, 'src/a.py'), 'a later, unrelated change\n');
+  const out = drv(d, ['board']).out;
+  ok('board does not call it a trespass', !has(out, 'main checkout has changes'),
+     out.split('\n').filter((l) => has(l, 'src/a.py')).join(' | '));
 }
 
 // -------------------------------------------------------------- slot run, wait
@@ -1974,7 +2029,7 @@ else console.log('\nsandboxes kept: ' + boxes.join('\n                '));
 // an exception thrown before its first `ok`, a case quietly commented out — and
 // the suite still ends on "all green", because green is only ever measured
 // against however many checks happened to run.
-const EXPECTED = 342;   // every check above counts; raise it deliberately when you add one
+const EXPECTED = 347;   // every check above counts; raise it deliberately when you add one
 
 console.log('\n' + '-'.repeat(60));
 if (pass + failures.length !== EXPECTED)

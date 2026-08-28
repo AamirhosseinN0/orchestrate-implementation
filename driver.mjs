@@ -1760,6 +1760,30 @@ function bundleCandidates(r) {
   return groups;
 }
 
+// A bundle's members are handed to one agent as a list to work through, and the
+// brief prints that list as "do them in this order". The order was whatever the
+// command line happened to say — and `bundle suggest` built its own suggestion
+// from the order tasks were added, which is not dependency order and on a real
+// plan was sometimes exactly backwards. Sort it here, once, so both the stored
+// order and the suggested command line are orders that can actually be worked.
+//
+// Stable: members with no dependency between them keep the order they came in,
+// so a coherent hand-written list is not shuffled for no reason. A cycle cannot
+// be ordered, so what is left over is appended rather than dropped — a bundle
+// that names one is still bundled, and `graph` is where a cycle gets reported.
+function bundleOrder(members) {
+  const mine = new Set(members.map((m) => m.key));
+  const left = [...members];
+  const out = [], done = new Set();
+  while (left.length) {
+    const i = left.findIndex((m) => (m.needs || []).every((n) => !mine.has(n) || done.has(n)));
+    if (i < 0) { out.push(...left); break; }          // cycle — keep them, do not lose them
+    const [m] = left.splice(i, 1);
+    out.push(m); done.add(m.key);
+  }
+  return out;
+}
+
 function cmdBundle(sub, rest, flags) {
   const r = readReg();
   // `bundle a b c --into a` — the first key is not a subcommand
@@ -1771,7 +1795,10 @@ function cmdBundle(sub, rest, flags) {
     console.log('Steps that could be one chip instead of several. Each group shares a plan, so');
     console.log('one agent reads it once instead of every member reading it again.\n');
     for (const g of groups) {
-      const keys = g.members.map((t) => t.key);
+      // Dependency order, not discovery order — this line is copied and run
+      // verbatim, and `bundle` keeps the order it is given as the order the
+      // agent is told to work in.
+      const keys = bundleOrder(g.members).map((t) => t.key);
       const owns = new Set(g.members.flatMap((t) => t.owns || []));
       let planBytes = 0;
       try { planBytes = fs.statSync(path.resolve(CWD, g.plan)).size; } catch { /* gone */ }
@@ -1800,7 +1827,14 @@ function cmdBundle(sub, rest, flags) {
     if (m.chip) die(m.key + ' already has a chip');
   }
   const host = getTask(r, into);
-  const others = members.filter((m) => m.key !== into);
+  // The working order is every member sorted by what each one needs — including
+  // the host, which the brief prints first whether or not it is first. Keep it
+  // whole rather than deriving it at render time: the members are cancelled a
+  // few lines below, and their `needs` are the only surviving record of the
+  // order they had to be done in.
+  const ordered = bundleOrder(members);
+  host.bundleOrder = ordered.map((m) => m.key);
+  const others = ordered.filter((m) => m.key !== into);
   const uniq = (xs) => [...new Set(xs)];
   host.owns = uniq(members.flatMap((m) => m.owns || []));
   host.serialises = uniq(members.flatMap((m) => m.serialises || []));
@@ -1875,7 +1909,12 @@ function cmdBundle(sub, rest, flags) {
 function cmdFrontier() {
   const r = readReg();
   const open = openTasks(r, null);
-  const unblocksOf = (key) => tasks(r).filter((x) => (x.needs || []).includes(key)).length;
+  // Work that has landed or been cancelled is not unblocked by anything — it is
+  // over. Counting it inflated the number printed beside each candidate AND the
+  // sort that decides what to offer first, so a task whose every dependent had
+  // been absorbed by `bundle` still read as the one to open next.
+  const unblocksOf = (key) => tasks(r).filter((x) =>
+    !DEAD_STATUS.includes(x.status) && (x.needs || []).includes(key)).length;
   const cands = tasks(r)
     .filter((t) => t.status === 'planned' && !t.chip && heldNeeds(r, t).length === 0)
     .sort((a, b) => unblocksOf(b.key) - unblocksOf(a.key) || (a.key < b.key ? -1 : 1));
@@ -2061,8 +2100,15 @@ function cmdBrief(key, flags) {
     B.push('rather than once per step. Do them in this order, and say which you finished if you');
     B.push('cannot finish them all:');
     B.push('');
-    B.push('- ' + t.key + ' — ' + String(t.title).replace(/ \(\+ [^)]*\)$/, ''));
-    for (const b of t.bundled) B.push('- ' + b.key + ' — ' + b.title);
+    // The host is not necessarily the first step — `--into` picks which task
+    // survives, not which one is done first. Printing it at the top regardless
+    // put a step before its own dependency. Use the recorded order when there
+    // is one; older bundles have none, and fall back to what they had.
+    const titles = new Map([[t.key, String(t.title).replace(/ \(\+ [^)]*\)$/, '')],
+      ...t.bundled.map((b) => [b.key, b.title])]);
+    const seq = (t.bundleOrder || []).length ? t.bundleOrder
+      : [t.key, ...t.bundled.map((b) => b.key)];
+    for (const k of seq) if (titles.has(k)) B.push('- ' + k + ' — ' + titles.get(k));
     B.push('');
   }
   if (t.plan) {
@@ -3488,7 +3534,13 @@ function trespass(r) {
       if (p) dirty.push(p);
       if (/[RC]/.test(xy)) { const src = (parts[++i] || '').trim(); if (src) dirty.push(src); }
     }
+    // Only work that is still out there can be trespassed on. A landed task has
+    // no copy of the repository any more, so `board` telling you to undo your
+    // change and "let it do it in its own copy" named something that does not
+    // exist — and every ordinary edit to a file after its task landed read as a
+    // violation.
     for (const f of dirty) for (const t of tasks(r)) {
+      if (DEAD_STATUS.includes(t.status)) continue;
       if ((t.owns || []).some((o) => collides(f, o))) out.push({ file: f, key: t.key });
     }
   } catch { /* not a git repo, or git unavailable — skip */ }

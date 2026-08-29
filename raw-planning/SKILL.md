@@ -1,6 +1,6 @@
 ---
 name: raw-planning
-description: Turn an idea that is still in someone's head into a written plan, by asking instead of guessing. Ask what the project is called and what it is, then work through plain questions — who it is for, what it must do, what it must never do — a few at a time. When the user wants to see how other people already built this, search GitHub and the wider web, bring back real projects with what each one gives and costs, and fold the chosen one's details in. Every question is typed in the chat and answered in the user's own words, never as a menu of options, and when something genuinely cannot be known from the room — what people build this with today, what the ones who tried it regret — a Sonnet agent goes and searches, sparingly, never for what the user could simply be asked. Everything the user mentions is written down the same round, even the parts there was no room to ask about, so nothing is lost between rounds. Only if the user asks for it does a last section propose what to build it in — language, what holds the data, what to lean on — reasoned from the plan and from a fresh search, never from memory. It all lands in one raw_plan_<name>_01.md that is rewritten at the end of every round, and it keeps going round after round until the user says that is enough. Use when asked to start a raw plan, do raw planning, plan a new project from nothing, scope an idea before any code is written, or write down what to build before deciding how to build it.
+description: Turn an idea that is still in someone's head into a written plan, by asking instead of guessing. Ask what the project is called and what it is, then work through plain questions — who it is for, what it must do, what it must never do — a few at a time. When the user wants to see how other people already built this, search GitHub and the wider web, bring back real projects with what each one gives and costs, and fold the chosen one's details in. Every question is typed in the chat and answered in the user's own words, never as a menu of options, and when something genuinely cannot be known from the room — what people build this with today, what the ones who tried it regret — a Sonnet agent goes and searches, sparingly, never for what the user could simply be asked. Everything the user mentions is written down the same round, even the parts there was no room to ask about, so nothing is lost between rounds. Questions whose answers already follow from what the user said are not asked again — they are answered, marked as the model's reading rather than the user's, and handed back to be corrected; questions that need a search are held until it lands and then put to the user as a proposed answer. Only if the user asks for it does a last section propose what to build it in — language, what holds the data, what to lean on — reasoned from the plan and from a fresh search, never from memory. It all lands in one raw_plan_<name>_01.md that is rewritten at the end of every round, and it keeps going round after round until the user says that is enough. Use when asked to start a raw plan, do raw planning, plan a new project from nothing, scope an idea before any code is written, or write down what to build before deciding how to build it.
 ---
 
 The user has an idea and nothing written down. This turns it into one file, by
@@ -18,8 +18,11 @@ file is the work; the conversation is how it gets filled in.
 - **One exception, at the very end.** Section 13 holds the technology — the
   language, what holds the data, what gets leaned on — and it stays empty
   unless the user asks for it. Nothing from it leaks into sections 1 to 12.
-- **Not a guess.** If the user has not said it, it goes in **Still open** — it
-  does not get filled in with something sensible.
+- **Not a guess.** Nothing is filled in with whatever sounds sensible. There is
+  one narrow exception and it is not a guess: where an answer *follows* from
+  what the user already said, it is written down as **yours**, shown to them,
+  and stays marked as yours until they say otherwise. See **Questions you
+  should not ask** below.
 - **Nothing to install.** No driver, no register, no worktrees. A conversation,
   a file, and a search when nobody in the room knows the answer.
 
@@ -83,10 +86,15 @@ Projects looked at, what each one gives, what it costs, whether it is being
 taken from. Empty until somebody searches.
 
 ## 8. Decided
-| What was asked | What the user chose | Why | Round |
+| What was asked | The answer | Whose | Why | Round |
+
+**Whose** is `theirs` when they said it, and `mine` when it was taken from
+something they said and they have not corrected it. `mine` never quietly
+becomes `theirs`.
 
 ## 9. Still open
 Numbered questions nobody has answered yet. The next round comes from here.
+One marked `waiting on a search` is not asked until the answer is back.
 
 ## 10. What "finished" looks like
 How the user will know it works. Not tests — the plain version.
@@ -267,6 +275,93 @@ short line what moved.
 
 Then say, in two or three lines in the chat, what is now settled and what is
 open. The user should never have to open the file to know where they are.
+
+---
+
+## Questions you should not ask
+
+By round four the questions start to rhyme, and some of them are ones the user
+could not answer if they tried. Both are the same failure: asking blank when
+there was already something to put in front of them.
+
+Three kinds never get asked as an open question.
+
+### The ones you can already tell
+
+Sometimes the answer is sitting in what they already said. Ask it again and it
+reads as not having listened — which is what makes the fourth round feel like
+the second.
+
+It is a **read** when one of these holds:
+
+- they answered it earlier, in different words, about something else
+- it follows necessarily from a decision they made — they said it is just for
+  them on their own phone, so "can two people share a list" is answered
+- it is a detail of something they described, and any other answer would
+  contradict what they said
+
+It is a **guess**, and does not qualify, when the honest reason is "most things
+like this work that way". A sensible default is a guess with better manners.
+
+Do not ask it. **Answer it, and hand them the answer to check:**
+
+```
+Two I think you've already answered — tell me if I have either wrong:
+  • Nobody signs in. You said it is just for you, on your own phone.
+  • A list cannot be shared, for the same reason.
+```
+
+One line each, and **always with the thing it came from**, so they can check
+the reasoning and not just the conclusion. A paragraph invites agreement; a
+line invites checking.
+
+It goes into **Decided** that same round marked `mine`. If they say nothing, it
+stays `mine` — silence does not promote it, and it does not hold the plan up
+either.
+
+If a round has more reads in it than questions, you have stopped asking and
+started drafting. That is the signal to change the subject, or that the plan is
+close to done.
+
+### The ones waiting on a search
+
+Some questions the user genuinely cannot answer yet — what these usually cost,
+what everybody who built one hit, whether the thing they want is even allowed.
+Asked now, they get back "I don't know, what do you think?", which spends a
+question and gets nothing.
+
+**Hold them.** They sit in **Still open** marked `waiting on a search`, and
+they do not take a slot in the round. Ask the round's questions from what is
+answerable now.
+
+When the report comes back, the question does not go out as a question either.
+It goes out as an answer, with what it rests on:
+
+```
+That thing about people losing work when two of them edit at once — I looked
+it up. Every one of these ends up needing a way to get the old version back,
+and the ones that skipped it added it later in a hurry. I have written it in
+as something it must do. Does that fit, or would you rather leave it out?
+```
+
+They agree → **Decided**, `theirs`. They change it → **Decided**, `theirs`, in
+their version. They say nothing → **Decided**, `mine`, and it shows up again at
+the stop.
+
+If the search comes back with nothing, the question stops waiting and goes back
+into the ordinary run — asked plainly, with "nobody seems to have a settled
+answer to this" said out loud.
+
+### The ones already asked
+
+Before a question goes out, read the file. If it is a rewording of something in
+**Decided**, it is a read, not a question. If it is already in **Still open**
+word for word, it was not answered last time and asking it identically will not
+help — ask the smaller version of it, or hold it.
+
+And if a whole round's questions sit in the same territory as the last one, the
+seam is worked out. Move to a different row of the question table, or notice
+that the plan may be near its stop.
 
 ---
 
@@ -645,7 +740,10 @@ one after round nine — not a draft waiting to become one.
 5. Say in the chat, in a few lines: where the file is, what got settled, and
    what is still open — named, not counted. They are stopping; they should know
    what they are stopping on.
-6. Then offer the next step, once: turning this into a real implementation plan
+6. **Read out everything still marked `mine`.** Those are the answers taken
+   from what they said and never corrected. They are the most likely thing in
+   the file to be wrong, and this is the last moment anybody looks at them.
+7. Then offer the next step, once: turning this into a real implementation plan
    — the kind with stages, files and checks — which is what
    `orchestrate-implementation` needs before it can build anything. Offer it
    once. If they are done, they are done.

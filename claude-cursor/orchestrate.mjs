@@ -499,7 +499,12 @@ CMDS.run = (argv) => {
     commit(s, 'run open', argv);
     ok(`${key} is open on ${row.shown}`);
     console.log(`  worktree  ${t.worktree}\n  branch    ${t.branch}\n  chat      ${t.chat}\n  brief     ${t.briefFile}`);
-    console.log(`\nLaunch it in the background:\n  bash ${path.relative(CWD, path.join(HERE, 'scripts', 'run.sh'))} \\\n    --role chip --tier ${t.tier} --key ${key} --workspace ${t.worktree} \\\n    --chat ${t.chat} --prompt-file ${t.briefFile}`);
+    // The shorter of the two spellings. A skill installed far from the project
+    // relativises to a ../../../.. chain nobody can read or check.
+    const rel = path.relative(CWD, path.join(HERE, 'scripts', 'run.sh'));
+    const abs = path.join(HERE, 'scripts', 'run.sh');
+    const runner = rel.length < abs.length && !rel.startsWith('../..') ? rel : abs;
+    console.log(`\nLaunch it in the background:\n  bash ${runner} \\\n    --role chip --tier ${t.tier} --key ${key} --workspace ${t.worktree} \\\n    --chat ${t.chat} --prompt-file ${t.briefFile}`);
     return;
   }
 

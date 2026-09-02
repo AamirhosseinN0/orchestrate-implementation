@@ -2544,6 +2544,228 @@ say('verify is green on a recorded run nobody made up');
   ok('and says it could not check', has(r4.out, 'could not check'), r4.out);
 }
 
+// ------------------------------------------- the cursor launcher, role by role
+// These drive claude-cursor/scripts/*.sh against a stub `agent` on PATH, so the
+// guards are exercised without a login, a network call or a billed run. Every
+// case here guards a specific defect: the launcher used to verify the model only
+// when it matched one hard-coded pin, which meant pointing pre-flight at a
+// second model silently switched the check off.
+{
+  say('the cursor launcher, role by role');
+  const SK = path.join(path.dirname(fileURLToPath(import.meta.url)), 'claude-cursor', 'scripts');
+  const d = bare('cursor');
+  const stubDir = path.join(d, 'stub');
+  const REC = path.join(d, 'received.txt');
+  fs.mkdirSync(stubDir, { recursive: true });
+
+  // Stands in for `agent`. Records what it was handed, then prints whichever
+  // shape of stream the case under test needs.
+  fs.writeFileSync(path.join(stubDir, 'agent'), [
+    '#!/usr/bin/env bash',
+    'printf "%s\\n" "$@" > "$STUB_REC"',
+    'M=${STUB_SHOWN:-Cursor Grok 4.6 Extra High}',
+    'INIT="{\\"type\\":\\"system\\",\\"subtype\\":\\"init\\",\\"model\\":\\"$M\\"}"',
+    'case "${STUB_MODE:-normal}" in',
+    '  noinit)    echo "{\\"type\\":\\"thinking\\",\\"subtype\\":\\"delta\\"}" ;;',
+    '  latemodel) echo "warning: a line before the init event"; echo "$INIT";',
+    '             echo "{\\"type\\":\\"result\\",\\"result\\":\\"done\\"}" ;;',
+    '  errortail) echo "$INIT"; echo "NonRetriableError: Agent Looping Detected" ;;',
+    '  iserror)   echo "$INIT"; echo "{\\"type\\":\\"result\\",\\"is_error\\":true,\\"result\\":\\"boom\\"}" ;;',
+    '  *)         echo "$INIT"; echo "{\\"type\\":\\"result\\",\\"result\\":\\"done\\"}" ;;',
+    'esac',
+  ].join('\n') + '\n', { mode: 0o755 });
+
+  const PROMPT = path.join(d, 'prompt.txt');
+  fs.writeFileSync(PROMPT, 'do the work\n');
+
+  // Runs cursor-run.sh with the stub ahead of everything on PATH.
+  function run(args, env = {}) {
+    try {
+      const out = execFileSync('bash', [path.join(SK, 'cursor-run.sh'), ...args], {
+        cwd: d, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'],
+        env: { ...process.env, PATH: stubDir + path.delimiter + process.env.PATH,
+               STUB_REC: REC, CURSOR_ORCH_LOG_DIR: path.join(d, 'logs'), ...env },
+      });
+      return { code: 0, out };
+    } catch (e) {
+      return { code: e.status === undefined ? -1 : e.status, out: String(e.stdout || '') + String(e.stderr || '') };
+    }
+  }
+  const sent = () => readIf(REC);
+  const base = (...a) => ['--key', 'k', '--workspace', '.', '--prompt-file', PROMPT, ...a];
+
+  // --- the role is mandatory, because it selects the check ---
+  const noRole = run(['--key', 'k', '--workspace', '.', '--prompt-file', PROMPT]);
+  ok('a run without --role is refused', noRole.code === 2, noRole.out);
+  ok('and says which roles exist', has(noRole.out, 'refine'), noRole.out);
+  const badRole = run(base('--role', 'builder'));
+  ok('an unknown role is refused', badRole.code === 2, badRole.out);
+
+  // --- each role launches on its own model ---
+  const refine = run(base('--role', 'refine'));
+  ok('refine runs', refine.code === 0, refine.out);
+  ok('refine asks for grok 4.6 xhigh', has(sent(), 'cursor-grok-4.6-xhigh'), sent());
+
+  const chip = run(base('--role', 'chip'));
+  ok('chip runs', chip.code === 0, chip.out);
+  ok('chip asks for grok 4.6 xhigh', has(sent(), 'cursor-grok-4.6-xhigh'), sent());
+
+  const pre = run(base('--role', 'preflight'), { STUB_SHOWN: 'Composer 2.5' });
+  ok('preflight runs', pre.code === 0, pre.out);
+  ok('preflight asks for composer 2.5', has(sent(), 'composer-2.5'), sent());
+  ok('and does not ask for grok', !has(sent(), 'grok'), sent());
+
+  // Pre-flight on Composer must still be checked. Before the role table the
+  // comparison was gated on a single pinned name, so this run reported a model
+  // nobody asked for and exited 0.
+  const preWrong = run(base('--role', 'preflight'), { STUB_SHOWN: 'Cursor Grok 4.6 Extra High' });
+  ok('preflight refuses a model that is not composer', preWrong.code === 1, preWrong.out);
+  ok('and names what it expected', has(preWrong.out, 'Composer 2.5'), preWrong.out);
+
+  // --- the fast tier, by flag and by environment ---
+  const fastFlag = run(base('--role', 'chip', '--model', 'cursor-grok-4.6-xhigh-fast'));
+  ok('a -fast model on the flag is refused', fastFlag.code === 2, fastFlag.out);
+  ok('and refused for being fast, not for anything else', has(fastFlag.out, 'non-fast'), fastFlag.out);
+  const fastEnv = run(base('--role', 'chip'), { CURSOR_ORCH_MODEL: 'composer-2.5-fast' });
+  ok('a -fast model in the environment is refused', fastEnv.code === 2, fastEnv.out);
+
+  // --- an override may not switch the check off (the N1 regression) ---
+  const bareOverride = run(base('--role', 'chip', '--model', 'composer-2.5'));
+  ok('an override without --model-shown is refused', bareOverride.code === 2, bareOverride.out);
+  ok('and says why it will not run unverified', has(bareOverride.out, '--model-shown'), bareOverride.out);
+  const envOverride = run(base('--role', 'chip'), { CURSOR_ORCH_MODEL: 'composer-2.5' });
+  ok('the same override through the environment is refused', envOverride.code === 2, envOverride.out);
+  const named = run(base('--role', 'chip', '--model', 'composer-2.5', '--model-shown', 'Composer 2.5'),
+    { STUB_SHOWN: 'Composer 2.5' });
+  ok('an override that says what to expect runs', named.code === 0, named.out);
+  const namedWrong = run(base('--role', 'chip', '--model', 'composer-2.5', '--model-shown', 'Composer 2.5'),
+    { STUB_SHOWN: 'Composer 2.5 Fast' });
+  ok('and is still checked against the name it gave', namedWrong.code === 1, namedWrong.out);
+
+  // --- the effort-drop and fast-tier guards on the way back ---
+  const dropped = run(base('--role', 'chip'), { STUB_SHOWN: 'Cursor Grok 4.6' });
+  ok('a dropped effort suffix stops the run', dropped.code === 1, dropped.out);
+  const ranFast = run(base('--role', 'chip'), { STUB_SHOWN: 'Cursor Grok 4.6 Extra High Fast' });
+  ok('a run that came back on the fast tier stops', ranFast.code === 1, ranFast.out);
+  ok('and says so plainly', has(ranFast.out, 'fast tier'), ranFast.out);
+
+  // --- reading the model off a line that is not the first ---
+  const late = run(base('--role', 'chip'), { STUB_MODE: 'latemodel' });
+  ok('an init event behind a warning is still read', late.code === 0, late.out);
+  ok('and the model is reported', has(late.out, 'Cursor Grok 4.6 Extra High'), late.out);
+
+  // --- streams that stop outside the protocol ---
+  const noInit = run(base('--role', 'chip'), { STUB_MODE: 'noinit' });
+  ok('a stream with no init event fails', noInit.code === 1, noInit.out);
+  ok('and says the run never started', has(noInit.out, 'never started'), noInit.out);
+  const tail = run(base('--role', 'chip'), { STUB_MODE: 'errortail' });
+  ok('a stream ending in a bare error line fails', tail.code === 1, tail.out);
+  ok('and quotes that line rather than only naming the log',
+    has(tail.out, 'NonRetriableError'), tail.out);
+  const isErr = run(base('--role', 'chip'), { STUB_MODE: 'iserror' });
+  ok('a result marked is_error fails', isErr.code === 1, isErr.out);
+
+  // --- the runtime instruction is injected only when asked for ---
+  const plain = run(base('--role', 'chip'));
+  ok('nothing is prepended when no runtime is pinned', !has(sent(), 'export PATH'), sent());
+  ok('and the prompt still arrives', has(sent(), 'do the work'), sent());
+  const pinned = run(base('--role', 'chip', '--node-bin', '/opt/node/bin'));
+  ok('a pinned runtime is prepended to the prompt', has(sent(), 'export PATH="/opt/node/bin:$PATH"'), sent());
+  ok('and the brief is still there under it', has(sent(), 'do the work'), sent());
+  const pinnedEnv = run(base('--role', 'chip'), { CURSOR_ORCH_NODE_BIN: '/opt/node/bin' });
+  ok('the environment pins it too', has(sent(), '/opt/node/bin'), sent());
+  ok('the run itself is unaffected', pinnedEnv.code === 0 && plain.code === 0 && pinned.code === 0);
+
+  // ---------------------------------------------------- reading the answer back
+  const LOGS = path.join(d, 'logs');
+  function result(args) {
+    try {
+      const out = execFileSync('bash', [path.join(SK, 'cursor-result.sh'), ...args], {
+        cwd: d, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'],
+        env: { ...process.env, CURSOR_ORCH_LOG_DIR: LOGS },
+      });
+      return { code: 0, out };
+    } catch (e) {
+      return { code: e.status === undefined ? -1 : e.status, out: String(e.stdout || '') + String(e.stderr || '') };
+    }
+  }
+  const writeLog = (name, lines) => {
+    fs.mkdirSync(LOGS, { recursive: true });
+    fs.writeFileSync(path.join(LOGS, name + '.jsonl'), lines.join('\n') + '\n');
+  };
+  const INIT = '{"type":"system","subtype":"init","model":"Cursor Grok 4.6 Extra High"}';
+
+  writeLog('good', [INIT, '{"type":"result","result":"first answer"}',
+    '{"type":"result","result":"second answer"}']);
+  const all = result(['good']);
+  ok('a key resolves against the log directory', all.code === 0, all.out);
+  ok('every result is printed', has(all.out, 'first answer') && has(all.out, 'second answer'), all.out);
+  const last = result(['--last', 'good']);
+  ok('--last prints only the final one', has(last.out, 'second answer') && !has(last.out, 'first answer'), last.out);
+  const byPath = result([path.join(LOGS, 'good.jsonl')]);
+  ok('a path works as well as a key', byPath.code === 0 && has(byPath.out, 'first answer'), byPath.out);
+
+  // A run killed outside the protocol has no result line at all. A parser that
+  // only looks for one reports silence, and a dead run reads as a quiet one.
+  writeLog('killed', [INIT, '{"type":"thinking","subtype":"delta"}',
+    'NonRetriableError: Agent Looping Detected']);
+  const killed = result(['killed']);
+  ok('a stream with no result line fails', killed.code === 1, killed.out);
+  ok('and the bare error line is surfaced', has(killed.out, 'NonRetriableError'), killed.out);
+
+  writeLog('boom', [INIT, '{"type":"result","is_error":true,"result":"it broke"}']);
+  const boom = result(['boom']);
+  ok('a result marked is_error exits non-zero', boom.code === 1, boom.out);
+  ok('and still prints what it said', has(boom.out, 'it broke'), boom.out);
+
+  // The shell output is wrapped in a success branch under the call's result.
+  writeLog('tools', [INIT,
+    '{"type":"tool_call","subtype":"completed","tool_call":{"shellToolCall":{"args":{"command":"echo hi"},' +
+      '"result":{"success":{"stdout":"hi there\\n","stderr":"","exitCode":0}}}}}',
+    '{"type":"result","result":"done"}']);
+  const tools = result(['--tool-output', 'tools']);
+  ok('--tool-output finds the shell output', tools.code === 0 && has(tools.out, 'hi there'), tools.out);
+  ok('and shows the command that produced it', has(tools.out, 'echo hi'), tools.out);
+  ok('and its exit code', has(tools.out, '[exit 0]'), tools.out);
+  const noTools = result(['--tool-output', 'good']);
+  ok('--tool-output on a run with no shell calls fails', noTools.code === 1, noTools.out);
+
+  const missing = result(['nowhere']);
+  ok('a key with no log behind it is refused', missing.code === 2, missing.out);
+
+  // ------------------------------------------------------------ the chat address
+  function chat(stub) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'orch-chat-'));
+    boxes.push(dir);
+    fs.writeFileSync(path.join(dir, 'agent'), '#!/usr/bin/env bash\n' + stub + '\n', { mode: 0o755 });
+    try {
+      const out = execFileSync('bash', [path.join(SK, 'cursor-chat.sh')], {
+        cwd: dir, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'],
+        env: { ...process.env, PATH: dir + path.delimiter + process.env.PATH },
+      });
+      return { code: 0, out };
+    } catch (e) {
+      return { code: e.status === undefined ? -1 : e.status, out: String(e.stdout || '') + String(e.stderr || '') };
+    }
+  }
+  const UUID = '78ebef49-44a5-4b5c-816f-afa07ff9613f';
+  const plainUuid = chat('printf "' + UUID + '"');
+  ok('a bare uuid comes back', plainUuid.code === 0 && has(plainUuid.out, UUID), plainUuid.out);
+  ok('and nothing else rides along', plainUuid.out.trim() === UUID, JSON.stringify(plainUuid.out));
+
+  // The failure this guards does not surface here — it surfaces much later, as
+  // --resume quietly opening a new chat against an address that is not one.
+  const bannered = chat('echo "Update available: 2026.09.01"; printf "' + UUID + '\\n"');
+  ok('a banner ahead of the uuid is dropped', bannered.code === 0, bannered.out);
+  ok('and the address is just the uuid', bannered.out.trim() === UUID, JSON.stringify(bannered.out));
+  const trailing = chat('printf "' + UUID + '\\n"; echo "note: something"');
+  ok('a banner after the uuid is dropped too', trailing.out.trim() === UUID, JSON.stringify(trailing.out));
+
+  const noUuid = chat('echo "could not reach the server"');
+  ok('no uuid at all is refused', noUuid.code === 1, noUuid.out);
+  ok('rather than handing out an address that is not one', has(noUuid.out, 'no uuid'), noUuid.out);
+}
+
 // ---------------------------------------------------------------------- report
 if (!KEEP) for (const d of boxes) { try { fs.rmSync(d, { recursive: true, force: true }); } catch { /* gone */ } }
 else console.log('\nsandboxes kept: ' + boxes.join('\n                '));
@@ -2552,7 +2774,7 @@ else console.log('\nsandboxes kept: ' + boxes.join('\n                '));
 // an exception thrown before its first `ok`, a case quietly commented out — and
 // the suite still ends on "all green", because green is only ever measured
 // against however many checks happened to run.
-const EXPECTED = 431;   // every check above counts; raise it deliberately when you add one
+const EXPECTED = 487;   // every check above counts; raise it deliberately when you add one
 
 console.log('\n' + '-'.repeat(60));
 if (pass + failures.length !== EXPECTED)

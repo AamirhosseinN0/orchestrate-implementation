@@ -24,6 +24,7 @@ import { spawnSync } from 'node:child_process';
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.dirname(HERE);
 const DRIVER = path.join(ROOT, 'driver.mjs');
+const ORCH = path.join(ROOT, 'claude-cursor', 'orchestrate.mjs');
 const TEST = path.join(ROOT, 'test.mjs');
 
 const argv = process.argv.slice(2);
@@ -143,19 +144,28 @@ async function main() {
   const isDriver = (u) => u.includes('driver.mjs');
   const isTest = (u) => u.includes('test.mjs');
 
+  const isOrch = (u) => u.includes('orchestrate.mjs');
   const driverFns = stat(fns, isDriver);
   const driverBlocks = stat(blocks, isDriver);
+  const orchFns = stat(fns, isOrch);
   const testFns = stat(fns, isTest);
 
   console.log(`\ncoverage dumps merged: ${files}`);
   console.log(`DRIVER   functions: ${driverFns.hit}/${driverFns.total} (${(driverFns.pct ?? 0).toFixed(1)}%)`);
   console.log(`DRIVER   blocks:    ${driverBlocks.hit}/${driverBlocks.total} (${(driverBlocks.pct ?? 0).toFixed(1)}%)`);
+  console.log(`ORCH     functions: ${orchFns.hit}/${orchFns.total} (${(orchFns.pct ?? 0).toFixed(1)}%)`);
   console.log(`TEST     functions: ${testFns.hit}/${testFns.total} (${(testFns.pct ?? 0).toFixed(1)}%)`);
 
   {
     const src = fs.existsSync(DRIVER) ? fs.readFileSync(DRIVER, 'utf8') : '';
     const misses = driverFns.miss.slice().sort((a, b) => a.start - b.start);
     console.log(`\n--- ${misses.length} uncovered driver functions ---`);
+    for (const m of misses) console.log(`  L${offsetToLine(src, m.start)}  ${m.fnName}`);
+  }
+  {
+    const src = fs.existsSync(ORCH) ? fs.readFileSync(ORCH, 'utf8') : '';
+    const misses = orchFns.miss.slice().sort((a, b) => a.start - b.start);
+    console.log(`\n--- ${misses.length} uncovered orchestrate functions ---`);
     for (const m of misses) console.log(`  L${offsetToLine(src, m.start)}  ${m.fnName}`);
   }
 
@@ -180,9 +190,17 @@ async function main() {
   // behind 137 MB. Clear it once the numbers are out of it.
   const sweep = () => { if (ownedDir) try { fs.rmSync(ownedDir, { recursive: true, force: true }); } catch { /* gone */ } };
   process.on('exit', sweep);
+  // The backend of the cursor skill gets its own floor, spaced under its real
+  // number the same way. Two files, two gates: a regression in one must not be
+  // masked by the other being large and well covered.
+  const ORCH_THRESHOLD = Number(process.env.ORCHESTRATE_ORCH_COV_THRESHOLD ?? 85);
   const pct = driverFns.pct ?? 0;
-  const coverOk = pct >= threshold;
-  console.log(`\nthreshold: ${threshold}% driver-function coverage -> ${coverOk ? 'PASS' : 'BELOW'}`);
+  const orchPct = orchFns.total ? (orchFns.pct ?? 0) : 100;
+  const driverOk = pct >= threshold;
+  const orchOk = orchPct >= ORCH_THRESHOLD;
+  const coverOk = driverOk && orchOk;
+  console.log(`\nthreshold: ${threshold}% driver-function coverage -> ${driverOk ? 'PASS' : 'BELOW'}`);
+  console.log(`threshold: ${ORCH_THRESHOLD}% orchestrate-function coverage -> ${orchOk ? 'PASS' : 'BELOW'}`);
 
   if (!passed) {
     console.log('\nSWEEP: FAILED (test.mjs exited non-zero)');

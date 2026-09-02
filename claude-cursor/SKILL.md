@@ -129,17 +129,65 @@ Then write the preamble below plus that path to a file and launch it in the
 $RUN --role chip --stream --key "$KEY" --workspace "$WT" --chat "$CID" --prompt-file /tmp/chip-$KEY.txt
 ```
 
-**Open every chip the parent's interference rule allows, in one round** — up to
-twelve in flight. Same file or same serialisation point means one waits; nothing
-about the runner itself is a reason to hold a chip back.
+### One task per chip, and never two
+
+**A chip is one task, in one worktree, on one chat. Never give one agent two
+task keys.** It reads like a saving — one run instead of three, one prompt to
+write — and it is the most expensive mistake available here, because four things
+downstream are keyed to the assumption and none of them complains when it breaks:
+
+- **The chat uuid is one task's address.** `chip --id "$CID"` binds that chat to
+  that key. Put two keys on one chat and a send-back for 2.1 arrives at an agent
+  midway through 2.2, while the register still lists that same chat as 2.2's
+  address. Neither task can be spoken to alone again.
+- **The branch is the unit of merge.** Two tasks committing onto one branch
+  cannot be judged apart: `guard` passes or fails the pair, and `join` lands both
+  or neither. One task failing verification takes a finished one down with it.
+- **`done` reports one key.** A stacked agent files one report and the other task
+  sits `waiting` forever, or files two from one context and the second describes
+  work the first already claimed.
+- **It converts parallel work into serial work.** Two tasks in one agent run one
+  after the other inside a single run; two chips run at the same time. Stacking
+  is slower than the thing it looks like an optimisation of — and one agent that
+  loops or dies now takes both tasks with it instead of one.
+
+If two tasks genuinely cannot be separated — they are the same edit — that is one
+task and the register should say so. Merge them with `task add`, do not merge them
+in the prompt.
+
+### Spawn them together
+
+**Open every chip the parent's interference rule allows in the same round**, up
+to twelve in flight. Same file or same serialisation point means one waits;
+nothing about the runner itself is a reason to hold a chip back, and starting
+them one at a time spends the round's wall-clock for nothing.
+
+Each chip is its own `Bash` call with `run_in_background: true` — that is what
+makes them concurrent and what wakes you as each finishes. Set every one of them
+up first, then launch:
+
+```bash
+# once per key: worktree, chat, register, brief
+for KEY in 2.1 2.2 2.3; do
+  BR=step/$KEY; WT=$(realpath ../wt-$KEY)
+  git worktree add "$WT" -b "$BR"
+  CID=$($NEWCHAT)                             # a fresh chat per chip, never reused
+  node $DRV chip  "$KEY" --id "$CID" --worktree "$WT" --branch "$BR"
+  node $DRV agent "$KEY" --name "$CID" --force
+  printf '%s\n' "$CID" > /tmp/cid-$KEY        # the address, for the send-back
+done
+```
+
+Then one backgrounded `Bash` call per key — separate calls, so they are actually
+concurrent rather than a loop that waits on each in turn.
 
 Gate order is the parent's, unchanged: `graph` green → `preflight check` →
 `doctor` → chips.
 
 ### The chip preamble
 
-The brief is written for a Claude Code session. Three lines put that right; the
-brief file itself is never edited.
+The brief is written for a Claude Code session. Five numbered points put that
+right; the brief file itself is never edited.
 
 ```
 You are a Cursor CLI subprocess, not a Claude Code session.
@@ -151,7 +199,10 @@ You are a Cursor CLI subprocess, not a Claude Code session.
 3. At the end, still run the `driver.mjs ... done` command exactly as the
    brief writes it — that is the report that survives. Print the message it
    asks you to send as your final output instead of sending it.
-4. Bare `node` here is the login profile's default, not this project's pinned
+4. This brief is the whole of your work. You own one task and one worktree —
+   do not pick up another task's files, and do not do work a different brief
+   describes, however small it looks from here.
+5. Bare `node` here is the login profile's default, not this project's pinned
    runtime. If the project pins one, every command that depends on it must
    start `export PATH="<dir>:$PATH";` — per command, since an export in one
    shell call does not reach the next.
@@ -257,6 +308,11 @@ same signal a growing log is, only visible without asking for it.
   write-access indicator. Confirm writes by artifact — the file, or `git diff`.
 - **Omitting `--resume` silently opens a new chat**, losing the address for that
   task. Always pass `--chat`.
+
+- **A chat is never shared between chips.** One `$NEWCHAT` per key, every time.
+  Reusing an address is the same defect as stacking two tasks into one chip, and
+  it arrives quietly: the second chip resumes into the first one's conversation,
+  inherits its context, and both answer to the same uuid.
 - **Effort is a suffix on the model id**, not a flag — which is why the chip
   and refine name ends `-xhigh`. `--effort` does not exist and will error.
   `-fast` is a separate speed tier stacked on top of effort, so `-xhigh-fast` is

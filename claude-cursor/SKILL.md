@@ -1,6 +1,6 @@
 ---
 name: claude-cursor
-description: Run an implementation end to end in five stages — load the plans, judge how hard each step is and pick a model for it, refine away the ambiguity, check that nothing collides, then run every step that can run at once. Every step that can run without colliding with another is launched in the same round on its own agent; interference — a shared file, a shared serialisation point, an unlanded dependency — is the only permitted reason to hold one back. Agents execute on the Cursor CLI (`agent`) or as Claude Code subagents. Use when asked to orchestrate a plan, run an implementation, hand the building work to Cursor agents, run steps in parallel, drive work in parallel worktrees, pick models per step, or take a written plan through to merged code.
+description: Run an implementation end to end in five stages — load the plans, judge how hard each step is and pick a model for it, refine away the ambiguity, check that nothing collides, then run every step that can run at once. Every step that can run is launched in the same round on its own agent; only an unlanded dependency or a serialisation point that open work is already moving holds one back. Two steps owning the same file run together and reconcile at the merge, because each builds in its own worktree. Agents execute on the Cursor CLI (`agent`) or as Claude Code subagents. Use when asked to orchestrate a plan, run an implementation, hand the building work to Cursor agents, run steps in parallel, drive work in parallel worktrees, pick models per step, or take a written plan through to merged code.
 allowed-tools: Bash, Read, Write, Edit, Grep, Glob, AskUserQuestion, TodoWrite
 ---
 
@@ -25,31 +25,36 @@ a projection of it, so nothing is lost if a session ends mid-build.
 
 ## The rule: run everything that can run at once
 
-**Every step that can run without colliding with another must be launched in the
-same round, on its own agent. Interference is the only permitted reason to hold
-one back.**
+**Every step that can run must be launched in the same round, on its own agent.
+Only two things hold a step back: a dependency that has not landed, and a
+serialisation point that open work is already moving.**
 
 Not caution about the runner, not tidiness, not "let me see how the first one
 goes", not the size of the round. If `check` names five steps, five agents start
 now — five separate backgrounded `Bash` calls, in one message.
 
-Two steps interfere when:
+**Two steps owning the same file is not a reason to wait.** Each builds in its
+own worktree, on its own copy of the repository, so two agents writing one file
+never meet. What they both changed is reconciled once, at the merge, by whichever
+branch goes second — and that costs far less than making one of them sit through
+the other's whole run and landing. `check` names the pairs that will need it and
+`join` says when the moment comes.
 
-- they own the same file, or one owns a directory containing the other's file, or
-- they name the same serialisation point — a lockfile, a migration head, a
-  closed list a test asserts on, or
-- one needs the other, and it has not landed yet.
+**A shared serialisation point is different in kind, and does hold a step back.**
+A lockfile, a migration head, a closed list a test asserts on: git merges these
+cleanly and produces something wrong. There is no conflict to see and no diff to
+read, and the fix is not a code change — a lockfile is regenerated, not merged.
+Those go one at a time.
 
-That is the whole list. `check` computes it for you and the set it prints is
-already safe to open all at once, because it checks the candidates against each
-other as well as against what is out.
+`check` computes both, and the set it prints is already safe to open all at once
+because it checks the candidates against each other as well as against what is
+out.
 
-This is not a preference. On the build this was measured against, refining obeyed
-the rule and turned 130 minutes of work into a 17-minute span. The step stage
-ignored it and stretched 182 minutes of work over 475 — three steps cleared their
-checks in the same minute, the first opened, and the second waited an hour and a
-half for it to land. Nothing was learned by waiting. Every gate that matters had
-already passed.
+The evidence for the rule is the refining stage: ten agents launched together
+turned 130 minutes of work into a 17-minute span. (The chip stage on that same
+build ran one at a time, but its steps were a near-total dependency chain —
+S-001 → S-002 → S-006 → S-007 → S-008 → S-009 → S-010 — so most of that was
+required, not wasted. The rule matters for graphs that are wider than that one.)
 
 Up to twelve agents in flight is verified clean; the ceiling is memory, not the
 API. Heavy checks inside those agents go through `slot`, so twelve suites queue
@@ -145,10 +150,9 @@ It prints three things: the set that can open right now, the steps held back and
 exactly what they would collide with, and the steps still waiting on work to
 land.
 
-Two steps interfere when they own the same file, or when one owns a directory
-containing the other's file, or when they name the same serialisation point — a
-lockfile, a migration head, a shared test assertion. Overlapping steps are
-recorded, not refused; they simply cannot be open at the same time.
+It holds a step back only for a serialisation point that open work is already
+moving, or a dependency that has not landed. Steps that share a file are listed
+separately, as merges to sequence rather than collisions to prevent.
 
 Then sweep everything the steps cite, immediately before opening them:
 
@@ -217,9 +221,10 @@ Its process exit wakes you.
 ```bash
 node $ORCH run record S-1 --log .claude/orch/logs/S-1.jsonl
 node $ORCH guard S-1
-# merge into the main line, run the suite
+node $ORCH join S-1                          # merges it into the main line
+node $ORCH slot run ci -- <your test command>   # on the JOINED tree
 node $ORCH land S-1 --sha <sha>
-node $ORCH check          # a landing usually widens what can open
+node $ORCH check                             # a landing usually widens what can open
 ```
 
 `run record` reads the log rather than asking what happened: what files were
@@ -231,8 +236,31 @@ wrote but does not own is reported here, before `guard` runs.
 replaces. On the real build, 36 MB across 27 runs became 5,670 characters of
 typed prose and a five-line ledger.
 
-Then loop: record, guard, land, `check`, open everything it names. Keep going
-until the board is empty.
+### When a join conflicts, or the joined tree goes red
+
+Both are the same event: the step's branch and the main line disagree. `join`
+rolls the merge back so the main line is untouched, names the files and which
+landed step is the other side, and stops.
+
+**Send it back to the agent that wrote it.** It is still on its chat, and it
+knows why it made those changes:
+
+```bash
+node $ORCH sendback S-1 --why conflict          # composed from the conflict itself
+node $ORCH sendback S-1 --why "joined tree red: docs.test.ts route set mismatch"
+```
+
+That writes the prompt and prints the `agent --resume` line. Do not open a new
+agent for this. A fresh one has to reconstruct two agents' intent from the
+outside, which is strictly harder than what either of them was doing.
+
+A clean merge is not a working one. The suite on the *joined* tree is the check
+that matters: on the real build a step passed its own suite 22 out of 22 and went
+red once merged, on a route-set assertion — exactly the kind of breakage a clean
+textual merge produces.
+
+Then loop: record, guard, join, verify, land, `check`, open everything it names.
+Keep going until the board is empty.
 
 ### Heavy checks go through one slot
 

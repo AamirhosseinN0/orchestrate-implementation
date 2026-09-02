@@ -20,6 +20,13 @@ const EVENTS = path.join(ORCH, 'events.jsonl');
 const sub = (...p) => { const d = path.join(ORCH, ...p); fs.mkdirSync(path.dirname(d), { recursive: true }); return d; };
 
 const die = (msg, code = 2) => { console.error('✗ ' + msg); process.exit(code); };
+// The shorter of the two spellings. A skill installed far from the project
+// relativises to a ../../../.. chain nobody can read or check.
+const shortest = (abs) => {
+  const rel = path.relative(CWD, abs);
+  return rel && !rel.startsWith('../..') && rel.length < abs.length ? rel : abs;
+};
+const SELF = () => shortest(process.argv[1]);
 const ok = (msg) => console.log('✓ ' + msg);
 const sha = (s) => crypto.createHash('sha256').update(s).digest('hex').slice(0, 12);
 
@@ -80,10 +87,30 @@ function sharedPoints(t1, t2) {
   }
   return out;
 }
-function interference(t, other) {
-  const files = overlap(t, other);
+// Two things used to be one. They are not the same, and treating them alike
+// serialised work that never needed it.
+//
+// A shared FILE is a merge to sequence, not a collision to prevent: each step
+// builds in its own worktree, on its own copy, so two agents writing one file
+// never meet. Whatever they both changed is reconciled once, at the merge, by
+// the agent whose branch goes second — which is cheaper than the wall-clock of
+// making one of them wait for the other to finish and land.
+//
+// A shared SERIALISATION POINT is different in kind, and is still a gate. A
+// lockfile, a migration head, a closed list a test asserts on: git merges these
+// cleanly and produces something wrong. There is no conflict to see and no
+// diff to read, and the fix is not a code change — a lockfile is regenerated,
+// not merged. Sequencing those is the only thing that works.
+function blocks(t, other) {
   const points = sharedPoints(t, other);
-  return files.length || points.length ? { files, points } : null;
+  return points.length ? { points } : null;
+}
+// What two steps will have to reconcile at the merge. Always reported, never a
+// gate: the point of saying it early is that the order is chosen rather than
+// discovered.
+function willMerge(t, other) {
+  const files = overlap(t, other);
+  return files.length ? { files } : null;
 }
 // A step is open — its files are in somebody's hands — from the moment it is
 // handed out until it lands. This used to be keyed off the chip id, which is
@@ -121,13 +148,18 @@ function frontier(s) {
   const cands = tasks(s)
     .filter((t) => t.status === 'planned' && heldNeeds(s, t).length === 0)
     .sort((a, b) => unblocks(b.key) - unblocks(a.key) || (a.key < b.key ? -1 : 1));
-  const accepted = [], blocked = [];
+  const accepted = [], blocked = [], merges = [];
   for (const t of cands) {
-    const clash = [...open, ...accepted].map((o) => ({ o, i: interference(t, o) })).filter((x) => x.i);
-    if (clash.length) blocked.push({ t, why: clash }); else accepted.push(t);
+    const clash = [...open, ...accepted].map((o) => ({ o, i: blocks(t, o) })).filter((x) => x.i);
+    if (clash.length) { blocked.push({ t, why: clash }); continue; }
+    for (const o of [...open, ...accepted]) {
+      const m = willMerge(t, o);
+      if (m) merges.push({ a: t.key, b: o.key, files: m.files });
+    }
+    accepted.push(t);
   }
   const waiting = tasks(s).filter((t) => t.status === 'planned' && heldNeeds(s, t).length > 0);
-  return { open, accepted, blocked, waiting, unblocks };
+  return { open, accepted, blocked, waiting, merges, unblocks };
 }
 
 // ------------------------------------------------------------ step validation
@@ -159,8 +191,9 @@ function overlapsOf(s, it) {
   const out = [];
   for (const other of tasks(s)) {
     if (other.key === it.key || DEAD_STATUS.includes(other.status)) continue;
-    const i = interference(mine, other);
-    if (i) out.push({ key: other.key, status: other.status, what: [...i.files, ...i.points.map((x) => 'serialisation point ' + x)].join('; ') });
+    const b = blocks(mine, other), m = willMerge(mine, other);
+    if (b) out.push({ key: other.key, status: other.status, gate: true, what: 'serialisation point ' + b.points.join('; ') });
+    if (m) out.push({ key: other.key, status: other.status, gate: false, what: m.files.join('; ') });
   }
   return out;
 }
@@ -173,17 +206,26 @@ function putStep(s, it) {
   return null;
 }
 function reportOverlaps(s, keys) {
-  const lines = [];
+  const gates = [], merges = [], seen = new Set();
   for (const k of keys) {
     const t = depOf(s, k); if (!t) continue;
     for (const o of overlapsOf(s, t)) {
-      lines.push(`  ${k} ↔ ${o.key}${OPEN_STATUSES.includes(o.status) ? ' (open right now)' : ''}: ${o.what}`);
+      // A pair is one fact however many directions it is looked at from.
+      const id = [k, o.key].sort().join('|') + '|' + o.gate;
+      if (seen.has(id)) continue;
+      seen.add(id);
+      const line = `  ${k} ↔ ${o.key}${OPEN_STATUSES.includes(o.status) ? ' (open right now)' : ''}: ${o.what}`;
+      (o.gate ? gates : merges).push(line);
     }
   }
-  if (lines.length) {
-    console.log(`\n${lines.length} overlap(s) — these cannot open at the same time:`);
-    for (const l of lines) console.log(l);
-    console.log('  If that is not what you meant, one of them owns too much. `check` decides the order.');
+  if (gates.length) {
+    console.log(`\n${gates.length} shared serialisation point(s) — these cannot be open at the same time:`);
+    for (const l of gates) console.log(l);
+  }
+  if (merges.length) {
+    console.log(`\n${merges.length} shared file(s) — these can run together; whichever lands second reconciles:`);
+    for (const l of merges) console.log(l);
+    console.log('  If that is not what you meant, one of them owns too much.');
   }
 }
 
@@ -324,11 +366,16 @@ CMDS.check = () => {
     }
     console.log('\nOpen all of them. Opening one at a time is the slowest thing this can do.');
   } else console.log('Nothing new can open right now.');
+  if (f.merges.length) {
+    console.log(`\n${f.merges.length} pair(s) share files. They still run together — whichever`);
+    console.log('lands second reconciles, and `join` says when that is needed:');
+    for (const m of f.merges) console.log('  ' + m.a.padEnd(10) + '↔ ' + m.b + '  ' + m.files.join('; '));
+  }
   if (f.blocked.length) {
-    console.log('\nReady, but they would interfere with open work:');
+    console.log('\nHeld back — they move a serialisation point that open work is already moving.');
+    console.log('git merges these cleanly and gets them wrong, so they go one at a time:');
     for (const { t, why } of f.blocked) for (const { o, i } of why) {
-      console.log('  ' + t.key.padEnd(10) + '↔ ' + o.key + '  on ' +
-        [...i.files, ...i.points.map((x) => 'serialisation point ' + x)].join('; '));
+      console.log('  ' + t.key.padEnd(10) + '↔ ' + o.key + '  ' + i.points.join('; '));
     }
   }
   if (f.waiting.length) console.log('\nWaiting on work to land: ' + f.waiting.map((t) => t.key).join('  '));
@@ -469,12 +516,14 @@ CMDS.run = (argv) => {
     if (!t.tier) die(`${key} has no model yet — run \`assess\` first`);
     const held = heldNeeds(s, t);
     if (held.length) die(`${key} needs ${held.join(', ')} to land first`);
-    // The same gate as everything else: nothing opens onto files in flight.
+    // Only a serialisation point stops a step opening. A shared file does not:
+    // the two build in separate worktrees and reconcile at the merge.
     for (const o of openTasks(s, key)) {
-      const i = interference(t, o);
-      if (i) die(`${key} would collide with ${o.key}, which is open: ` +
-        [...i.files, ...i.points.map((x) => 'serialisation point ' + x)].join('; '));
+      const i = blocks(t, o);
+      if (i) die(`${key} moves the same serialisation point as ${o.key}, which is open: ${i.points.join('; ')}\n` +
+        '  git merges these cleanly and gets them wrong, so they go one at a time.');
     }
+    const willReconcile = openTasks(s, key).map((o) => ({ o, m: willMerge(t, o) })).filter((x) => x.m);
     const row = tierOf(t.tier);
     t.branch = t.branch || `step/${key}`;
     // Beside the project, named after it. A bare `wt-<key>` in the parent
@@ -501,12 +550,12 @@ CMDS.run = (argv) => {
     t.status = 'open'; t.openedAt = new Date().toISOString();
     commit(s, 'run open', argv);
     ok(`${key} is open on ${row.shown}`);
+    if (willReconcile.length) {
+      console.log(`  shares files with open work — whichever lands second reconciles:`);
+      for (const { o, m } of willReconcile) console.log(`    ↔ ${o.key}: ${m.files.join('; ')}`);
+    }
     console.log(`  worktree  ${t.worktree}\n  branch    ${t.branch}\n  chat      ${t.chat}\n  brief     ${t.briefFile}`);
-    // The shorter of the two spellings. A skill installed far from the project
-    // relativises to a ../../../.. chain nobody can read or check.
-    const rel = path.relative(CWD, path.join(HERE, 'scripts', 'run.sh'));
-    const abs = path.join(HERE, 'scripts', 'run.sh');
-    const runner = rel.length < abs.length && !rel.startsWith('../..') ? rel : abs;
+    const runner = shortest(path.join(HERE, 'scripts', 'run.sh'));
     console.log(`\nLaunch it in the background:\n  bash ${runner} \\\n    --role chip --tier ${t.tier} --key ${key} --workspace ${t.worktree} \\\n    --chat ${t.chat} --prompt-file ${t.briefFile}`);
     // Opening one at a time is the slowest thing this can do, and it is easy to
     // do by accident — one `run open` reads like progress. So the ones still
@@ -514,8 +563,8 @@ CMDS.run = (argv) => {
     const more = frontier(readState()).accepted;
     if (more.length) {
       console.log(`\n⚠ ${more.length} more step(s) can open right now and are not: ${more.map((x) => x.key).join(' ')}`);
-      console.log('  Open them in this same round. Interference is the only reason to hold one back,');
-      console.log('  and none of these interferes with anything — that is what put them on this list.');
+      console.log('  Open them in this same round. A shared serialisation point is the only');
+      console.log('  reason to hold one back, and none of these shares one with open work.');
     }
     return;
   }
@@ -932,20 +981,22 @@ CMDS.doctor = () => {
 
   // Two steps claiming one path. Between open ones this is the breach; between
   // planned ones it only means they cannot open together, which `check` says.
-  const dupOpen = [], dupPlanned = [];
+  // A shared file between open steps is expected now: they build in separate
+  // worktrees and reconcile at the merge. What is worth saying is which merges
+  // are coming, so the order is chosen rather than discovered.
+  const dueOpen = [], duePlanned = [];
   for (let i = 0; i < live.length; i++) for (let j = i + 1; j < live.length; j++) {
     const f = overlap(live[i], live[j]);
     if (!f.length) continue;
     const both = OPEN_STATUSES.includes(live[i].status) && OPEN_STATUSES.includes(live[j].status);
-    (both ? dupOpen : dupPlanned).push(`${live[i].key} ↔ ${live[j].key}: ${f.join('; ')}`);
+    (both ? dueOpen : duePlanned).push(`${live[i].key} ↔ ${live[j].key}: ${f.join('; ')}`);
   }
-  if (dupOpen.length) {
-    bad += dupOpen.length;
-    console.log(`✗ ${dupOpen.length} pair(s) of OPEN steps claim the same path:`);
-    for (const x of dupOpen) console.log('    ' + x);
-    console.log('    Two of them changing one thing is the one failure this cannot survive.');
+  if (dueOpen.length) {
+    console.log(`· ${dueOpen.length} pair(s) of open steps share files — a merge to sequence, not a collision:`);
+    for (const x of dueOpen) console.log('    ' + x);
+    console.log('    Whichever lands second reconciles. `join` will say when.');
   }
-  if (dupPlanned.length) console.log(`· ${dupPlanned.length} pair(s) of planned steps share a path — they simply cannot open together.`);
+  if (duePlanned.length) console.log(`· ${duePlanned.length} further pair(s) share files but are not both out yet.`);
 
   // A serialisation point only one step names is usually a spelling that missed
   // its partner, which is the failure mode this whole comparison exists for.
@@ -977,6 +1028,104 @@ CMDS.doctor = () => {
   ok(`${live.length} step(s) check out — paths, proofs, briefs and ownership`);
 };
 
+// ------------------------------------------------------- joining, and sending back
+// Merging is where steps that shared a file finally meet. Whichever goes second
+// reconciles, and the agent that should do it is the one that wrote the branch —
+// it is still on its chat and it knows why it made those changes. A fresh agent
+// reading logs would have to reconstruct two agents' intent from outside, which
+// is strictly harder than what either of them was doing.
+CMDS.join = (argv) => {
+  const s = readState();
+  const t = getTask(s, argv[0]);
+  if (!t.branch) die(`${t.key} has no branch — it was never opened`);
+  // Excluding .claude: this tool's own state lives there and is written on every
+  // command, so a bare status is dirty before anything has happened and would
+  // refuse every merge for ever.
+  // Only tracked changes. An untracked file does not stop a merge — git refuses
+  // by itself if one would be overwritten — and refusing here would block every
+  // merge in any tree with a build directory in it.
+  const dirty = shq('git', ['status', '--porcelain', '--', ':!.claude'])
+    .split('\n').filter((l) => l.trim() && !l.startsWith('??')).join('\n');
+  if (dirty) die("the main checkout has uncommitted changes to tracked files:\n" +
+    dirty.split('\n').slice(0, 10).map((l) => '    ' + l).join('\n') +
+    "\n  Merging on top of them would mix your work into the step's. Commit or stash first.");
+
+  const before = shq('git', ['rev-parse', 'HEAD']);
+  let conflicted = [];
+  try {
+    execFileSync('git', ['merge', '--no-ff', t.branch, '-m', `land ${t.key}`],
+      { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] });
+  } catch {
+    // Take the conflicted list before aborting; after the abort there is nothing
+    // left to read it from.
+    conflicted = shq('git', ['diff', '--name-only', '--diff-filter=U']).split('\n').filter(Boolean);
+    try { execFileSync('git', ['merge', '--abort'], { stdio: 'ignore' }); } catch { /* nothing to abort */ }
+  }
+  t.joinAttempts = (t.joinAttempts || 0) + 1;
+
+  if (conflicted.length) {
+    // Who landed the other side, so the resume can say what it is reconciling
+    // against rather than just naming files.
+    const others = tasks(s).filter((x) => x.key !== t.key && x.status === 'landed' &&
+      conflicted.some((f) => (x.owns || []).some((o) => collides(o, f))));
+    t.conflictedWith = others.map((x) => x.key);
+    t.conflictedOn = conflicted;
+    commit(s, 'join (conflict)', argv);
+    console.log(`✗ ${t.key} conflicts with the main line on ${conflicted.length} file(s):`);
+    for (const f of conflicted) console.log('    ' + f);
+    if (others.length) console.log(`  The other side is ${others.map((x) => x.key).join(', ')}, already landed.`);
+    console.log('\n  The merge was rolled back — the main line is untouched.');
+    console.log(`  Send it back to the agent that wrote it, which is still on its chat:`);
+    console.log(`    node ${SELF()} sendback ${t.key} --why conflict`);
+    process.exit(1);
+  }
+  t.joinedAt = new Date().toISOString();
+  t.joinedSha = shq('git', ['rev-parse', '--short', 'HEAD']);
+  commit(s, 'join', argv);
+  ok(`${t.key} merged cleanly at ${t.joinedSha} (was ${before.slice(0, 7)})`);
+  console.log('  A clean merge is not a working one. Run the suite on the joined tree now:');
+  console.log(`    node ${SELF()} slot run ci -- <your test command>`);
+  console.log(`  Green: land ${t.key} --sha ${t.joinedSha}`);
+  console.log(`  Red:   sendback ${t.key} --why "<what broke>"   (then git reset --hard ${before.slice(0, 7)})`);
+};
+
+CMDS.sendback = (argv) => {
+  const s = readState();
+  const t = getTask(s, argv[0]);
+  const i = argv.indexOf('--why');
+  let why = i === -1 ? '' : argv.slice(i + 1).join(' ');
+  if (!t.chat) die(`${t.key} has no chat to resume — it was never opened through \`run open\``);
+  if (!why) die('sendback needs --why "<what to fix>"');
+
+  // The one case worth composing rather than retyping.
+  if (why === 'conflict') {
+    const files = t.conflictedOn || [];
+    const others = t.conflictedWith || [];
+    why = `Your branch ${t.branch} no longer merges into the main line. ` +
+      (others.length ? `${others.join(' and ')} landed while you were working, and ` : '') +
+      `these files conflict:\n\n` + files.map((f) => '    ' + f).join('\n') +
+      `\n\nYou own them, so reconciling is yours. Fetch the current main line into your
+worktree, look at what landed there, and merge it into your branch — keeping both
+sides' intent, not just yours. The other change is not a mistake to overwrite.
+Then re-run your proof and commit.`;
+  }
+  const prompt = `${why}\n\nYou are still ${t.key}, in ${t.worktree}, on ${t.branch}.\n\n` +
+    `You may write only what you own:\n` + (t.owns || []).map((o) => '    ' + o).join('\n') +
+    ((t.verify || []).length
+      ? `\n\nProve it again with:\n` + t.verify.map((v) => '    ' + v).join('\n')
+      : '');
+  const f = sub('sendbacks', `${t.key}-${(t.sendbacks || []).length + 1}.txt`);
+  fs.writeFileSync(f, prompt + '\n');
+  (t.sendbacks ||= []).push({ at: new Date().toISOString(), why: why.slice(0, 200), file: path.relative(CWD, f) });
+  t.status = 'open';
+  commit(s, 'sendback', argv);
+  ok(`${t.key} sent back — the prompt is at ${path.relative(CWD, f)}`);
+  console.log('\n  Resume the agent that wrote it, on its own chat:');
+  console.log(`    agent -p --force --trust --resume ${t.chat} "$(cat ${path.relative(CWD, f)})"`);
+  console.log('\n  It has the context for why it made those changes. A new agent reading logs');
+  console.log('  would have to reconstruct that from outside.');
+};
+
 const HELP = `orchestrate — five stages, on Cursor or Claude Code
 
   load <path>...            read the plan files, record them
@@ -987,6 +1136,8 @@ const HELP = `orchestrate — five stages, on Cursor or Claude Code
   run open <key>            worktree, chat, brief — everything a step needs to start
   run record <key> --log L  harvest a finished run into the record
   guard <key>               did it touch anything it does not own
+  join <key>                merge it into the main line; says when it conflicts
+  sendback <key> --why W    resume the agent that wrote it, with what to fix
   land <key> [--sha S]      record the merge
   board                     every step and its state
   doctor                    everything the steps cite that can be checked without running

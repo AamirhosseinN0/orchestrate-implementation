@@ -3019,15 +3019,33 @@ say('verify is green on a recorded run nobody made up');
 
   // A second step opening onto a file already in flight is the one thing this
   // must refuse, whoever asks.
+  // A shared FILE is a merge to sequence, not a collision to prevent: the two
+  // build in separate worktrees and never meet.
   const rec4 = run(['step', 'add'], JSON.stringify([{ key: 'S-4', title: 'also a', plan: 'docs/plan.md', owns: ['src/a.ts'] }]));
-  ok('a step overlapping open work is recorded, not refused', rec4.code === 0, rec4.out);
-  ok('with the overlap named, and which of them is out', has(rec4.out, 'open right now'), rec4.out);
+  ok('a step sharing a file with open work is recorded', rec4.code === 0, rec4.out);
+  ok('and told it will reconcile at the merge, not wait',
+    has(rec4.out, 'lands second reconciles'), rec4.out);
   run(['assess', 'set', 'S-4=low']);
-  const collide = run(['run', 'open', 'S-4']);
-  ok('but opening it onto a file in flight is refused', collide.code === 2, collide.out);
-  ok('and names what it would collide with', has(collide.out, 'S-1') && has(collide.out, 'src/a.ts'), collide.out);
-  const blocked = run(['check']);
-  ok('check reports it as held back rather than hiding it', has(blocked.out, 'would interfere'), blocked.out);
+  const alongside = run(['run', 'open', 'S-4']);
+  ok('and it opens anyway, alongside the work it shares a file with', alongside.code === 0, alongside.out);
+  ok('being told which open step it will have to reconcile with',
+    has(alongside.out, 'shares files with open work') && has(alongside.out, 'S-1'), alongside.out);
+
+  // A shared SERIALISATION POINT is different in kind and still a gate: git
+  // merges a lockfile cleanly and gets it wrong, with no conflict to see.
+  run(['step', 'add'], JSON.stringify([
+    { key: 'L-1', title: 'locks', plan: 'docs/plan.md', owns: ['src/l1.ts'], serialises: ['package-lock'] },
+    { key: 'L-2', title: 'locks too', plan: 'docs/plan.md', owns: ['src/l2.ts'], serialises: ['Package-Lock'] }]));
+  run(['assess', 'set', 'L-1=low', 'L-2=low']);
+  ok('the first of two steps moving one lockfile opens', run(['run', 'open', 'L-1']).code === 0);
+  const gated = run(['run', 'open', 'L-2']);
+  ok('the second is refused', gated.code === 2, gated.out);
+  ok('naming the point, however it was spelled', has(gated.out, 'package-lock'), gated.out);
+  ok('and saying why sequencing is the only thing that works',
+    has(gated.out, 'merges these cleanly and gets them wrong'), gated.out);
+  const board2 = run(['check']);
+  ok('check holds it back for the point, not for a file',
+    has(board2.out, 'serialisation point that open work'), board2.out);
 
   // --- refine done goes through that same gate ---
   const rep = path.join(d, '.claude', 'orch', 'refine');
@@ -3035,11 +3053,12 @@ say('verify is green on a recorded run nobody made up');
   fs.writeFileSync(path.join(rep, 'docs-plan-md.json'), JSON.stringify({
     summary: 's', openQuestions: [], steps: [{ key: 'R-1', title: 'collides', owns: ['src/a.ts'] }] }));
   const refined = run(['refine', 'done', 'docs/plan.md']);
-  ok('a refined step that overlaps open work is still recorded', refined.code === 0, refined.out);
-  ok('but the overlap is named at once, not left for a later sweep',
-    has(refined.out, 'src/a.ts') && has(refined.out, 'open right now'), refined.out);
-  ok('and it cannot be opened while that work is out',
-    run(['run', 'open', 'R-1']).code === 2, run(['run', 'open', 'R-1']).out);
+  ok('a refined step that shares a file with open work is recorded', refined.code === 0, refined.out);
+  ok('and the coming merge is named at once, not left for a later sweep',
+    has(refined.out, 'src/a.ts') && has(refined.out, 'lands second reconciles'), refined.out);
+  run(['assess', 'set', 'R-1=low']);
+  ok('and it opens alongside that work rather than waiting for it',
+    run(['run', 'open', 'R-1']).code === 0, run(['run', 'open', 'R-1']).out);
   fs.writeFileSync(path.join(rep, 'docs-plan-md.json'), JSON.stringify({
     summary: 's', openQuestions: ['which timezone do stamps use'],
     steps: [{ key: 'R-2', title: 'fine', owns: ['src/r.ts'], verify: ['true'] }] }));
@@ -3107,8 +3126,8 @@ say('verify is green on a recorded run nobody made up');
     has(one.out, 'more step(s) can open right now'), one.out);
   ok('and names them, so stopping short is not a silent choice',
     has(one.out, 'P-2') && has(one.out, 'P-3'), one.out);
-  ok('and says interference is the only reason to hold one back',
-    has(one.out, 'only reason to hold one back'), one.out);
+  ok('and says a shared serialisation point is the only thing that would hold one back',
+    has(one.out, 'only'), one.out);
   run(['run', 'open', 'P-2']); run(['run', 'open', 'P-3']);
   ok('once the round is fully open it stops nagging',
     !has(run(['board']).out, 'can open right now'), run(['board']).out);
@@ -3243,11 +3262,11 @@ say('verify is green on a recorded run nobody made up');
   poison((j) => { for (const k of ['S-1', 'S-2']) { const t = j.tasks.find((x) => x.key === k);
     t.status = 'open'; t.serialises = ['docker-compose.yml']; t.owns = ['src/same.ts']; } });
   const breach = run(['doctor']);
-  ok('two open steps claiming one path is a failure', breach.code === 1, breach.out);
-  ok('and is named as the one thing this cannot survive',
-    has(breach.out, 'cannot survive'), breach.out);
-  ok('two open steps holding one serialisation point is a failure too',
-    has(breach.out, 'held by more than one open step'), breach.out);
+  ok('two open steps sharing a file is reported as a merge to sequence',
+    has(breach.out, 'merge to sequence'), breach.out);
+  ok('and says who reconciles', has(breach.out, 'lands second reconciles'), breach.out);
+  ok('two open steps holding one serialisation point is still a failure',
+    breach.code === 1 && has(breach.out, 'held by more than one open step'), breach.out);
 
   // A brief handed out does not change when the record does, and the agent
   // holding it will not know.
@@ -3261,6 +3280,101 @@ say('verify is green on a recorded run nobody made up');
   ok('and says to tell the agent to re-read it', has(stale.out, 're-read'), stale.out);
 }
 
+// ------------------------------------------ merging, and sending the work back
+// Two steps that shared a file finally meet here. Whichever goes second
+// reconciles, and the agent that should do it is the one that wrote the branch.
+{
+  say('merging, and sending the work back');
+  const ROOT = path.dirname(fileURLToPath(import.meta.url));
+  const O = path.join(ROOT, 'claude-cursor', 'orchestrate.mjs');
+  const d = bare('join');
+  const stub = path.join(d, 'stub');
+  fs.mkdirSync(stub, { recursive: true });
+  // A real uuid shape: cursor-chat.sh takes the address by shape and refuses
+  // anything that is not one, which is the whole point of it.
+  let chatN = 0;
+  fs.writeFileSync(path.join(stub, 'agent'),
+    '#!/usr/bin/env bash\nN=$(cat "$STUB_N" 2>/dev/null || echo 1)\n' +
+    'printf "Created chat %08x-0000-4000-8000-000000000000\\n" "$N"\n', { mode: 0o755 });
+  const wtRoot = path.join(d, 'wts');
+  fs.mkdirSync(wtRoot, { recursive: true });
+  const ENV = { ...process.env, PATH: stub + path.delimiter + process.env.PATH,
+                CURSOR_ORCH_WT: wtRoot, STUB_N: path.join(d, 'n') };
+  const run = (args, input) => {
+    fs.writeFileSync(path.join(d, 'n'), String(++chatN));
+    try { return { code: 0, out: execFileSync('node', [O, ...args], { cwd: d, encoding: 'utf8', input, env: ENV, stdio: ['pipe', 'pipe', 'pipe'] }) }; }
+    catch (e) { return { code: e.status ?? -1, out: String(e.stdout || '') + String(e.stderr || '') }; }
+  };
+  const git = (args, cwd = d) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] });
+
+  git(['init', '-q', '-b', 'main']);
+  git(['config', 'user.email', 'ci@example.invalid']);
+  git(['config', 'user.name', 'ci']);
+  fs.mkdirSync(path.join(d, 'src'), { recursive: true });
+  fs.mkdirSync(path.join(d, 'docs'), { recursive: true });
+  fs.writeFileSync(path.join(d, 'docs', 'plan.md'), '# plan\n');
+  fs.writeFileSync(path.join(d, 'src', 'shared.ts'), 'one\ntwo\nthree\n');
+  git(['add', '-A']); git(['commit', '-qm', 'init']);
+  run(['load', 'docs']);
+  run(['step', 'add'], JSON.stringify([
+    { key: 'A', title: 'a', plan: 'docs/plan.md', owns: ['src/shared.ts'], verify: ['true'] },
+    { key: 'B', title: 'b', plan: 'docs/plan.md', owns: ['src/shared.ts'], verify: ['true'] }]));
+  run(['assess', 'set', 'A=low', 'B=low']);
+  run(['run', 'open', 'A']); run(['run', 'open', 'B']);
+  ok('two steps owning one file are both open at once',
+    (run(['board']).out.match(/^\s+[AB]\s/gm) || []).length === 2, run(['board']).out);
+
+  // Both rewrite the same line, so the second merge cannot be automatic.
+  for (const k of ['A', 'B']) {
+    const wt = path.join(wtRoot, path.basename(d) + '-wt-' + k);
+    fs.writeFileSync(path.join(wt, 'src', 'shared.ts'), `one\n${k} changed it\nthree\n`);
+    git(['add', '-A'], wt); git(['commit', '-qm', k], wt);
+  }
+
+  const j1 = run(['join', 'A']);
+  ok('the first branch in merges cleanly', j1.code === 0, j1.out);
+  ok('and is told a clean merge is not a working one', has(j1.out, 'not a working one'), j1.out);
+  ok('and pointed at the suite on the joined tree', has(j1.out, 'slot run ci'), j1.out);
+  run(['land', 'A']);
+
+  const j2 = run(['join', 'B']);
+  ok('the second conflicts', j2.code === 1, j2.out);
+  ok('naming the file', has(j2.out, 'src/shared.ts'), j2.out);
+  ok('and which landed step is the other side', has(j2.out, 'The other side is A'), j2.out);
+  ok('the main line is rolled back, not left mid-merge',
+    !fs.existsSync(path.join(d, '.git', 'MERGE_HEAD')));
+  ok('and still holds what landed before it',
+    has(readIf(path.join(d, 'src', 'shared.ts')), 'A changed it'), readIf(path.join(d, 'src', 'shared.ts')));
+  ok('it points at a send-back rather than a new agent', has(j2.out, 'sendback B'), j2.out);
+
+  const sb = run(['sendback', 'B', '--why', 'conflict']);
+  ok('the send-back is composed from the conflict itself', sb.code === 0, sb.out);
+  ok('and resumes the chat that step already has', has(sb.out, 'agent -p --force --trust --resume'), sb.out);
+  ok('saying why a fresh agent would be worse', has(sb.out, 'reconstruct that from outside'), sb.out);
+  const prompt = readIf(path.join(d, '.claude', 'orch', 'sendbacks', 'B-1.txt'));
+  ok('the prompt names what landed while it was working', has(prompt, 'A landed while you were working'), prompt);
+  ok('and the file that conflicts', has(prompt, 'src/shared.ts'), prompt);
+  ok('and tells it to keep both sides, not overwrite one',
+    has(prompt, 'not a mistake to overwrite'), prompt);
+  ok('and repeats what it owns, so the fix stays in bounds', has(prompt, 'You may write only what you own'), prompt);
+  ok('and how to prove it again', has(prompt, 'Prove it again'), prompt);
+
+  const free = run(['sendback', 'B', '--why', 'joined tree red: route set mismatch']);
+  ok('a send-back for a red suite is the same path', free.code === 0, free.out);
+  ok('carrying what broke', has(readIf(path.join(d, '.claude', 'orch', 'sendbacks', 'B-2.txt')), 'route set mismatch'));
+  ok('sendback without --why is refused', run(['sendback', 'B']).code === 2);
+
+  // Merging on top of your own uncommitted work would mix it into the step's.
+  fs.writeFileSync(path.join(d, 'src', 'shared.ts'), 'edited by hand\n');
+  const dirty = run(['join', 'B']);
+  ok('a merge onto a dirty checkout is refused', dirty.code === 2, dirty.out);
+  ok('and shows what is uncommitted', has(dirty.out, 'src/shared.ts'), dirty.out);
+  git(['checkout', '--', 'src/shared.ts']);
+  fs.writeFileSync(path.join(d, 'untracked-build-output'), 'x\n');
+  ok('but an untracked file does not block one — git refuses by itself if it would be overwritten',
+    run(['join', 'B']).code === 1, run(['join', 'B']).out);
+}
+
 // ---------------------------------------------------------------------- report
 if (!KEEP) for (const d of boxes) { try { fs.rmSync(d, { recursive: true, force: true }); } catch { /* gone */ } }
 else console.log('\nsandboxes kept: ' + boxes.join('\n                '));
@@ -3269,7 +3383,7 @@ else console.log('\nsandboxes kept: ' + boxes.join('\n                '));
 // an exception thrown before its first `ok`, a case quietly commented out — and
 // the suite still ends on "all green", because green is only ever measured
 // against however many checks happened to run.
-const EXPECTED = 625;   // every check above counts; raise it deliberately when you add one
+const EXPECTED = 653;   // every check above counts; raise it deliberately when you add one
 
 console.log('\n' + '-'.repeat(60));
 if (pass + failures.length !== EXPECTED)

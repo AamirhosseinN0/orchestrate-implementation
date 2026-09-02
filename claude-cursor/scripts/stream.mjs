@@ -36,9 +36,10 @@ const mag = (s) => c('35', s);
 // missing stamp gets.
 let t0 = null, lastTs = null;
 const wall0 = Date.now();
+const clock = (ev) => { const t = ev && ev.timestamp_ms; if (t) { if (t0 === null) t0 = t; lastTs = t; } };
 const stamp = (ev) => {
   const now = (ev && ev.timestamp_ms) || null;
-  if (now) { if (t0 === null) t0 = now; lastTs = now; }
+  if (now) clock(ev);
   // A line with no clock of its own — a bare error tail — is stamped with the
   // last one seen. It is the moment the run stopped, and printing 00:00 there
   // hides the one timing anybody wants.
@@ -165,6 +166,7 @@ function feed(line) {
   // a loop detector, a transport error. It is the most important thing on the
   // screen, so it is never swallowed, and it ends the run.
   try { ev = JSON.parse(line); } catch { say(null, red('■ ') + line.trim()); ended = true; return; }
+  clock(ev);   // every event advances the clock, including the ones that print nothing
   try { handle(ev); } catch { /* one odd event must not stop the watch */ }
 }
 

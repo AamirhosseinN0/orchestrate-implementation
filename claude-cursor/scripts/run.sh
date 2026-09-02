@@ -73,7 +73,7 @@ elif [ -z "$SHOWN_WANT" ]; then
   exit 2
 fi
 
-LOG_DIR=${CURSOR_ORCH_LOG_DIR:-.claude/orchestration/cursor}
+LOG_DIR=${CURSOR_ORCH_LOG_DIR:-.claude/orch/logs}
 LOG="$LOG_DIR/$KEY.jsonl"
 
 # Defect: in streaming mode `tee` failed only once the agent was already

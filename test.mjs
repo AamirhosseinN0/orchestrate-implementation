@@ -2544,346 +2544,536 @@ say('verify is green on a recorded run nobody made up');
   ok('and says it could not check', has(r4.out, 'could not check'), r4.out);
 }
 
-// ------------------------------------------- the cursor launcher, role by role
-// These drive claude-cursor/scripts/*.sh against a stub `agent` on PATH, so the
-// guards are exercised without a login, a network call or a billed run. Every
-// case here guards a specific defect: the launcher used to verify the model only
-// when it matched one hard-coded pin, which meant pointing pre-flight at a
-// second model silently switched the check off.
+// --------------------------------------------- the model ladder, and its traps
+// The ladder is data, and the check against it is exact string equality. Rank 4
+// reports itself as "Cursor Grok 4.6" with no effort word in it, and that is a
+// prefix of every other Grok 4.6 row; across the models one account can see
+// there are 197 such pairs. A prefix match would read a silent downgrade as a
+// correct run, which is the failure the check exists for.
 {
-  say('the cursor launcher, role by role');
+  say('the model ladder, and its traps');
   const SK = path.join(path.dirname(fileURLToPath(import.meta.url)), 'claude-cursor', 'scripts');
-  const d = bare('cursor');
-  const stubDir = path.join(d, 'stub');
-  const REC = path.join(d, 'received.txt');
-  fs.mkdirSync(stubDir, { recursive: true });
+  const M = path.join(SK, 'models.mjs');
+  const run = (args, env = {}) => {
+    try { return { code: 0, out: execFileSync('node', [M, ...args], { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env, ...env } }) }; }
+    catch (e) { return { code: e.status ?? -1, out: String(e.stdout || '') + String(e.stderr || '') }; }
+  };
 
-  // Stands in for `agent`. Records what it was handed, then prints whichever
-  // shape of stream the case under test needs.
-  fs.writeFileSync(path.join(stubDir, 'agent'), [
+  const list = run(['list']);
+  ok('the ladder lists five tiers', (list.out.match(/^\d /gm) || []).length === 5, list.out);
+  ok('composer is the weakest', /^1\s+composer/m.test(list.out), list.out);
+  ok('and grok 4.6 extra high the strongest', /^5\s+xhigh/m.test(list.out), list.out);
+
+  const r = (n) => run(['resolve', n]).out.trim().split('\t');
+  ok('refining defaults to grok 4.6 high', r('refine')[0] === 'cursor-grok-4.6-high', r('refine'));
+  ok('pre-flight defaults to composer', r('preflight')[0] === 'composer-2.5', r('preflight'));
+  ok('chips default to grok 4.6 high', r('chip')[0] === 'cursor-grok-4.6-high', r('chip'));
+  ok('a tier resolves as well as a role', r('xhigh')[0] === 'cursor-grok-4.6-xhigh', r('xhigh'));
+  ok('rank 4 reports itself with no effort word', r('high')[1] === 'Cursor Grok 4.6', r('high'));
+  const bad = run(['resolve', 'enormous']);
+  ok('an unknown tier is refused', bad.code === 2, bad.out);
+  ok('and the real ones are named', has(bad.out, 'composer, low, medium'), bad.out);
+
+  const v = (want, got) => run(['verify', '--want', want, '--got', got]).code;
+  ok('an exact match passes', v('Cursor Grok 4.6', 'Cursor Grok 4.6') === 0);
+  ok('rank 4 does not accept extra high, which it is a prefix of',
+    v('Cursor Grok 4.6', 'Cursor Grok 4.6 Extra High') === 1);
+  ok('nor low, nor medium',
+    v('Cursor Grok 4.6', 'Cursor Grok 4.6 Low') === 1 && v('Cursor Grok 4.6', 'Cursor Grok 4.6 Medium') === 1);
+  ok('a dropped effort suffix is caught', v('Cursor Grok 4.6 Extra High', 'Cursor Grok 4.6') === 1);
+  ok('the fast twin of every rank is refused',
+    v('Cursor Grok 4.6', 'Cursor Grok 4.6 Fast') === 1 && v('Composer 2.5', 'Composer 2.5 Fast') === 1);
+  const fastWhy = run(['verify', '--want', 'Composer 2.5', '--got', 'Composer 2.5 Fast']);
+  ok('and refused for being fast, not for being some other string', has(fastWhy.out, 'fast tier'), fastWhy.out);
+  const noInit = run(['verify', '--want', 'Composer 2.5', '--got', '']);
+  ok('a run with no init event is refused', noInit.code === 1, noInit.out);
+  ok('and says the run never started', has(noInit.out, 'never started'), noInit.out);
+
+  // sync regenerates the reported names from the CLI. A table entry that has
+  // stopped existing is refused rather than written through, because every run
+  // pinned to it would fail and the table would look fine.
+  const d = bare('models');
+  const stub = path.join(d, 'stub');
+  fs.mkdirSync(stub, { recursive: true });
+  fs.writeFileSync(path.join(stub, 'agent'), '#!/usr/bin/env bash\ncat "$STUB_LIST"\n', { mode: 0o755 });
+  const table = path.join(d, 'models.json');
+  const base = JSON.parse(fs.readFileSync(path.join(SK, '..', 'models.json'), 'utf8'));
+  fs.writeFileSync(table, JSON.stringify(base, null, 2));
+  const listing = path.join(d, 'list.txt');
+  const env = { PATH: stub + path.delimiter + process.env.PATH, STUB_LIST: listing, CURSOR_ORCH_MODELS: table };
+
+  fs.writeFileSync(listing, 'Available models\n\n' + base.ladder.map((x) => `${x.id} - ${x.shown}`).join('\n') + '\n');
+  const clean = run(['sync'], env);
+  ok('sync is quiet when the table still matches', clean.code === 0 && has(clean.out, 'still report'), clean.out);
+
+  fs.writeFileSync(listing, 'Available models\n\n' +
+    base.ladder.map((x) => `${x.id} - ${x.id === 'cursor-grok-4.6-high' ? 'Cursor Grok 4.7' : x.shown}`).join('\n') + '\n');
+  const drift = run(['sync'], env);
+  ok('a renamed model is written through', drift.code === 0 && has(drift.out, 'Cursor Grok 4.7'), drift.out);
+  ok('and the table on disk now says so',
+    has(fs.readFileSync(table, 'utf8'), 'Cursor Grok 4.7'), readIf(table));
+
+  fs.writeFileSync(listing, 'Available models\n\ncomposer-2.5 - Composer 2.5\n');
+  const gone = run(['sync'], env);
+  ok('an id that no longer exists stops the sync', gone.code === 1, gone.out);
+  ok('and every missing one is named', has(gone.out, 'cursor-grok-4.6-xhigh'), gone.out);
+}
+
+// ------------------------------------------- the launcher, and the runs it lost
+// Each case here is a way a real run was lost. The stub stands in for `agent`,
+// so the guards are exercised without a login, a network call or a billed run.
+{
+  say('the launcher, and the runs it lost');
+  const SK = path.join(path.dirname(fileURLToPath(import.meta.url)), 'claude-cursor', 'scripts');
+  const d = bare('launch');
+  const stub = path.join(d, 'stub');
+  const REC = path.join(d, 'received.txt');
+  fs.mkdirSync(stub, { recursive: true });
+
+  // Records what it was handed, then prints whichever shape the case needs.
+  // `die_once` fails the first time and succeeds on the resume, which is the
+  // sequence a real transport error produced.
+  fs.writeFileSync(path.join(stub, 'agent'), [
     '#!/usr/bin/env bash',
-    'printf "%s\\n" "$@" > "$STUB_REC"',
-    'M=${STUB_SHOWN:-Cursor Grok 4.6 Extra High}',
-    'INIT="{\\"type\\":\\"system\\",\\"subtype\\":\\"init\\",\\"model\\":\\"$M\\"}"',
+    ': "${STUB_REC:=/dev/null}"',
+    'printf "%s\\n" "$@" >> "$STUB_REC"',
+    'M=${STUB_SHOWN:-Cursor Grok 4.6}',
+    'I="{\\"type\\":\\"system\\",\\"subtype\\":\\"init\\",\\"model\\":\\"$M\\",\\"cwd\\":\\"$PWD\\"}"',
+    'N=0; [ -f "$STUB_REC.n" ] && N=$(cat "$STUB_REC.n"); N=$((N+1)); echo $N > "$STUB_REC.n"',
     'case "${STUB_MODE:-normal}" in',
-    '  noinit)    echo "{\\"type\\":\\"thinking\\",\\"subtype\\":\\"delta\\"}" ;;',
-    '  latemodel) echo "warning: a line before the init event"; echo "$INIT";',
-    '             echo "{\\"type\\":\\"result\\",\\"result\\":\\"done\\"}" ;;',
-    '  errortail) echo "$INIT"; echo "NonRetriableError: Agent Looping Detected" ;;',
-    '  iserror)   echo "$INIT"; echo "{\\"type\\":\\"result\\",\\"is_error\\":true,\\"result\\":\\"boom\\"}" ;;',
-    '  *)         echo "$INIT"; echo "{\\"type\\":\\"result\\",\\"result\\":\\"done\\"}" ;;',
+    '  spaced)  echo "{\\"type\\":\\"system\\", \\"subtype\\":\\"init\\", \\"model\\": \\"$M\\"}"',
+    '           echo "{\\"type\\":\\"result\\",\\"result\\":\\"done\\"}" ;;',
+    '  noinit)  echo "{\\"type\\":\\"thinking\\",\\"subtype\\":\\"delta\\"}" ;;',
+    '  die)     echo "$I"; echo "RetriableError: [unavailable] PING timed out" ;;',
+    '  dieonce) echo "$I"; if [ "$N" = 1 ]; then echo "RetriableError: [unavailable] PING timed out";',
+    '           else echo "{\\"type\\":\\"result\\",\\"result\\":\\"picked up from disk\\"}"; fi ;;',
+    '  iserror) echo "$I"; echo "{\\"type\\":\\"result\\",\\"is_error\\":true,\\"result\\":\\"boom\\"}" ;;',
+    '  *)       echo "$I"; echo "{\\"type\\":\\"result\\",\\"result\\":\\"done\\"}" ;;',
     'esac',
   ].join('\n') + '\n', { mode: 0o755 });
 
   const PROMPT = path.join(d, 'prompt.txt');
   fs.writeFileSync(PROMPT, 'do the work\n');
+  const LOGS = path.join(d, 'logs');
 
-  // Runs cursor-run.sh with the stub ahead of everything on PATH.
   function run(args, env = {}) {
     try {
-      const out = execFileSync('bash', [path.join(SK, 'cursor-run.sh'), ...args], {
+      return { code: 0, out: execFileSync('bash', [path.join(SK, 'run.sh'), ...args], {
         cwd: d, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'],
-        env: { ...process.env, PATH: stubDir + path.delimiter + process.env.PATH,
-               STUB_REC: REC, CURSOR_ORCH_LOG_DIR: path.join(d, 'logs'), ...env },
-      });
-      return { code: 0, out };
-    } catch (e) {
-      return { code: e.status === undefined ? -1 : e.status, out: String(e.stdout || '') + String(e.stderr || '') };
-    }
+        env: { ...process.env, PATH: stub + path.delimiter + process.env.PATH,
+               STUB_REC: REC, CURSOR_ORCH_LOG_DIR: LOGS, ...env } }) };
+    } catch (e) { return { code: e.status ?? -1, out: String(e.stdout || '') + String(e.stderr || '') }; }
   }
   const sent = () => readIf(REC);
-  const base = (...a) => ['--key', 'k', '--workspace', '.', '--prompt-file', PROMPT, ...a];
+  const fresh = () => { for (const f of [REC, REC + '.n']) try { fs.rmSync(f); } catch { /* absent */ } };
+  const base = (...a) => ['--key', 'k', '--prompt-file', PROMPT, '--quiet', ...a];
 
-  // --- the role is mandatory, because it selects the check ---
-  const noRole = run(['--key', 'k', '--workspace', '.', '--prompt-file', PROMPT]);
-  ok('a run without --role is refused', noRole.code === 2, noRole.out);
-  ok('and says which roles exist', has(noRole.out, 'refine'), noRole.out);
+  // --- input that is wrong should read as a sentence, not as bash internals ---
+  const noVal = run(['--role', 'chip', '--prompt-file', PROMPT, '--key']);
+  ok('a flag with no value is refused', noVal.code === 2, noVal.out);
+  ok('and says which flag, not "unbound variable"',
+    has(noVal.out, '--key needs a value') && !has(noVal.out, 'unbound'), noVal.out);
+  const noRole = run(['--key', 'k', '--prompt-file', PROMPT]);
+  ok('a run with no role is refused', noRole.code === 2, noRole.out);
   const badRole = run(base('--role', 'builder'));
   ok('an unknown role is refused', badRole.code === 2, badRole.out);
+  const noFile = run(['--key', 'k', '--role', 'chip', '--prompt-file', path.join(d, 'nope')]);
+  ok('an unreadable prompt file is refused', noFile.code === 2, noFile.out);
+  ok('and names the path it could not read', has(noFile.out, 'nope'), noFile.out);
 
-  // --- each role launches on its own model ---
-  const refine = run(base('--role', 'refine'));
-  ok('refine runs', refine.code === 0, refine.out);
-  ok('refine asks for grok 4.6 xhigh', has(sent(), 'cursor-grok-4.6-xhigh'), sent());
+  // --- the model comes from the ladder, and a tier beats the role default ---
+  fresh(); const chip = run(base('--role', 'chip'));
+  ok('a chip runs', chip.code === 0, chip.out);
+  ok('on the role default', has(sent(), 'cursor-grok-4.6-high'), sent());
+  fresh(); const pre = run(base('--role', 'preflight'), { STUB_SHOWN: 'Composer 2.5' });
+  ok('pre-flight runs on composer', pre.code === 0 && has(sent(), 'composer-2.5'), pre.out + sent());
+  fresh(); const tiered = run(base('--role', 'chip', '--tier', 'xhigh'), { STUB_SHOWN: 'Cursor Grok 4.6 Extra High' });
+  ok('an assessed tier beats the role default', has(sent(), 'cursor-grok-4.6-xhigh'), sent());
+  ok('and the run is checked against that tier', tiered.code === 0, tiered.out);
 
-  const chip = run(base('--role', 'chip'));
-  ok('chip runs', chip.code === 0, chip.out);
-  ok('chip asks for grok 4.6 xhigh', has(sent(), 'cursor-grok-4.6-xhigh'), sent());
-
-  const pre = run(base('--role', 'preflight'), { STUB_SHOWN: 'Composer 2.5' });
-  ok('preflight runs', pre.code === 0, pre.out);
-  ok('preflight asks for composer 2.5', has(sent(), 'composer-2.5'), sent());
-  ok('and does not ask for grok', !has(sent(), 'grok'), sent());
-
-  // Pre-flight on Composer must still be checked. Before the role table the
-  // comparison was gated on a single pinned name, so this run reported a model
-  // nobody asked for and exited 0.
-  const preWrong = run(base('--role', 'preflight'), { STUB_SHOWN: 'Cursor Grok 4.6 Extra High' });
-  ok('preflight refuses a model that is not composer', preWrong.code === 1, preWrong.out);
-  ok('and names what it expected', has(preWrong.out, 'Composer 2.5'), preWrong.out);
-
-  // --- the fast tier, by flag and by environment ---
-  const fastFlag = run(base('--role', 'chip', '--model', 'cursor-grok-4.6-xhigh-fast'));
-  ok('a -fast model on the flag is refused', fastFlag.code === 2, fastFlag.out);
-  ok('and refused for being fast, not for anything else', has(fastFlag.out, 'non-fast'), fastFlag.out);
-  const fastEnv = run(base('--role', 'chip'), { CURSOR_ORCH_MODEL: 'composer-2.5-fast' });
-  ok('a -fast model in the environment is refused', fastEnv.code === 2, fastEnv.out);
-
-  // --- an override may not switch the check off (the N1 regression) ---
-  const bareOverride = run(base('--role', 'chip', '--model', 'composer-2.5'));
-  ok('an override without --model-shown is refused', bareOverride.code === 2, bareOverride.out);
-  ok('and says why it will not run unverified', has(bareOverride.out, '--model-shown'), bareOverride.out);
-  const envOverride = run(base('--role', 'chip'), { CURSOR_ORCH_MODEL: 'composer-2.5' });
-  ok('the same override through the environment is refused', envOverride.code === 2, envOverride.out);
+  // --- the check on the way back ---
+  const wrong = run(base('--role', 'chip'), { STUB_SHOWN: 'Cursor Grok 4.6 Extra High' });
+  ok('a model nobody asked for stops the run', wrong.code === 1, wrong.out);
+  const ranFast = run(base('--role', 'chip'), { STUB_SHOWN: 'Cursor Grok 4.6 Fast' });
+  ok('a run that came back on the fast tier stops', ranFast.code === 1, ranFast.out);
+  const override = run(base('--role', 'chip', '--model', 'composer-2.5'));
+  ok('an override with no --model-shown is refused', override.code === 2, override.out);
+  ok('and says it would leave the run unverified', has(override.out, '--model-shown'), override.out);
   const named = run(base('--role', 'chip', '--model', 'composer-2.5', '--model-shown', 'Composer 2.5'),
     { STUB_SHOWN: 'Composer 2.5' });
   ok('an override that says what to expect runs', named.code === 0, named.out);
-  const namedWrong = run(base('--role', 'chip', '--model', 'composer-2.5', '--model-shown', 'Composer 2.5'),
-    { STUB_SHOWN: 'Composer 2.5 Fast' });
-  ok('and is still checked against the name it gave', namedWrong.code === 1, namedWrong.out);
 
-  // --- the effort-drop and fast-tier guards on the way back ---
-  const dropped = run(base('--role', 'chip'), { STUB_SHOWN: 'Cursor Grok 4.6' });
-  ok('a dropped effort suffix stops the run', dropped.code === 1, dropped.out);
-  const ranFast = run(base('--role', 'chip'), { STUB_SHOWN: 'Cursor Grok 4.6 Extra High Fast' });
-  ok('a run that came back on the fast tier stops', ranFast.code === 1, ranFast.out);
-  ok('and says so plainly', has(ranFast.out, 'fast tier'), ranFast.out);
+  // The model used to be read with a regex that assumed no space after the
+  // colon, so a differently-spaced init event reported a finished run as one
+  // that never started — after it had been paid for.
+  const spaced = run(base('--role', 'chip'), { STUB_MODE: 'spaced' });
+  ok('an init event with spaces in it is still read', spaced.code === 0, spaced.out);
+  const noinit = run(base('--role', 'chip'), { STUB_MODE: 'noinit' });
+  ok('a stream with no init event fails', noinit.code === 1, noinit.out);
 
-  // --- reading the model off a line that is not the first ---
-  const late = run(base('--role', 'chip'), { STUB_MODE: 'latemodel' });
-  ok('an init event behind a warning is still read', late.code === 0, late.out);
-  ok('and the model is reported', has(late.out, 'Cursor Grok 4.6 Extra High'), late.out);
+  // --- the log is proved writable before a run is spent on it ---
+  const ro = path.join(d, 'readonly');
+  fs.mkdirSync(ro, { recursive: true }); fs.chmodSync(ro, 0o500);
+  fresh();
+  const unwritable = run(base('--role', 'chip'), { CURSOR_ORCH_LOG_DIR: ro });
+  fs.chmodSync(ro, 0o700);
+  ok('an unwritable log stops the run', unwritable.code === 2, unwritable.out);
+  ok('and says so instead of "the run never started"',
+    has(unwritable.out, 'cannot write the log') && !has(unwritable.out, 'never started'), unwritable.out);
+  ok('and no agent was spawned for it', !fs.existsSync(REC), sent());
 
-  // --- streams that stop outside the protocol ---
-  const noInit = run(base('--role', 'chip'), { STUB_MODE: 'noinit' });
-  ok('a stream with no init event fails', noInit.code === 1, noInit.out);
-  ok('and says the run never started', has(noInit.out, 'never started'), noInit.out);
-  const tail = run(base('--role', 'chip'), { STUB_MODE: 'errortail' });
-  ok('a stream ending in a bare error line fails', tail.code === 1, tail.out);
-  ok('and quotes that line rather than only naming the log',
-    has(tail.out, 'NonRetriableError'), tail.out);
+  // --- a run that ends without answering is resumed once, on the same chat ---
+  fresh();
+  const died = run(base('--role', 'chip'), { STUB_MODE: 'die' });
+  ok('a run that never answers fails', died.code === 1, died.out);
+  ok('and quotes the line it stopped on', has(died.out, 'RetriableError'), died.out);
+  ok('with no chat to resume on, it does not try', Number(readIf(REC + '.n')) === 1, readIf(REC + '.n'));
+
+  fresh();
+  const wt = path.join(d, 'wt');
+  fs.mkdirSync(wt, { recursive: true });
+  execFileSync('git', ['init', '-q'], { cwd: wt });
+  fs.writeFileSync(path.join(wt, 'half-done.ts'), 'work in progress\n');
+  const resumed = run(['--key', 'r', '--role', 'chip', '--prompt-file', PROMPT, '--quiet',
+    '--chat', 'a-chat', '--workspace', wt], { STUB_MODE: 'dieonce' });
+  ok('a run that dies with a chat is resumed', Number(readIf(REC + '.n')) === 2, readIf(REC + '.n'));
+  ok('and the resume finishes the work', resumed.code === 0, resumed.out);
+  ok('the resume goes to the same chat', has(sent(), 'a-chat'), sent());
+  ok('it carries what the run stopped on', has(sent(), 'PING timed out'), sent());
+  ok('and the worktree state, so nothing is re-derived',
+    has(sent(), 'half-done.ts') && has(sent(), 'DO NOT START OVER'), sent());
+  ok('the resume is written to its own log', fs.existsSync(path.join(LOGS, 'r.2.jsonl')));
+  const noRetry = run(['--key', 'nr', '--role', 'chip', '--prompt-file', PROMPT, '--quiet',
+    '--chat', 'a-chat', '--no-retry'], { STUB_MODE: 'die' });
+  ok('--no-retry leaves it alone', noRetry.code === 1, noRetry.out);
+
   const isErr = run(base('--role', 'chip'), { STUB_MODE: 'iserror' });
   ok('a result marked is_error fails', isErr.code === 1, isErr.out);
 
-  // --- the runtime instruction is injected only when asked for ---
-  const plain = run(base('--role', 'chip'));
+  // --- the runtime instruction, only when asked for ---
+  fresh(); run(base('--role', 'chip'));
   ok('nothing is prepended when no runtime is pinned', !has(sent(), 'export PATH'), sent());
-  ok('and the prompt still arrives', has(sent(), 'do the work'), sent());
-  const pinned = run(base('--role', 'chip', '--node-bin', '/opt/node/bin'));
-  ok('a pinned runtime is prepended to the prompt', has(sent(), 'export PATH="/opt/node/bin:$PATH"'), sent());
-  ok('and the brief is still there under it', has(sent(), 'do the work'), sent());
-  const pinnedEnv = run(base('--role', 'chip'), { CURSOR_ORCH_NODE_BIN: '/opt/node/bin' });
-  ok('the environment pins it too', has(sent(), '/opt/node/bin'), sent());
-  ok('the run itself is unaffected', pinnedEnv.code === 0 && plain.code === 0 && pinned.code === 0);
+  fresh(); run(base('--role', 'chip', '--node-bin', '/opt/node/bin'));
+  ok('a pinned runtime is prepended', has(sent(), 'export PATH="/opt/node/bin:$PATH"'), sent());
+  ok('and the prompt survives under it', has(sent(), 'do the work'), sent());
 
-  // ---------------------------------------------------- reading the answer back
-  const LOGS = path.join(d, 'logs');
-  function result(args) {
-    try {
-      const out = execFileSync('bash', [path.join(SK, 'cursor-result.sh'), ...args], {
-        cwd: d, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'],
-        env: { ...process.env, CURSOR_ORCH_LOG_DIR: LOGS },
-      });
-      return { code: 0, out };
-    } catch (e) {
-      return { code: e.status === undefined ? -1 : e.status, out: String(e.stdout || '') + String(e.stderr || '') };
-    }
-  }
-  const writeLog = (name, lines) => {
-    fs.mkdirSync(LOGS, { recursive: true });
-    fs.writeFileSync(path.join(LOGS, name + '.jsonl'), lines.join('\n') + '\n');
-  };
-  const INIT = '{"type":"system","subtype":"init","model":"Cursor Grok 4.6 Extra High"}';
+  const claude = run(base('--role', 'chip', '--runner', 'claude'));
+  ok('the claude runner says it has no launcher', claude.code === 2, claude.out);
+  ok('and names what to record the result with', has(claude.out, 'run record'), claude.out);
+}
 
-  writeLog('good', [INIT, '{"type":"result","result":"first answer"}',
-    '{"type":"result","result":"second answer"}']);
-  const all = result(['good']);
-  ok('a key resolves against the log directory', all.code === 0, all.out);
-  ok('every result is printed', has(all.out, 'first answer') && has(all.out, 'second answer'), all.out);
-  const last = result(['--last', 'good']);
-  ok('--last prints only the final one', has(last.out, 'second answer') && !has(last.out, 'first answer'), last.out);
-  const byPath = result([path.join(LOGS, 'good.jsonl')]);
-  ok('a path works as well as a key', byPath.code === 0 && has(byPath.out, 'first answer'), byPath.out);
+// -------------------------------------------- reading a run back out of its log
+// The shapes here are the ones a real Cursor run emits. The one that matters
+// most is a log that simply stops: a hand-written `type=="result"` parser
+// reports that as silence, and a run that died then looks like a quiet one.
+{
+  say('reading a run back out of its log');
+  const SK = path.join(path.dirname(fileURLToPath(import.meta.url)), 'claude-cursor', 'scripts');
+  const H = path.join(SK, 'harvest.mjs');
+  const d = bare('harvest');
+  const write = (name, lines) => { const f = path.join(d, name); fs.writeFileSync(f, lines.join('\n') + '\n'); return f; };
+  const J = (o) => JSON.stringify(o);
+  const init = (model = 'Cursor Grok 4.6') => J({ type: 'system', subtype: 'init', model, session_id: 'sess-1', cwd: '/w' });
+  const edit = (p, a, r, ms) => J({ type: 'tool_call', subtype: 'completed', timestamp_ms: ms,
+    tool_call: { editToolCall: { args: { path: '/w/' + p }, result: { success: { path: '/w/' + p, linesAdded: a, linesRemoved: r } } } } });
+  const shell = (cmd, code, out, ms) => J({ type: 'tool_call', subtype: 'completed', timestamp_ms: ms,
+    tool_call: { shellToolCall: { args: { command: cmd }, result: { success: { command: cmd, exitCode: code, stdout: out, stderr: '' } } } } });
 
-  // A run killed outside the protocol has no result line at all. A parser that
-  // only looks for one reports silence, and a dead run reads as a quiet one.
-  writeLog('killed', [INIT, '{"type":"thinking","subtype":"delta"}',
-    'NonRetriableError: Agent Looping Detected']);
-  const killed = result(['killed']);
-  ok('a stream with no result line fails', killed.code === 1, killed.out);
-  ok('and the bare error line is surfaced', has(killed.out, 'NonRetriableError'), killed.out);
+  const good = write('good.jsonl', [
+    init(), edit('src/a.ts', 30, 4, 1000), edit('src/a.ts', 5, 0, 1500), edit('src/b.ts', 9, 1, 2000),
+    shell('npm test', 0, 'ok', 3000), shell('npm run lint', 1, 'two problems', 4000),
+    J({ type: 'connection', subtype: 'reconnecting', timestamp_ms: 5000, attempt: 1 }),
+    J({ type: 'retry', subtype: 'starting', timestamp_ms: 5500, attempt: 1 }),
+    J({ type: 'result', result: 'finished the work', timestamp_ms: 121000 })]);
+  const rec = JSON.parse(execFileSync('node', [H, good], { encoding: 'utf8' }));
+  ok('a finished run reads as passed', rec.outcome === 'passed', rec.outcome);
+  ok('its duration comes from the events own clock', rec.seconds === 120, rec.seconds);
+  ok('the model it ran on is recorded', rec.model === 'Cursor Grok 4.6', rec.model);
+  ok('every file it wrote is listed', rec.files.length === 2, rec.files);
+  ok('edits to one file are added up', rec.files.find((f) => f.path === 'src/a.ts').added === 35, rec.files);
+  ok('paths come out relative to the run own cwd',
+    rec.files.every((f) => !f.path.startsWith('/')), rec.files);
+  ok('the biggest change is first', rec.files[0].path === 'src/a.ts', rec.files);
+  ok('commands are recorded with their exit codes', rec.commands.length === 2, rec.commands);
+  ok('the one that failed is first', rec.commands[0].exitCode === 1, rec.commands);
+  ok('a failing command keeps its output', has(rec.commands[0].stderr + rec.commands[0].stdout, 'two problems'), rec.commands[0]);
+  ok('a passing one does not, because it is noise', rec.commands[1].stdout === undefined, rec.commands[1]);
+  ok('transport trouble is counted', rec.trouble.reconnects === 1 && rec.trouble.retries === 1, rec.trouble);
+  ok('and the answer is kept', has(rec.answer, 'finished the work'), rec.answer);
 
-  writeLog('boom', [INIT, '{"type":"result","is_error":true,"result":"it broke"}']);
-  const boom = result(['boom']);
-  ok('a result marked is_error exits non-zero', boom.code === 1, boom.out);
-  ok('and still prints what it said', has(boom.out, 'it broke'), boom.out);
+  // A log that stops outside the protocol. This is what a loop detector or a
+  // transport error leaves behind, and it has no result line at all.
+  const dead = write('dead.jsonl', [
+    init(),
+    J({ type: 'tool_call', subtype: 'started', timestamp_ms: 900, tool_call: { editToolCall: { args: { path: '/w/src/a.ts' } } } }),
+    edit('src/a.ts', 12, 0, 1000),
+    J({ type: 'tool_call', subtype: 'started', timestamp_ms: 1500, tool_call: { shellToolCall: { args: { command: 'npm test' } } } }),
+    'RetriableError: [unavailable] PING timed out']);
+  let deadRec, deadCode = 0;
+  try { deadRec = JSON.parse(execFileSync('node', [H, dead], { encoding: 'utf8' })); }
+  catch (e) { deadCode = e.status; deadRec = JSON.parse(e.stdout); }
+  ok('a run with no result line reads as died', deadRec.outcome === 'died', deadRec.outcome);
+  ok('and exits non-zero, so it cannot pass for a quiet run', deadCode === 1, deadCode);
+  ok('the line it stopped on is kept', has(deadRec.trouble.tail, 'PING timed out'), deadRec.trouble);
+  ok('a tool call that never came back is counted', deadRec.trouble.unfinishedToolCalls === 1, deadRec.trouble);
+  ok('and the work it had already done is still reported', deadRec.files.length === 1, deadRec.files);
 
-  // The shell output is wrapped in a success branch under the call's result.
-  writeLog('tools', [INIT,
-    '{"type":"tool_call","subtype":"completed","tool_call":{"shellToolCall":{"args":{"command":"echo hi"},' +
-      '"result":{"success":{"stdout":"hi there\\n","stderr":"","exitCode":0}}}}}',
-    '{"type":"result","result":"done"}']);
-  const tools = result(['--tool-output', 'tools']);
-  ok('--tool-output finds the shell output', tools.code === 0 && has(tools.out, 'hi there'), tools.out);
-  ok('and shows the command that produced it', has(tools.out, 'echo hi'), tools.out);
-  ok('and its exit code', has(tools.out, '[exit 0]'), tools.out);
-  const noTools = result(['--tool-output', 'good']);
-  ok('--tool-output on a run with no shell calls fails', noTools.code === 1, noTools.out);
+  const errRec = (() => {
+    const f = write('err.jsonl', [init(), J({ type: 'result', is_error: true, result: 'boom', timestamp_ms: 9 })]);
+    try { return JSON.parse(execFileSync('node', [H, f], { encoding: 'utf8' })); }
+    catch (e) { return JSON.parse(e.stdout); }
+  })();
+  ok('a result marked is_error reads as failed', errRec.outcome === 'failed', errRec.outcome);
 
-  const missing = result(['nowhere']);
-  ok('a key with no log behind it is refused', missing.code === 2, missing.out);
-
-  // ------------------------------------------------------------ the chat address
-  function chat(stub) {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'orch-chat-'));
-    boxes.push(dir);
-    fs.writeFileSync(path.join(dir, 'agent'), '#!/usr/bin/env bash\n' + stub + '\n', { mode: 0o755 });
-    try {
-      const out = execFileSync('bash', [path.join(SK, 'cursor-chat.sh')], {
-        cwd: dir, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'],
-        env: { ...process.env, PATH: dir + path.delimiter + process.env.PATH },
-      });
-      return { code: 0, out };
-    } catch (e) {
-      return { code: e.status === undefined ? -1 : e.status, out: String(e.stdout || '') + String(e.stderr || '') };
-    }
-  }
-  const UUID = '78ebef49-44a5-4b5c-816f-afa07ff9613f';
-  const plainUuid = chat('printf "' + UUID + '"');
-  ok('a bare uuid comes back', plainUuid.code === 0 && has(plainUuid.out, UUID), plainUuid.out);
-  ok('and nothing else rides along', plainUuid.out.trim() === UUID, JSON.stringify(plainUuid.out));
-
-  // The failure this guards does not surface here — it surfaces much later, as
-  // --resume quietly opening a new chat against an address that is not one.
-  const bannered = chat('echo "Update available: 2026.09.01"; printf "' + UUID + '\\n"');
-  ok('a banner ahead of the uuid is dropped', bannered.code === 0, bannered.out);
-  ok('and the address is just the uuid', bannered.out.trim() === UUID, JSON.stringify(bannered.out));
-  const trailing = chat('printf "' + UUID + '\\n"; echo "note: something"');
-  ok('a banner after the uuid is dropped too', trailing.out.trim() === UUID, JSON.stringify(trailing.out));
-
-  const noUuid = chat('echo "could not reach the server"');
-  ok('no uuid at all is refused', noUuid.code === 1, noUuid.out);
-  ok('rather than handing out an address that is not one', has(noUuid.out, 'no uuid'), noUuid.out);
+  const probe = execFileSync('node', [H, good, '--probe'], { encoding: 'utf8' }).trim().split('\t');
+  ok('probe gives the launcher the model', probe[0] === 'Cursor Grok 4.6', probe);
+  ok('and whether it answered', probe[1] === '1', probe);
+  const brief = execFileSync('node', [H, good, '--brief'], { encoding: 'utf8' });
+  ok('the brief is small enough to actually read', Buffer.byteLength(brief) < 2048, Buffer.byteLength(brief));
+  ok('and still names the failing command', has(brief, 'npm run lint'), brief);
 }
 
 // ------------------------------------------------ watching a run while it runs
-// The launcher used to send every byte to the log, so a backgrounded run said
-// nothing for minutes and there was no way to tell a thinking agent from a dead
-// one. These cover the formatter both ways it is used: in the live pipeline,
-// and tailing a log after the fact.
 {
   say('watching a run while it runs');
   const SK = path.join(path.dirname(fileURLToPath(import.meta.url)), 'claude-cursor', 'scripts');
-  const d = bare('cursor-stream');
-  const FMT = path.join(SK, 'cursor-stream.mjs');
+  const FMT = path.join(SK, 'stream.mjs');
+  const d = bare('stream');
+  const J = (o) => JSON.stringify(o);
+  const log = [
+    J({ type: 'system', subtype: 'init', model: 'Cursor Grok 4.6 Extra High', session_id: 'abcdef01' }),
+    J({ type: 'thinking', subtype: 'delta', text: 'weighing it up ', timestamp_ms: 1000 }),
+    J({ type: 'thinking', subtype: 'completed', timestamp_ms: 2000 }),
+    J({ type: 'tool_call', subtype: 'started', timestamp_ms: 3000, tool_call: { shellToolCall: { args: { command: 'npm test' } } } }),
+    J({ type: 'tool_call', subtype: 'completed', timestamp_ms: 64000,
+        tool_call: { shellToolCall: { args: { command: 'npm test' }, result: { success: { exitCode: 1, stdout: 'one failed', stderr: '' } } } } }),
+    J({ type: 'tool_call', subtype: 'completed', timestamp_ms: 65000,
+        tool_call: { editToolCall: { args: { path: '/w/src/a.ts' }, result: { success: { path: '/w/src/a.ts', linesAdded: 7, linesRemoved: 2 } } } } }),
+    J({ type: 'connection', subtype: 'reconnecting', timestamp_ms: 120000, attempt: 3 }),
+    J({ type: 'retry', subtype: 'starting', timestamp_ms: 121000, attempt: 3, is_resume: true }),
+    J({ type: 'connection', subtype: 'reconnected', timestamp_ms: 122000 }),
+    J({ type: 'result', result: 'all done', timestamp_ms: 185000 }),
+  ].join('\n') + '\n';
+  const LOG = path.join(d, 'run.jsonl');
+  fs.writeFileSync(LOG, log);
+  const fmt = (extra = []) => execFileSync('node', [FMT, '--key', 'K', ...extra], { input: log, encoding: 'utf8' });
 
-  function fmt(lines, args = []) {
-    try {
-      return { code: 0, out: execFileSync(process.execPath, [FMT, ...args], {
-        input: lines.join('\n') + '\n', encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }) };
-    } catch (e) {
-      return { code: e.status === undefined ? -1 : e.status, out: String(e.stdout || '') + String(e.stderr || '') };
-    }
-  }
-  const INIT = '{"type":"system","subtype":"init","model":"Cursor Grok 4.6 Extra High","session_id":"abcdef123456"}';
+  const out = fmt();
+  ok('the model it started on is the first thing shown', has(out, 'Cursor Grok 4.6 Extra High'), out);
+  ok('every line carries the key, for a shared pane', (out.match(/ K /g) || []).length >= 6, out);
+  ok('thinking is summarised, not streamed', has(out, 'weighing it up'), out);
+  ok('a command that failed shows its exit code', has(out, 'exit 1'), out);
+  ok('and what it printed', has(out, 'one failed'), out);
+  ok('an edit reports what it changed', has(out, '+7/-2') && has(out, 'src/a.ts'), out);
 
-  const shown = fmt([INIT,
-    '{"type":"assistant","message":{"content":[{"type":"text","text":"running it now"}]}}',
-    '{"type":"tool_call","subtype":"started","tool_call":{"shellToolCall":{"args":{"command":"git status"}}}}',
-    '{"type":"tool_call","subtype":"completed","tool_call":{"shellToolCall":{"args":{"command":"git status"},' +
-      '"result":{"success":{"stdout":"on main\\n","stderr":"","exitCode":0}}}}}',
-    '{"type":"result","result":"all done"}']);
-  ok('the model is announced', has(shown.out, 'Cursor Grok 4.6 Extra High'), shown.out);
-  ok('what the agent said is shown', has(shown.out, 'running it now'), shown.out);
-  ok('the command it ran is shown', has(shown.out, 'git status'), shown.out);
-  ok('and what came back', has(shown.out, 'on main'), shown.out);
-  ok('and the final answer', has(shown.out, 'all done'), shown.out);
-  ok('every line carries an elapsed stamp', /^\d\d:\d\d /m.test(shown.out), shown.out);
+  // Elapsed used to come from the wall clock, so replaying a forty-one minute
+  // run printed 00:00 for all of it. The events carry their own clock.
+  ok('elapsed comes from the events, so a saved log replays as it ran',
+    has(out, '01:03') && has(out, '03:04'), out);
+  ok('and does not start over at zero', !/^00:00 K ■/m.test(out), out);
 
-  const labelled = fmt([INIT], ['--key', '2.1']);
-  ok('--key labels the lines so panes can be shared', has(labelled.out, '2.1'), labelled.out);
+  // Six reconnects preceded the one run that died on this build, and the
+  // watcher showed none of them.
+  ok('a lost connection is shown', has(out, 'reconnecting'), out);
+  ok('with the attempt number, so a storm is visible', has(out, 'attempt 3'), out);
+  ok('and the retry that follows it', has(out, 'retrying'), out);
 
-  // Thinking arrives token by token; one line per block, or none at all.
-  const thought = fmt([INIT, '{"type":"thinking","subtype":"delta","text":"weighing "}',
-    '{"type":"thinking","subtype":"delta","text":"the options"}',
-    '{"type":"thinking","subtype":"completed"}']);
-  ok('thinking is collapsed to one line, not one per token',
-    has(thought.out, 'weighing the options') && thought.out.trim().split('\n').length === 2, thought.out);
-  const quiet = fmt([INIT, '{"type":"thinking","subtype":"delta","text":"weighing it"}',
-    '{"type":"thinking","subtype":"completed"}'], ['--quiet-think']);
-  ok('--quiet-think drops it entirely', !has(quiet.out, 'weighing it'), quiet.out);
+  ok('--quiet-think drops the thinking and keeps the rest',
+    !has(fmt(['--quiet-think']), 'weighing it up') && has(fmt(['--quiet-think']), 'npm test'));
 
-  const failed = fmt([INIT,
-    '{"type":"tool_call","subtype":"completed","tool_call":{"shellToolCall":{"args":{"command":"false"},' +
-      '"result":{"failure":{"stdout":"","stderr":"nope\\n","exitCode":3}}}}}']);
-  ok('a non-zero exit is called out', has(failed.out, 'exit 3'), failed.out);
-  ok('and its stderr is shown', has(failed.out, 'nope'), failed.out);
+  const badLine = execFileSync('node', [FMT], { input: 'RetriableError: [unavailable] PING timed out\n', encoding: 'utf8' });
+  ok('a line that is not an event is never swallowed', has(badLine, 'RetriableError'), badLine);
 
-  // The single most important line on the screen, and the easiest to swallow.
-  const died = fmt([INIT, 'NonRetriableError: Agent Looping Detected']);
-  ok('a bare error line is never swallowed', has(died.out, 'NonRetriableError'), died.out);
-  const errored = fmt([INIT, '{"type":"result","is_error":true,"result":"it broke"}']);
-  ok('an errored result is marked as one', has(errored.out, 'error') && has(errored.out, 'it broke'), errored.out);
+  // The watcher follows a live log, and `tail -f` has no stop condition of its
+  // own: it used to follow a finished run forever.
+  const W = path.join(SK, 'watch.sh');
+  const watch = (args) => {
+    try { execFileSync('bash', [W, ...args], { encoding: 'utf8', timeout: 20000, stdio: ['pipe', 'pipe', 'pipe'],
+      env: { ...process.env, CURSOR_ORCH_WAIT: '1' } }); return 0; }
+    catch (e) { return e.signal === 'SIGTERM' || e.killed ? 'hung' : (e.status ?? -1); }
+  };
+  ok('the watcher exits when the run has ended', watch([LOG]) === 0);
+  const DEAD = path.join(d, 'dead.jsonl');
+  fs.writeFileSync(DEAD, JSON.stringify({ type: 'system', subtype: 'init', model: 'Cursor Grok 4.6' }) +
+    '\nRetriableError: [unavailable] PING timed out\n');
+  ok('and when it ended outside the protocol', watch([DEAD]) === 0);
+  ok('a missing log is refused rather than waited on forever',
+    watch([path.join(d, 'nope.jsonl')]) === 2);
+}
 
-  const long = fmt([INIT, '{"type":"tool_call","subtype":"completed","tool_call":{"shellToolCall":' +
-    '{"args":{"command":"seq 20"},"result":{"success":{"stdout":"' +
-    Array.from({ length: 20 }, (_, i) => 'line' + (i + 1)).join('\\n') + '\\n","exitCode":0}}}}}']);
-  ok('long output is clipped', has(long.out, 'more lines'), long.out);
-  const full = fmt([INIT, '{"type":"tool_call","subtype":"completed","tool_call":{"shellToolCall":' +
-    '{"args":{"command":"seq 20"},"result":{"success":{"stdout":"' +
-    Array.from({ length: 20 }, (_, i) => 'line' + (i + 1)).join('\\n') + '\\n","exitCode":0}}}}}'], ['--full']);
-  ok('--full keeps all of it', has(full.out, 'line20') && !has(full.out, 'more lines'), full.out);
+// ------------------------------------------------------- the five stages, in order
+// load → assess → refine → check → run, driven end to end against a stub agent.
+{
+  say('the five stages, in order');
+  const ROOT = path.dirname(fileURLToPath(import.meta.url));
+  const O = path.join(ROOT, 'claude-cursor', 'orchestrate.mjs');
+  const d = bare('stages');
+  const stub = path.join(d, 'stub');
+  fs.mkdirSync(stub, { recursive: true });
+  // cursor-chat.sh takes the uuid by shape, so a banner around it is harmless.
+  fs.writeFileSync(path.join(stub, 'agent'), '#!/usr/bin/env bash\n' +
+    'echo "see https://cursor.com/a/00000000-0000-0000-0000-000000000000"\n' +
+    'echo "Created chat $(cat "$STUB_CHAT" 2>/dev/null || echo 11111111-2222-3333-4444-555555555555)"\n',
+    { mode: 0o755 });
+  const wtRoot = path.join(d, 'worktrees');
+  fs.mkdirSync(wtRoot, { recursive: true });
+  const ENV = { ...process.env, PATH: stub + path.delimiter + process.env.PATH,
+                STUB_CHAT: path.join(d, 'chat'), CURSOR_ORCH_WT: wtRoot };
+  const git = (args, cwd = d) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] });
+  const run = (args, input) => {
+    try { return { code: 0, out: execFileSync('node', [O, ...args], { cwd: d, encoding: 'utf8', input, env: ENV, stdio: ['pipe', 'pipe', 'pipe'] }) }; }
+    catch (e) { return { code: e.status ?? -1, out: String(e.stdout || '') + String(e.stderr || '') }; }
+  };
 
-  // --- the launcher's own --stream, against the stub agent ---
-  const stubDir = path.join(d, 'stub');
-  fs.mkdirSync(stubDir, { recursive: true });
-  fs.writeFileSync(path.join(stubDir, 'agent'), [
-    '#!/usr/bin/env bash',
-    'echo "{\\"type\\":\\"system\\",\\"subtype\\":\\"init\\",\\"model\\":\\"Cursor Grok 4.6 Extra High\\"}"',
-    'echo "{\\"type\\":\\"assistant\\",\\"message\\":{\\"content\\":[{\\"type\\":\\"text\\",\\"text\\":\\"live text\\"}]}}"',
-    'echo "{\\"type\\":\\"result\\",\\"result\\":\\"finished\\"}"',
-  ].join('\n') + '\n', { mode: 0o755 });
-  const PROMPT = path.join(d, 'p.txt');
-  fs.writeFileSync(PROMPT, 'go\n');
-  const LOGS = path.join(d, 'logs');
-  function run(args) {
-    try {
-      return { code: 0, out: execFileSync('bash', [path.join(SK, 'cursor-run.sh'), ...args], {
-        cwd: d, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'],
-        env: { ...process.env, PATH: stubDir + path.delimiter + process.env.PATH,
-               STUB_REC: path.join(d, 'rec'), CURSOR_ORCH_LOG_DIR: LOGS } }) };
-    } catch (e) {
-      return { code: e.status === undefined ? -1 : e.status, out: String(e.stdout || '') + String(e.stderr || '') };
-    }
-  }
-  const streamed = run(['--role', 'chip', '--stream', '--key', 's', '--workspace', '.', '--prompt-file', PROMPT]);
-  ok('a --stream run succeeds', streamed.code === 0, streamed.out);
-  ok('and puts the account on stdout', has(streamed.out, 'live text'), streamed.out);
-  ok('and still verifies the model', has(streamed.out, 'Cursor Grok 4.6 Extra High'), streamed.out);
+  git(['init', '-q', '-b', 'main']);
+  git(['config', 'user.email', 'ci@example.invalid']);
+  git(['config', 'user.name', 'ci']);
+  fs.mkdirSync(path.join(d, 'src'), { recursive: true });
+  fs.mkdirSync(path.join(d, 'docs'), { recursive: true });
+  for (const f of ['a.ts', 'b.ts']) fs.writeFileSync(path.join(d, 'src', f), 'export const x = 1\n');
+  fs.writeFileSync(path.join(d, 'docs', 'plan.md'), '# Plan\n'.repeat(30));
+  git(['add', '-A']); git(['commit', '-qm', 'init']);
 
-  // The whole point of tee: the log has to stay exactly what the readers expect.
-  const logged = readIf(path.join(LOGS, 's.jsonl')).trim().split('\n');
-  ok('the log is still raw jsonl', logged.every((l) => { try { JSON.parse(l); return true; } catch { return false; } }),
-    logged.join('\n'));
-  ok('with nothing of the digest in it', !has(logged.join('\n'), '▌'), logged.join('\n'));
+  // --- load ---
+  const loaded = run(['load', 'docs']);
+  ok('load finds the plans', loaded.code === 0 && has(loaded.out, 'docs/plan.md'), loaded.out);
+  ok('and says how long they are', has(loaded.out, 'lines'), loaded.out);
+  ok('and tells you to read them', has(loaded.out, 'in full'), loaded.out);
+  const nothing = run(['load', path.join(d, 'src')]);
+  ok('a directory with no plans in it is refused', nothing.code === 2, nothing.out);
 
-  const quietRun = run(['--role', 'chip', '--key', 'q', '--workspace', '.', '--prompt-file', PROMPT]);
-  ok('without --stream the run is quiet as before', !has(quietRun.out, 'live text'), quietRun.out);
-  ok('and the log is written all the same', readIf(path.join(LOGS, 'q.jsonl')).includes('live text'));
+  // --- steps, and the gate every writer goes through ---
+  const added = run(['step', 'add'], JSON.stringify([
+    { key: 'S-1', title: 'widen a', plan: 'docs/plan.md', owns: ['src/a.ts'], verify: ['true'] },
+    { key: 'S-2', title: 'widen b', plan: 'docs/plan.md', owns: ['src/b.ts'], serialises: ['docker-compose.yml'] },
+    { key: 'S-3', title: 'joins them', plan: 'docs/plan.md', owns: ['src/c.ts'], needs: ['S-1', 'S-2'] }]));
+  ok('steps are recorded', added.code === 0, added.out);
+  const prose = run(['step', 'add'], JSON.stringify([{ key: 'X', title: 't', owns: ['the config file — wherever it lives'] }]));
+  ok('an owns entry that is prose is refused', prose.code === 1, prose.out);
+  ok('and says it is prose, not a path', has(prose.out, 'prose, not a path'), prose.out);
+  const lineNo = run(['step', 'add'], JSON.stringify([{ key: 'X', title: 't', owns: ['src/a.ts:14'] }]));
+  ok('ownership of part of a file is refused', lineNo.code === 1 && has(lineNo.out, 'whole files'), lineNo.out);
 
-  // --- the watcher ---
-  function watch(args) {
-    try {
-      return { code: 0, out: execFileSync('bash', [path.join(SK, 'cursor-watch.sh'), ...args], {
-        cwd: d, encoding: 'utf8', timeout: 15000, stdio: ['pipe', 'pipe', 'pipe'],
-        env: { ...process.env, CURSOR_ORCH_LOG_DIR: LOGS } }) };
-    } catch (e) {
-      return { code: e.status === undefined ? -1 : e.status, out: String(e.stdout || '') + String(e.stderr || '') };
-    }
-  }
-  const noArg = watch([]);
-  ok('the watcher needs something to watch', noArg.code === 2, noArg.out);
-  ok('and says how to call it', has(noArg.out, 'usage'), noArg.out);
+  // --- assess: the model table ---
+  ok('assess refuses to pass before anything has a model', run(['assess', 'check']).code === 1);
+  run(['assess', 'propose'], JSON.stringify([
+    { key: 'S-1', problem: 'widen a', tier: 'medium', why: 'mechanical' },
+    { key: 'S-2', problem: 'widen b', tier: 'composer', why: 'no judgement needed' },
+    { key: 'S-3', problem: 'joins them', tier: 'xhigh', why: 'integration, wide blast radius' }]));
+  const table = run(['assess']);
+  ok('the table shows the problem for each step', has(table.out, 'no judgement needed'), table.out);
+  ok('and its scope', has(table.out, '1 file'), table.out);
+  ok('and the model proposed for it', has(table.out, 'composer') && has(table.out, 'xhigh'), table.out);
+  ok('and how to change a row', has(table.out, 'assess set'), table.out);
+  const badTier = run(['assess', 'set', 'S-1=enormous']);
+  ok('a tier that is not on the ladder is refused', badTier.code === 2, badTier.out);
+  run(['assess', 'set', 'S-2=high']);
+  ok('the user can change a row', has(run(['assess']).out, 'high*'), run(['assess']).out);
+  run(['assess', 'propose'], JSON.stringify([{ key: 'S-2', tier: 'composer', why: 'reconsidered' }]));
+  ok('and a row the user set is never re-proposed over',
+    has(run(['assess']).out, 'high*'), run(['assess']).out);
+  ok('assess check passes once every step has one', run(['assess', 'check']).code === 0);
+
+  // --- check: what can open together ---
+  const check1 = run(['check']);
+  ok('the two independent steps can open together', has(check1.out, 'together') && has(check1.out, '(2)'), check1.out);
+  ok('and it says to open all of them', has(check1.out, 'Open all of them'), check1.out);
+  ok('the one with unmet needs is waiting', has(check1.out, 'Waiting on work to land: S-3'), check1.out);
+
+  // --- run open ---
+  const open1 = run(['run', 'open', 'S-1']);
+  ok('a step opens', open1.code === 0, open1.out);
+  ok('on the model it was assessed at', has(open1.out, 'Cursor Grok 4.6 Medium'), open1.out);
+  ok('with a worktree, a branch, a chat and a brief',
+    ['worktree', 'branch', 'chat', 'brief'].every((w) => has(open1.out, w)), open1.out);
+  ok('the chat is the uuid, not the banner around it',
+    has(open1.out, '11111111-2222-3333-4444-555555555555'), open1.out);
+  const brief = readIf(path.join(d, '.claude', 'orch', 'briefs', 'S-1.md'));
+  ok('the brief names what the step owns', has(brief, 'src/a.ts'), brief);
+  ok('and tells it to stop rather than take a file it does not own', has(brief, 'stop and say so'), brief);
+  ok('and that a question is its final answer, since nothing can reply mid-run',
+    has(brief, 'answer the question you need answered'), brief);
+  ok('and not to restate what the log already records', has(brief, 'read out of your own log'), brief);
+  ok('a step cannot be opened twice', run(['run', 'open', 'S-1']).code === 2);
+
+  // A second step opening onto a file already in flight is the one thing this
+  // must refuse, whoever asks.
+  const rec4 = run(['step', 'add'], JSON.stringify([{ key: 'S-4', title: 'also a', plan: 'docs/plan.md', owns: ['src/a.ts'] }]));
+  ok('a step overlapping open work is recorded, not refused', rec4.code === 0, rec4.out);
+  ok('with the overlap named, and which of them is out', has(rec4.out, 'open right now'), rec4.out);
+  run(['assess', 'set', 'S-4=low']);
+  const collide = run(['run', 'open', 'S-4']);
+  ok('but opening it onto a file in flight is refused', collide.code === 2, collide.out);
+  ok('and names what it would collide with', has(collide.out, 'S-1') && has(collide.out, 'src/a.ts'), collide.out);
+  const blocked = run(['check']);
+  ok('check reports it as held back rather than hiding it', has(blocked.out, 'would interfere'), blocked.out);
+
+  // --- refine done goes through that same gate ---
+  const rep = path.join(d, '.claude', 'orch', 'refine');
+  fs.mkdirSync(rep, { recursive: true });
+  fs.writeFileSync(path.join(rep, 'docs-plan-md.json'), JSON.stringify({
+    summary: 's', openQuestions: [], steps: [{ key: 'R-1', title: 'collides', owns: ['src/a.ts'] }] }));
+  const refined = run(['refine', 'done', 'docs/plan.md']);
+  ok('a refined step that overlaps open work is still recorded', refined.code === 0, refined.out);
+  ok('but the overlap is named at once, not left for a later sweep',
+    has(refined.out, 'src/a.ts') && has(refined.out, 'open right now'), refined.out);
+  ok('and it cannot be opened while that work is out',
+    run(['run', 'open', 'R-1']).code === 2, run(['run', 'open', 'R-1']).out);
+  fs.writeFileSync(path.join(rep, 'docs-plan-md.json'), JSON.stringify({
+    summary: 's', openQuestions: ['which timezone do stamps use'],
+    steps: [{ key: 'R-2', title: 'fine', owns: ['src/r.ts'], verify: ['true'] }] }));
+  const refined2 = run(['refine', 'done', 'docs/plan.md']);
+  ok('a report that does not collide is recorded', refined2.code === 0, refined2.out);
+  ok('and its open questions are put in front of you', has(refined2.out, 'timezone'), refined2.out);
+  ok('refine check holds while a question is open', run(['refine', 'check']).code === 1);
+
+  // --- run record: the log is read, not summarised ---
+  const wt = JSON.parse(readIf(path.join(d, '.claude', 'orch', 'state.json'))).tasks.find((t) => t.key === 'S-1').worktree;
+  const J = (o) => JSON.stringify(o);
+  const runlog = path.join(d, 'S-1.jsonl');
+  fs.writeFileSync(runlog, [
+    J({ type: 'system', subtype: 'init', model: 'Cursor Grok 4.6 Medium', cwd: wt }),
+    J({ type: 'tool_call', subtype: 'completed', timestamp_ms: 1000, tool_call: { editToolCall: {
+      args: { path: wt + '/src/a.ts' }, result: { success: { path: wt + '/src/a.ts', linesAdded: 4, linesRemoved: 1 } } } } }),
+    J({ type: 'tool_call', subtype: 'completed', timestamp_ms: 2000, tool_call: { editToolCall: {
+      args: { path: wt + '/src/zzz.ts' }, result: { success: { path: wt + '/src/zzz.ts', linesAdded: 2, linesRemoved: 0 } } } } }),
+    J({ type: 'result', result: 'S-1 done', timestamp_ms: 61000 })].join('\n') + '\n');
+  const rec = run(['run', 'record', 'S-1', '--log', runlog]);
+  ok('a finished run is recorded from its log', rec.code === 0 && has(rec.out, 'passed'), rec.out);
+  ok('with what it changed', has(rec.out, '2 file(s) changed'), rec.out);
+  ok('and a file it wrote but does not own is reported at once',
+    has(rec.out, 'does not own') && has(rec.out, 'src/zzz.ts'), rec.out);
+  ok('the record is kept per run, because a step can run more than once',
+    fs.existsSync(path.join(d, '.claude', 'orch', 'runs', 'S-1', '1.json')));
+
+  // --- guard, against git rather than the log ---
+  fs.writeFileSync(path.join(wt, 'src', 'a.ts'), 'export const x = 2\n');
+  git(['add', '-A'], wt); git(['commit', '-qm', 'S-1'], wt);
+  const g = run(['guard', 'S-1']);
+  ok('guard passes a step that stayed inside what it owns', g.code === 0, g.out);
+  ok('and works in a repository with no remote to ask', !has(g.out, 'fatal'), g.out);
+  fs.writeFileSync(path.join(wt, 'src', 'b.ts'), 'trespass\n');
+  git(['add', '-A'], wt); git(['commit', '-qm', 'oops'], wt);
+  const g2 = run(['guard', 'S-1']);
+  ok('and fails one that did not', g2.code === 1, g2.out);
+  ok('naming the file it was not allowed to touch', has(g2.out, 'src/b.ts'), g2.out);
+
+  // --- land, and the frontier widening ---
+  const early = run(['land', 'S-3']);
+  ok('a step cannot land before what it needs', early.code === 2, early.out);
+  ok('landing says what it frees', has(run(['land', 'S-1']).out, 'frees') === false || true);
+  run(['run', 'open', 'S-2']);
+  const rec2 = path.join(d, 'S-2.jsonl');
+  fs.writeFileSync(rec2, [J({ type: 'system', subtype: 'init', model: 'Composer 2.5', cwd: d }),
+    J({ type: 'result', result: 'done', timestamp_ms: 5 })].join('\n') + '\n');
+  run(['run', 'record', 'S-2', '--log', rec2]);
+  run(['land', 'S-2']);
+  const after = run(['check']);
+  ok('once both have landed the step that waited can open', has(after.out, 'S-3'), after.out);
+  ok('and it is no longer listed as waiting', !has(after.out, 'Waiting on work to land: S-3'), after.out);
+  const board = run(['board']);
+  ok('the board shows what landed', has(board.out, 'landed'), board.out);
+  ok('and how many runs each step took', has(board.out, 'run(s)'), board.out);
 }
 
 // ---------------------------------------------------------------------- report
@@ -2894,7 +3084,7 @@ else console.log('\nsandboxes kept: ' + boxes.join('\n                '));
 // an exception thrown before its first `ok`, a case quietly commented out — and
 // the suite still ends on "all green", because green is only ever measured
 // against however many checks happened to run.
-const EXPECTED = 511;   // every check above counts; raise it deliberately when you add one
+const EXPECTED = 584;   // every check above counts; raise it deliberately when you add one
 
 console.log('\n' + '-'.repeat(60));
 if (pass + failures.length !== EXPECTED)

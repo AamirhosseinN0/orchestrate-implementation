@@ -148,29 +148,43 @@ function stepProblems(s, it, existing) {
     else if (/:\d+/.test(o)) p.push(`owns entry "${o}" carries a :line suffix — ownership is whole files`);
     else if (!/[/.]/.test(o) && o.split(/\s+/).length > 1) p.push(`owns entry "${o}" reads as a sentence, not a path`);
   }
-  // The collision check, run on every write rather than only on `task add`.
-  const mine = { owns: it.owns || existing?.owns || [], serialises: it.serialises || existing?.serialises || [] };
+  return p;
+}
+// Two steps sharing a file is not a reason to refuse the record — it only means
+// they cannot be open at the same time, which is `check`'s business and
+// `run open`'s gate. Refusing here would make refining impossible the moment
+// anything was in flight. So overlaps are reported, loudly, and written down.
+function overlapsOf(s, it) {
+  const mine = { owns: it.owns || [], serialises: it.serialises || [] };
+  const out = [];
   for (const other of tasks(s)) {
     if (other.key === it.key || DEAD_STATUS.includes(other.status)) continue;
     const i = interference(mine, other);
-    if (!i) continue;
-    // Two planned steps may share a file — that only means they cannot open
-    // together, which `check` reports. Sharing with something already OPEN is
-    // the one that must be refused now.
-    if (OPEN_STATUSES.includes(other.status)) {
-      const what = [...i.files, ...i.points.map((x) => 'serialisation point ' + x)].join('; ');
-      p.push(`would collide with ${other.key}, which is open right now: ${what}`);
-    }
+    if (i) out.push({ key: other.key, status: other.status, what: [...i.files, ...i.points.map((x) => 'serialisation point ' + x)].join('; ') });
   }
-  return p;
+  return out;
 }
 function putStep(s, it) {
   const existing = depOf(s, it.key);
   const problems = stepProblems(s, it, existing);
   if (problems.length) return problems;
-  if (existing) { Object.assign(existing, it); existing.status ||= 'planned'; }
-  else s.tasks.push({ status: 'planned', needs: [], owns: [], serialises: [], verify: [], ...it });
+  const merged = existing ? { ...existing, ...it } : { status: 'planned', needs: [], owns: [], serialises: [], verify: [], ...it };
+  if (existing) Object.assign(existing, it); else s.tasks.push(merged);
   return null;
+}
+function reportOverlaps(s, keys) {
+  const lines = [];
+  for (const k of keys) {
+    const t = depOf(s, k); if (!t) continue;
+    for (const o of overlapsOf(s, t)) {
+      lines.push(`  ${k} ↔ ${o.key}${OPEN_STATUSES.includes(o.status) ? ' (open right now)' : ''}: ${o.what}`);
+    }
+  }
+  if (lines.length) {
+    console.log(`\n${lines.length} overlap(s) — these cannot open at the same time:`);
+    for (const l of lines) console.log(l);
+    console.log('  If that is not what you meant, one of them owns too much. `check` decides the order.');
+  }
 }
 
 // ------------------------------------------------------------------ the model
@@ -241,6 +255,7 @@ CMDS.step = (argv) => {
   }
   commit(s, 'step add', argv);
   ok(`${list.length} step(s) recorded. ${tasks(s).length} in the register.`);
+  reportOverlaps(s, list.map((it) => it.key));
 };
 
 // The judgement, as the orchestrator read it. Stored, not computed.
@@ -318,6 +333,14 @@ CMDS.check = () => {
   }
   if (f.waiting.length) console.log('\nWaiting on work to land: ' + f.waiting.map((t) => t.key).join('  '));
   process.exit(bad ? 1 : 0);
+};
+
+// The ladder lives in models.json and models.mjs owns it; this is only a way to
+// see it without knowing where the scripts are.
+CMDS.models = (argv) => {
+  const r = execFileSync('node', [path.join(HERE, 'scripts', 'models.mjs'), ...(argv.length ? argv : ['list'])],
+    { encoding: 'utf8', stdio: ['inherit', 'pipe', 'inherit'] });
+  process.stdout.write(r);
 };
 
 CMDS.board = () => {
@@ -412,6 +435,7 @@ Report the file written, not a summary in your reply.`);
     rec.openQuestions = rep.openQuestions || [];
     commit(s, 'refine done', argv);
     ok(`${steps.length} step(s) from ${rec.path}: ${steps.map((t) => t.key).join(' ')}`);
+    reportOverlaps(s, steps.map((t) => t.key));
     if (rec.openQuestions.length) {
       console.log(`\n${rec.openQuestions.length} thing(s) it could not settle from the code — put these to the user before building:`);
       for (const q of rec.openQuestions) console.log('  · ' + q);
@@ -453,8 +477,20 @@ CMDS.run = (argv) => {
     }
     const row = tierOf(t.tier);
     t.branch = t.branch || `step/${key}`;
-    t.worktree = t.worktree || path.resolve(CWD, '..', `wt-${key}`);
-    if (!fs.existsSync(t.worktree)) sh('git', ['worktree', 'add', t.worktree, '-b', t.branch]);
+    // Beside the project, named after it. A bare `wt-<key>` in the parent
+    // directory collides with every other project doing the same thing, and the
+    // second one to try inherits a worktree pointing at somebody else's repo.
+    const wtRoot = process.env.CURSOR_ORCH_WT || path.resolve(CWD, '..');
+    t.worktree = t.worktree || path.join(wtRoot, `${path.basename(CWD)}-wt-${key}`);
+    if (!fs.existsSync(t.worktree)) {
+      try { sh('git', ['worktree', 'add', t.worktree, '-b', t.branch]); }
+      catch (e) { die(`could not make a worktree at ${t.worktree}\n  ${String(e.stderr || e.message).trim()}`); }
+    } else {
+      // Something is already there. If git does not know about it, it is not a
+      // worktree of this repo and opening onto it would write into a stranger.
+      const known = (() => { try { return shq('git', ['worktree', 'list']).includes(t.worktree); } catch { return false; } })();
+      if (!known) die(`${t.worktree} already exists and is not a worktree of this repo.\n  Move it, or pass a different one.`);
+    }
     if (!t.chat) t.chat = sh('bash', [path.join(HERE, 'scripts', 'cursor-chat.sh')]);
     const brief = sub('briefs', key + '.md');
     fs.writeFileSync(brief, briefText(s, t, row));
@@ -598,6 +634,7 @@ const HELP = `orchestrate — five stages, on Cursor or Claude Code
   guard <key>               did it touch anything it does not own
   land <key> [--sha S]      record the merge
   board                     every step and its state
+  models [list|sync]        the ladder, and regenerating it from the CLI
 
 State lives in .claude/orch/. events.jsonl is the record; state.json is a
 projection of it.`;

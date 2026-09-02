@@ -33,12 +33,13 @@ done
 LOG=$TARGET
 case "$TARGET" in
   */*|*.jsonl) ;;
-  *) LOG="${CURSOR_ORCH_LOG_DIR:-.claude/orchestration/cursor}/$TARGET.jsonl" ;;
+  *) LOG="${CURSOR_ORCH_LOG_DIR:-.claude/orch/logs}/$TARGET.jsonl" ;;
 esac
 
 # A watcher started in the same breath as the run would otherwise lose the race
-# with the first write.
-for _ in $(seq 1 60); do [ -f "$LOG" ] && break; sleep 0.5; done
+# with the first write. Half-second polls for CURSOR_ORCH_WAIT seconds.
+WAIT=${CURSOR_ORCH_WAIT:-30}
+for _ in $(seq 1 $((WAIT * 2))); do [ -f "$LOG" ] && break; sleep 0.5; done
 [ -f "$LOG" ] || { echo "✗ no log appeared at $LOG" >&2; exit 2; }
 
 if [ "$WINDOW" = 1 ]; then

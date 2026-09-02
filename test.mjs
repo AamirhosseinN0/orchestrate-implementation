@@ -2766,6 +2766,126 @@ say('verify is green on a recorded run nobody made up');
   ok('rather than handing out an address that is not one', has(noUuid.out, 'no uuid'), noUuid.out);
 }
 
+// ------------------------------------------------ watching a run while it runs
+// The launcher used to send every byte to the log, so a backgrounded run said
+// nothing for minutes and there was no way to tell a thinking agent from a dead
+// one. These cover the formatter both ways it is used: in the live pipeline,
+// and tailing a log after the fact.
+{
+  say('watching a run while it runs');
+  const SK = path.join(path.dirname(fileURLToPath(import.meta.url)), 'claude-cursor', 'scripts');
+  const d = bare('cursor-stream');
+  const FMT = path.join(SK, 'cursor-stream.mjs');
+
+  function fmt(lines, args = []) {
+    try {
+      return { code: 0, out: execFileSync(process.execPath, [FMT, ...args], {
+        input: lines.join('\n') + '\n', encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }) };
+    } catch (e) {
+      return { code: e.status === undefined ? -1 : e.status, out: String(e.stdout || '') + String(e.stderr || '') };
+    }
+  }
+  const INIT = '{"type":"system","subtype":"init","model":"Cursor Grok 4.6 Extra High","session_id":"abcdef123456"}';
+
+  const shown = fmt([INIT,
+    '{"type":"assistant","message":{"content":[{"type":"text","text":"running it now"}]}}',
+    '{"type":"tool_call","subtype":"started","tool_call":{"shellToolCall":{"args":{"command":"git status"}}}}',
+    '{"type":"tool_call","subtype":"completed","tool_call":{"shellToolCall":{"args":{"command":"git status"},' +
+      '"result":{"success":{"stdout":"on main\\n","stderr":"","exitCode":0}}}}}',
+    '{"type":"result","result":"all done"}']);
+  ok('the model is announced', has(shown.out, 'Cursor Grok 4.6 Extra High'), shown.out);
+  ok('what the agent said is shown', has(shown.out, 'running it now'), shown.out);
+  ok('the command it ran is shown', has(shown.out, 'git status'), shown.out);
+  ok('and what came back', has(shown.out, 'on main'), shown.out);
+  ok('and the final answer', has(shown.out, 'all done'), shown.out);
+  ok('every line carries an elapsed stamp', /^\d\d:\d\d /m.test(shown.out), shown.out);
+
+  const labelled = fmt([INIT], ['--key', '2.1']);
+  ok('--key labels the lines so panes can be shared', has(labelled.out, '2.1'), labelled.out);
+
+  // Thinking arrives token by token; one line per block, or none at all.
+  const thought = fmt([INIT, '{"type":"thinking","subtype":"delta","text":"weighing "}',
+    '{"type":"thinking","subtype":"delta","text":"the options"}',
+    '{"type":"thinking","subtype":"completed"}']);
+  ok('thinking is collapsed to one line, not one per token',
+    has(thought.out, 'weighing the options') && thought.out.trim().split('\n').length === 2, thought.out);
+  const quiet = fmt([INIT, '{"type":"thinking","subtype":"delta","text":"weighing it"}',
+    '{"type":"thinking","subtype":"completed"}'], ['--quiet-think']);
+  ok('--quiet-think drops it entirely', !has(quiet.out, 'weighing it'), quiet.out);
+
+  const failed = fmt([INIT,
+    '{"type":"tool_call","subtype":"completed","tool_call":{"shellToolCall":{"args":{"command":"false"},' +
+      '"result":{"failure":{"stdout":"","stderr":"nope\\n","exitCode":3}}}}}']);
+  ok('a non-zero exit is called out', has(failed.out, 'exit 3'), failed.out);
+  ok('and its stderr is shown', has(failed.out, 'nope'), failed.out);
+
+  // The single most important line on the screen, and the easiest to swallow.
+  const died = fmt([INIT, 'NonRetriableError: Agent Looping Detected']);
+  ok('a bare error line is never swallowed', has(died.out, 'NonRetriableError'), died.out);
+  const errored = fmt([INIT, '{"type":"result","is_error":true,"result":"it broke"}']);
+  ok('an errored result is marked as one', has(errored.out, 'error') && has(errored.out, 'it broke'), errored.out);
+
+  const long = fmt([INIT, '{"type":"tool_call","subtype":"completed","tool_call":{"shellToolCall":' +
+    '{"args":{"command":"seq 20"},"result":{"success":{"stdout":"' +
+    Array.from({ length: 20 }, (_, i) => 'line' + (i + 1)).join('\\n') + '\\n","exitCode":0}}}}}']);
+  ok('long output is clipped', has(long.out, 'more lines'), long.out);
+  const full = fmt([INIT, '{"type":"tool_call","subtype":"completed","tool_call":{"shellToolCall":' +
+    '{"args":{"command":"seq 20"},"result":{"success":{"stdout":"' +
+    Array.from({ length: 20 }, (_, i) => 'line' + (i + 1)).join('\\n') + '\\n","exitCode":0}}}}}'], ['--full']);
+  ok('--full keeps all of it', has(full.out, 'line20') && !has(full.out, 'more lines'), full.out);
+
+  // --- the launcher's own --stream, against the stub agent ---
+  const stubDir = path.join(d, 'stub');
+  fs.mkdirSync(stubDir, { recursive: true });
+  fs.writeFileSync(path.join(stubDir, 'agent'), [
+    '#!/usr/bin/env bash',
+    'echo "{\\"type\\":\\"system\\",\\"subtype\\":\\"init\\",\\"model\\":\\"Cursor Grok 4.6 Extra High\\"}"',
+    'echo "{\\"type\\":\\"assistant\\",\\"message\\":{\\"content\\":[{\\"type\\":\\"text\\",\\"text\\":\\"live text\\"}]}}"',
+    'echo "{\\"type\\":\\"result\\",\\"result\\":\\"finished\\"}"',
+  ].join('\n') + '\n', { mode: 0o755 });
+  const PROMPT = path.join(d, 'p.txt');
+  fs.writeFileSync(PROMPT, 'go\n');
+  const LOGS = path.join(d, 'logs');
+  function run(args) {
+    try {
+      return { code: 0, out: execFileSync('bash', [path.join(SK, 'cursor-run.sh'), ...args], {
+        cwd: d, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'],
+        env: { ...process.env, PATH: stubDir + path.delimiter + process.env.PATH,
+               STUB_REC: path.join(d, 'rec'), CURSOR_ORCH_LOG_DIR: LOGS } }) };
+    } catch (e) {
+      return { code: e.status === undefined ? -1 : e.status, out: String(e.stdout || '') + String(e.stderr || '') };
+    }
+  }
+  const streamed = run(['--role', 'chip', '--stream', '--key', 's', '--workspace', '.', '--prompt-file', PROMPT]);
+  ok('a --stream run succeeds', streamed.code === 0, streamed.out);
+  ok('and puts the account on stdout', has(streamed.out, 'live text'), streamed.out);
+  ok('and still verifies the model', has(streamed.out, 'Cursor Grok 4.6 Extra High'), streamed.out);
+
+  // The whole point of tee: the log has to stay exactly what the readers expect.
+  const logged = readIf(path.join(LOGS, 's.jsonl')).trim().split('\n');
+  ok('the log is still raw jsonl', logged.every((l) => { try { JSON.parse(l); return true; } catch { return false; } }),
+    logged.join('\n'));
+  ok('with nothing of the digest in it', !has(logged.join('\n'), '▌'), logged.join('\n'));
+
+  const quietRun = run(['--role', 'chip', '--key', 'q', '--workspace', '.', '--prompt-file', PROMPT]);
+  ok('without --stream the run is quiet as before', !has(quietRun.out, 'live text'), quietRun.out);
+  ok('and the log is written all the same', readIf(path.join(LOGS, 'q.jsonl')).includes('live text'));
+
+  // --- the watcher ---
+  function watch(args) {
+    try {
+      return { code: 0, out: execFileSync('bash', [path.join(SK, 'cursor-watch.sh'), ...args], {
+        cwd: d, encoding: 'utf8', timeout: 15000, stdio: ['pipe', 'pipe', 'pipe'],
+        env: { ...process.env, CURSOR_ORCH_LOG_DIR: LOGS } }) };
+    } catch (e) {
+      return { code: e.status === undefined ? -1 : e.status, out: String(e.stdout || '') + String(e.stderr || '') };
+    }
+  }
+  const noArg = watch([]);
+  ok('the watcher needs something to watch', noArg.code === 2, noArg.out);
+  ok('and says how to call it', has(noArg.out, 'usage'), noArg.out);
+}
+
 // ---------------------------------------------------------------------- report
 if (!KEEP) for (const d of boxes) { try { fs.rmSync(d, { recursive: true, force: true }); } catch { /* gone */ } }
 else console.log('\nsandboxes kept: ' + boxes.join('\n                '));
@@ -2774,7 +2894,7 @@ else console.log('\nsandboxes kept: ' + boxes.join('\n                '));
 // an exception thrown before its first `ok`, a case quietly commented out — and
 // the suite still ends on "all green", because green is only ever measured
 // against however many checks happened to run.
-const EXPECTED = 487;   // every check above counts; raise it deliberately when you add one
+const EXPECTED = 511;   // every check above counts; raise it deliberately when you add one
 
 console.log('\n' + '-'.repeat(60));
 if (pass + failures.length !== EXPECTED)

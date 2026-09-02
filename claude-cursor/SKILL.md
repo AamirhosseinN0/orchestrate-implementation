@@ -22,6 +22,7 @@ DRV=~/.claude/skills/orchestrate-implementation/driver.mjs
 RUN=~/.claude/skills/claude-cursor/scripts/cursor-run.sh
 RESULT=~/.claude/skills/claude-cursor/scripts/cursor-result.sh
 NEWCHAT=~/.claude/skills/claude-cursor/scripts/cursor-chat.sh
+WATCH=~/.claude/skills/claude-cursor/scripts/cursor-watch.sh
 ```
 
 ## 0. Before anything: the binary and the model
@@ -64,7 +65,7 @@ Note that `composer-2.5` carries no effort suffix — its whole name is the chec
 
 ```bash
 node $DRV refine brief docs/plans/2.1.md > /tmp/refine-2.1.txt
-$RUN --role refine --key refine-2.1 --workspace . --prompt-file /tmp/refine-2.1.txt
+$RUN --role refine --stream --key refine-2.1 --workspace . --prompt-file /tmp/refine-2.1.txt
 node $DRV refine done docs/plans/2.1.md
 ```
 
@@ -83,7 +84,7 @@ That brief says nothing about `SendMessage`, so it ports with **no preamble**.
 ```bash
 node $DRV preflight brief 2.1 > /tmp/pf-2.1.txt
 git status --porcelain -- ':!.claude' > /tmp/pf-before.txt      # ← before
-$RUN --role preflight --key preflight-2.1 --workspace . --prompt-file /tmp/pf-2.1.txt
+$RUN --role preflight --stream --key preflight-2.1 --workspace . --prompt-file /tmp/pf-2.1.txt
 git status --porcelain -- ':!.claude' > /tmp/pf-after.txt
 diff /tmp/pf-before.txt /tmp/pf-after.txt                       # must be empty
 node $DRV preflight done 2.1
@@ -125,7 +126,7 @@ Then write the preamble below plus that path to a file and launch it in the
 **background**, one `Bash` call per chip:
 
 ```bash
-$RUN --role chip --key "$KEY" --workspace "$WT" --chat "$CID" --prompt-file /tmp/chip-$KEY.txt
+$RUN --role chip --stream --key "$KEY" --workspace "$WT" --chat "$CID" --prompt-file /tmp/chip-$KEY.txt
 ```
 
 **Open every chip the parent's interference rule allows, in one round** — up to
@@ -176,6 +177,38 @@ node $DRV say 2.1 --kind sendback --text "..."
 There is no check-in message and no held chip, so the observer-echo problem the
 parent warns about cannot happen here: the address is the uuid you created.
 
+## Watching a run
+
+**Pass `--stream` on every run you background.** Without it the launcher sends
+every byte to the log and the task says nothing for minutes; with it, a readable
+account of the run — what the agent said, what it ran, what came back, each line
+stamped with elapsed time — goes to stdout while the untouched jsonl still lands
+in the log. Backgrounded, that account is what shows in the task pane, so you can
+see a round working instead of waiting on silence. The log is written by `tee`
+and is byte-for-byte what the redirect produced, so `$RESULT` and the model check
+are unaffected.
+
+To attach to a run already going — one another session started, or one you
+launched without `--stream` — replay it from the top and follow it live:
+
+```bash
+$WATCH 2.1                 # in a pane of your own
+$WATCH --window 2.1        # in its own terminal window
+$WATCH --tail 2.1          # skip the replay, only what happens next
+```
+
+`--quiet-think` drops the thinking summaries and keeps actions and answers;
+`--full` stops clipping long command output. Both work on `$WATCH` and on the
+formatter directly, so a saved log replays exactly as it ran:
+
+```bash
+node ~/.claude/skills/claude-cursor/scripts/cursor-stream.mjs < .claude/orchestration/cursor/2.1.jsonl
+```
+
+With ten runs in flight, ten `--stream` accounts in ten task panes is the point:
+each is labelled with its own key, and an account that has stopped moving is the
+same signal a growing log is, only visible without asking for it.
+
 ## Gotchas
 
 - **`$RESULT <key>` is how you read what an agent said.** `"type":"result"` in
@@ -212,7 +245,9 @@ parent warns about cannot happen here: the address is the uuid you created.
 - **A run's liveness is its log, not `ps`.** The process does not show up under
   `agent`, so a grep for it says "dead" about a run that is working. `"type":"result"`
   in `.claude/orchestration/cursor/<key>.jsonl` is what finished looks like; a
-  file still growing is what alive looks like.
+  file still growing is what alive looks like. With `--stream` the elapsed stamp
+  on each line says the same thing without asking: one agent's log sat unchanged
+  for 39 seconds mid-run and looked dead, and it was a long thinking block.
 - **`--trust` on every run.** Every new worktree is a directory Cursor has not
   seen, and without it a headless run stops dead asking to be trusted.
 - **Without `--force` it proposes, writes nothing, and still exits 0.** A whole

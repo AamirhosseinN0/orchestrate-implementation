@@ -29,6 +29,9 @@ role_shown() {
   esac
 }
 
+SELF_DIR=$(cd "$(dirname "$0")" && pwd)
+STREAM=${CURSOR_ORCH_STREAM:-0}
+
 KEY= WS=. CHAT= ROLE= PROMPT_FILE=
 MODEL="${CURSOR_ORCH_MODEL:-}"
 SHOWN_WANT="${CURSOR_ORCH_MODEL_SHOWN:-}"
@@ -44,6 +47,7 @@ while [ $# -gt 0 ]; do
     --model-shown) SHOWN_WANT=$2; shift 2 ;;
     --node-bin) NODE_BIN=$2; shift 2 ;;
     --prompt-file) PROMPT_FILE=$2; shift 2 ;;
+    --stream) STREAM=1; shift ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -102,8 +106,18 @@ fi
 set -- -p --force --trust --output-format stream-json --model "$MODEL" --workspace "$WS"
 [ -n "$CHAT" ] && set -- "$@" --resume "$CHAT"
 
-agent "$@" "$PROMPT" > "$LOG" 2>&1
-rc=$?
+# --stream puts a readable account of the run on stdout while the untouched
+# jsonl still lands in the log. Backgrounded, that account is what shows in the
+# task pane, so a run stops being a silent several minutes. The log is written
+# by tee and is byte-for-byte what the redirect produced, so everything that
+# reads it afterwards is unaffected.
+if [ "$STREAM" = 1 ]; then
+  agent "$@" "$PROMPT" 2>&1 | tee "$LOG" | node "$SELF_DIR/cursor-stream.mjs" --key "$KEY"
+  rc=${PIPESTATUS[0]}
+else
+  agent "$@" "$PROMPT" > "$LOG" 2>&1
+  rc=$?
+fi
 
 TAIL=$(tail -n 1 "$LOG" 2>/dev/null)
 

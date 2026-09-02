@@ -627,6 +627,154 @@ CMDS.land = (argv) => {
   else console.log('  run `check`: a landing usually widens what can open.');
 };
 
+// -------------------------------------------------------------------- the slot
+// One shared machine slot for heavy checks. Twelve agents each deciding to run
+// the suite at the same moment is how a box gets taken down, and this exists to
+// make that impossible rather than unlikely.
+//
+// mkdir is the mutex: it is atomic and it fails if the directory is there. Every
+// claim carries a token nobody else can guess, so "free this slot" means "free
+// the claim I took" rather than "delete whatever is at that path" — the
+// difference between a process tidying up after itself and an evicted one wiping
+// out the run that replaced it.
+import os from 'node:os';
+const slotsDir = () => { const d = path.join(ORCH, 'slots'); fs.mkdirSync(d, { recursive: true }); return d; };
+const lockOf = (name) => path.join(slotsDir(), String(name).replace(/[^A-Za-z0-9_-]+/g, '-') + '.lock');
+const holderOf = (lock) => { try { return JSON.parse(fs.readFileSync(path.join(lock, 'holder.json'), 'utf8')); } catch { return null; } };
+
+function slotTake(name, what) {
+  const lock = lockOf(name);
+  try { fs.mkdirSync(lock, { recursive: false }); } catch { return null; }
+  const claim = { token: crypto.randomBytes(9).toString('hex') + '-' + process.pid,
+    pid: process.pid, host: os.hostname(), what: what || '', since: new Date().toISOString() };
+  // Written by rename, so a waiter never reads a half-written claim and mistakes
+  // it for the "holder unknown" leftover case.
+  const tmp = path.join(lock, 'holder.json.tmp');
+  fs.writeFileSync(tmp, JSON.stringify(claim, null, 2) + '\n');
+  fs.renameSync(tmp, path.join(lock, 'holder.json'));
+  return { lock, token: claim.token };
+}
+// Never steal from a holder that can be shown to be alive. A suite legitimately
+// running past the time limit is still running, and taking its slot away starts
+// a second one beside it — the exact crash this prevents. So liveness is asked
+// first, and the limit only reaches a holder whose liveness cannot be
+// established: another host, or no pid to check.
+function slotStale(lock, staleMs) {
+  const h = holderOf(lock);
+  if (!h) { try { return Date.now() - fs.statSync(lock).mtimeMs > 10000; } catch { return false; } }
+  if (h.pid && h.host === os.hostname()) {
+    try { process.kill(h.pid, 0); return false; } catch (e) { return e.code === 'ESRCH'; }
+    // EPERM means it is there and owned by someone else: alive, not ours to judge.
+  }
+  return Date.now() - Date.parse(h.since || 0) > staleMs;
+}
+// Rename the whole lock out of the way. Rename is atomic and only one racer wins
+// it, so two waiters cannot both conclude they evicted the holder and both go —
+// which a check-then-remove let them do. If a fresh claim slipped in between the
+// judgement and the rename, it is put straight back.
+function slotDrop(lock, judged) {
+  const carried = lock + '.evicted.' + process.pid + '.' + Date.now();
+  try { fs.renameSync(lock, carried); } catch { return false; }
+  const got = holderOf(carried);
+  if (got && judged && got.token !== judged) {
+    try {
+      fs.mkdirSync(lock, { recursive: false });
+      fs.renameSync(path.join(carried, 'holder.json'), path.join(lock, 'holder.json'));
+      fs.rmSync(carried, { recursive: true, force: true });
+      return false;
+    } catch { console.error('slot: a claim changed hands mid-eviction and could not be restored.'); }
+  }
+  fs.rmSync(carried, { recursive: true, force: true });
+  return true;
+}
+const describe = (lock) => {
+  const h = holderOf(lock);
+  if (!h) return 'held by nobody we can name';
+  const mins = Math.round((Date.now() - Date.parse(h.since)) / 60000);
+  return `held by pid ${h.pid || '?'} on ${h.host}${h.what ? ' for ' + h.what : ''}, ${mins}m`;
+};
+const slotLog = (name, what) => {
+  try { fs.appendFileSync(path.join(slotsDir(), 'slot.log'),
+    JSON.stringify({ at: new Date().toISOString(), slot: name, what }) + '\n'); } catch { /* best effort */ }
+};
+
+CMDS.slot = (argv) => {
+  const [what, ...rest] = argv;
+  const dashdash = argv.indexOf('--');
+  const name = (rest[0] && !rest[0].startsWith('-')) ? rest[0] : 'ci';
+  const staleMin = Number((argv[argv.indexOf('--stale') + 1]) || 30);
+  const staleMs = staleMin * 60000;
+
+  if (what === 'status') {
+    const d = slotsDir();
+    const held = fs.readdirSync(d).filter((f) => f.endsWith('.lock'));
+    if (!held.length) console.log('no slot is held.');
+    for (const f of held) console.log(f.replace(/\.lock$/, '') + ': ' + describe(path.join(d, f)));
+    let log = [];
+    try { log = fs.readFileSync(path.join(d, 'slot.log'), 'utf8').split('\n').filter(Boolean); } catch { /* none yet */ }
+    if (log.length) {
+      console.log(`\nwhat has happened here (last ${Math.min(10, log.length)} of ${log.length}):`);
+      for (const l of log.slice(-10)) { let e; try { e = JSON.parse(l); } catch { continue; }
+        console.log('  ' + String(e.at).slice(0, 19).replace('T', ' ') + '  ' + e.slot + '  ' + e.what); }
+    }
+    return;
+  }
+
+  if (what === 'free') {
+    const lock = lockOf(name);
+    if (!fs.existsSync(lock)) return console.log(name + ' is already free.');
+    const h = holderOf(lock);
+    if (!argv.includes('--force') && !slotStale(lock, staleMs))
+      die(`${name} is ${describe(lock)} — its run may be inside it right now.\n` +
+          '  Freeing under a live run causes the exact crash the slot exists to stop.\n' +
+          `  If you are certain the holder is gone: slot free ${name} --force`);
+    if (!slotDrop(lock, h && h.token)) return console.log(`${name} changed hands while we looked — left alone.`);
+    slotLog(name, 'freed by hand');
+    ok(name + ' is free');
+    return;
+  }
+
+  if (what === 'run') {
+    if (dashdash === -1) die('slot run <name> -- <command>   (the -- is required)');
+    const cmd = argv.slice(dashdash + 1);
+    if (!cmd.length) die('slot run needs a command after --');
+    const label = cmd.join(' ').slice(0, 60);
+    let claim = null, waited = 0;
+    // Poll rather than block: a slot is held for minutes, and a ten-second miss
+    // costs nothing against a suite that runs for five.
+    for (;;) {
+      claim = slotTake(name, label);
+      if (claim) break;
+      const lock = lockOf(name);
+      if (slotStale(lock, staleMs)) {
+        const h = holderOf(lock);
+        if (slotDrop(lock, h && h.token)) { slotLog(name, `evicted a stale claim (${describe(lock)})`); continue; }
+      }
+      if (waited === 0) console.error(`waiting for the ${name} slot — ${describe(lockOf(name))}`);
+      waited += 10;
+      // A synchronous wait that spawns nothing: the alternative is a `sleep`
+      // process every ten seconds for as long as the queue is deep.
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10000);
+      if (waited > 3 * 3600) die(`gave up waiting for the ${name} slot after 3h`);
+    }
+    slotLog(name, `took it for: ${label}`);
+    // The claim must come back however the command ends, including a signal.
+    const release = () => { if (claim) { slotDrop(claim.lock, claim.token); claim = null; } };
+    for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(sig, () => { release(); process.exit(1); });
+    process.on('exit', release);
+    // The command's own exit code is the result. A non-zero one is news about
+    // the check, not a fault in the slot, so it is passed through rather than
+    // thrown — the claim is released either way by the exit handler.
+    let code = 0;
+    try { execFileSync(cmd[0], cmd.slice(1), { stdio: 'inherit', shell: false, env: process.env }); }
+    catch (e) { code = typeof e.status === 'number' ? e.status : 1; }
+    slotLog(name, `released after: ${label} (exit ${code})`);
+    release();
+    process.exit(code);
+  }
+  die('slot run <name> -- <cmd> | slot status | slot free <name> [--force]');
+};
+
 const HELP = `orchestrate — five stages, on Cursor or Claude Code
 
   load <path>...            read the plan files, record them
@@ -640,6 +788,7 @@ const HELP = `orchestrate — five stages, on Cursor or Claude Code
   land <key> [--sha S]      record the merge
   board                     every step and its state
   models [list|sync]        the ladder, and regenerating it from the CLI
+  slot run <n> -- <cmd>     one shared machine slot, so parallel heavy checks queue
 
 State lives in .claude/orch/. events.jsonl is the record; state.json is a
 projection of it.`;

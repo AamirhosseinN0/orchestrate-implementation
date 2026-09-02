@@ -186,6 +186,22 @@ typed prose and a five-line ledger.
 Then loop: record, guard, land, `check`, open everything it names. Keep going
 until the board is empty.
 
+### Heavy checks go through one slot
+
+Twelve agents each deciding to run the suite at the same moment is how a box goes
+down. Anything heavy — a full test run, a build, an install — goes through the
+shared slot, which lets exactly one through at a time and queues the rest:
+
+```bash
+node $ORCH slot run ci -- npm test
+```
+
+It passes the command's own exit code straight back, so it drops into a brief
+where a plain command would go. `slot status` shows who holds it and what has
+happened; a claim whose process is gone is evicted automatically, and freeing one
+that is still alive needs `--force` because doing it under a live run causes the
+exact crash the slot prevents.
+
 ### A step that must stop and ask
 
 A run is one-shot; nothing can answer it mid-flight. A step that cannot proceed

@@ -3076,6 +3076,53 @@ say('verify is green on a recorded run nobody made up');
   ok('and how many runs each step took', has(board.out, 'run(s)'), board.out);
 }
 
+// ------------------------------------------------ one shared slot for heavy checks
+// Twelve agents each deciding to run the suite at the same moment is how a box
+// goes down. The slot makes that impossible rather than unlikely.
+{
+  say('one shared slot for heavy checks');
+  const ROOT = path.dirname(fileURLToPath(import.meta.url));
+  const O = path.join(ROOT, 'claude-cursor', 'orchestrate.mjs');
+  const d = bare('slot');
+  const run = (args) => {
+    try { return { code: 0, out: execFileSync('node', [O, ...args], { cwd: d, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }) }; }
+    catch (e) { return { code: e.status ?? -1, out: String(e.stdout || '') + String(e.stderr || '') }; }
+  };
+
+  ok('nothing is held to begin with', has(run(['slot', 'status']).out, 'no slot is held'));
+  const passed = run(['slot', 'run', 'ci', '--', 'bash', '-c', 'echo inside']);
+  ok('a command runs inside the slot', passed.code === 0, passed.out);
+  ok('and the slot is given back', has(run(['slot', 'status']).out, 'no slot is held'));
+  const failed = run(['slot', 'run', 'ci', '--', 'bash', '-c', 'exit 7']);
+  ok('a failing check passes its own exit code through', failed.code === 7, failed.out);
+  ok('rather than a stack trace', !has(failed.out, 'at Object'), failed.out);
+  ok('and still gives the slot back', has(run(['slot', 'status']).out, 'no slot is held'));
+  ok('the history says what happened', has(run(['slot', 'status']).out, 'exit 7'), run(['slot', 'status']).out);
+  ok('run without -- is refused', run(['slot', 'run', 'ci']).code === 2);
+
+  // A second claim must not be handed out while a live one is held. The claim is
+  // written by hand here so the holder is this test process, which is alive.
+  const lock = path.join(d, '.claude', 'orch', 'slots', 'ci.lock');
+  fs.mkdirSync(lock, { recursive: true });
+  fs.writeFileSync(path.join(lock, 'holder.json'), JSON.stringify(
+    { token: 't', pid: process.pid, host: os.hostname(), what: 'a live run', since: new Date().toISOString() }));
+  ok('a held slot shows its holder', has(run(['slot', 'status']).out, 'a live run'), run(['slot', 'status']).out);
+  const freeLive = run(['slot', 'free', 'ci']);
+  ok('freeing a live slot is refused', freeLive.code === 2, freeLive.out);
+  ok('because that causes the crash it exists to stop', has(freeLive.out, 'exact crash'), freeLive.out);
+  ok('--force is offered, and works', run(['slot', 'free', 'ci', '--force']).code === 0);
+  ok('and then it is free again', has(run(['slot', 'status']).out, 'no slot is held'));
+
+  // A claim from a process that is gone must not hold the slot for ever.
+  fs.mkdirSync(lock, { recursive: true });
+  fs.writeFileSync(path.join(lock, 'holder.json'), JSON.stringify(
+    { token: 't', pid: 999999, host: os.hostname(), what: 'a dead run', since: new Date().toISOString() }));
+  const stolen = run(['slot', 'run', 'ci', '--', 'bash', '-c', 'echo took it']);
+  ok('a claim whose process is gone is evicted', stolen.code === 0, stolen.out);
+  ok('and the eviction is recorded, not silent',
+    has(run(['slot', 'status']).out, 'evicted'), run(['slot', 'status']).out);
+}
+
 // ---------------------------------------------------------------------- report
 if (!KEEP) for (const d of boxes) { try { fs.rmSync(d, { recursive: true, force: true }); } catch { /* gone */ } }
 else console.log('\nsandboxes kept: ' + boxes.join('\n                '));
@@ -3084,7 +3131,7 @@ else console.log('\nsandboxes kept: ' + boxes.join('\n                '));
 // an exception thrown before its first `ok`, a case quietly commented out — and
 // the suite still ends on "all green", because green is only ever measured
 // against however many checks happened to run.
-const EXPECTED = 584;   // every check above counts; raise it deliberately when you add one
+const EXPECTED = 599;   // every check above counts; raise it deliberately when you add one
 
 console.log('\n' + '-'.repeat(60));
 if (pass + failures.length !== EXPECTED)

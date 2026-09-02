@@ -11,7 +11,7 @@ MODELS="$SELF/models.mjs"
 HARVEST="$SELF/harvest.mjs"
 STREAM="$SELF/stream.mjs"
 
-KEY= WS=. CHAT= ROLE= PROMPT_FILE= RUNNER=cursor
+KEY= WS=. CHAT= ROLE= TIER= PROMPT_FILE= RUNNER=cursor
 MODEL="${CURSOR_ORCH_MODEL:-}"
 SHOWN_WANT="${CURSOR_ORCH_MODEL_SHOWN:-}"
 NODE_BIN="${CURSOR_ORCH_NODE_BIN:-}"
@@ -28,6 +28,7 @@ while [ $# -gt 0 ]; do
     --workspace)    need "$1" $#; WS=$2; shift 2 ;;
     --chat)         need "$1" $#; CHAT=$2; shift 2 ;;
     --role)         need "$1" $#; ROLE=$2; shift 2 ;;
+    --tier)         need "$1" $#; TIER=$2; shift 2 ;;
     --model)        need "$1" $#; MODEL=$2; shift 2 ;;
     --model-shown)  need "$1" $#; SHOWN_WANT=$2; shift 2 ;;
     --node-bin)     need "$1" $#; NODE_BIN=$2; shift 2 ;;
@@ -58,7 +59,9 @@ fi
 
 # The model, from the table rather than from a case statement in here.
 if [ -z "$MODEL" ]; then
-  IFS=$'\t' read -r MODEL DEFAULT_SHOWN < <(node "$MODELS" resolve "$ROLE") || exit 2
+  # A tier is what `assess` decided for this step; the role is only the default
+  # for agents nobody assesses individually.
+  IFS=$'\t' read -r MODEL DEFAULT_SHOWN < <(node "$MODELS" resolve "${TIER:-$ROLE}") || exit 2
   [ -n "$MODEL" ] || die "could not resolve a model for role $ROLE"
   SHOWN_WANT=${SHOWN_WANT:-$DEFAULT_SHOWN}
 elif [ -z "$SHOWN_WANT" ]; then

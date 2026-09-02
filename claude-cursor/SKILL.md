@@ -1,6 +1,6 @@
 ---
 name: claude-cursor
-description: Run an implementation end to end in five stages — load the plans, judge how hard each step is and pick a model for it, refine away the ambiguity, check that nothing collides, then run every step that can run at once. Agents execute on the Cursor CLI (`agent`) or as Claude Code subagents. Use when asked to orchestrate a plan, run an implementation, hand the building work to Cursor agents, drive steps in parallel worktrees, pick models per step, or take a written plan through to merged code.
+description: Run an implementation end to end in five stages — load the plans, judge how hard each step is and pick a model for it, refine away the ambiguity, check that nothing collides, then run every step that can run at once. Every step that can run without colliding with another is launched in the same round on its own agent; interference — a shared file, a shared serialisation point, an unlanded dependency — is the only permitted reason to hold one back. Agents execute on the Cursor CLI (`agent`) or as Claude Code subagents. Use when asked to orchestrate a plan, run an implementation, hand the building work to Cursor agents, run steps in parallel, drive work in parallel worktrees, pick models per step, or take a written plan through to merged code.
 allowed-tools: Bash, Read, Write, Edit, Grep, Glob, AskUserQuestion, TodoWrite
 ---
 
@@ -22,6 +22,38 @@ State lives in `.claude/orch/`. `events.jsonl` is the record and `state.json` is
 a projection of it, so nothing is lost if a session ends mid-build.
 
 **This is self-contained.** It does not read any other skill.
+
+## The rule: run everything that can run at once
+
+**Every step that can run without colliding with another must be launched in the
+same round, on its own agent. Interference is the only permitted reason to hold
+one back.**
+
+Not caution about the runner, not tidiness, not "let me see how the first one
+goes", not the size of the round. If `check` names five steps, five agents start
+now — five separate backgrounded `Bash` calls, in one message.
+
+Two steps interfere when:
+
+- they own the same file, or one owns a directory containing the other's file, or
+- they name the same serialisation point — a lockfile, a migration head, a
+  closed list a test asserts on, or
+- one needs the other, and it has not landed yet.
+
+That is the whole list. `check` computes it for you and the set it prints is
+already safe to open all at once, because it checks the candidates against each
+other as well as against what is out.
+
+This is not a preference. On the build this was measured against, refining obeyed
+the rule and turned 130 minutes of work into a 17-minute span. The step stage
+ignored it and stretched 182 minutes of work over 475 — three steps cleared their
+checks in the same minute, the first opened, and the second waited an hour and a
+half for it to land. Nothing was learned by waiting. Every gate that matters had
+already passed.
+
+Up to twelve agents in flight is verified clean; the ceiling is memory, not the
+API. Heavy checks inside those agents go through `slot`, so twelve suites queue
+instead of colliding.
 
 ## Before anything
 
@@ -134,16 +166,14 @@ $RUN --role chip --tier medium --key S-1 --workspace <worktree> \
 
 ### Open everything `check` names, in the same round
 
-**This is the single biggest thing you can get wrong.** Each step is its own
-backgrounded `Bash` call — that is what makes them concurrent and what wakes you
-as each finishes. Up to twelve in flight is verified clean; the ceiling is memory,
-not the API.
+This is **the rule** at the top of this document, and it is the single biggest
+thing you can get wrong. `run open` each step, then launch each as its own
+backgrounded `Bash` call — separate calls in one message, not a loop that waits
+on each in turn. That is what makes them concurrent and what wakes you as each
+finishes.
 
-On the build this was measured against, refining hit 7.6× by doing this and the
-step stage never did it once: 182 minutes of work stretched over 475. Three steps
-cleared their checks in the same minute; the first opened, and the second waited
-an hour and a half for it to land first. Nothing about the runner is a reason to
-hold a step back — only interference is.
+`run open` tells you when you have stopped short: it names how many more `check`
+would still allow and refuses to let that pass unnoticed.
 
 ### One step per agent, and never two
 

@@ -3073,6 +3073,24 @@ say('verify is green on a recorded run nobody made up');
   ok('and it is no longer listed as waiting', !has(after.out, 'Waiting on work to land: S-3'), after.out);
   const board = run(['board']);
   ok('the board shows what landed', has(board.out, 'landed'), board.out);
+
+  // Opening one at a time is the slowest thing this can do and the easiest to do
+  // by accident, because a single `run open` reads like progress.
+  run(['step', 'add'], JSON.stringify([
+    { key: 'P-1', title: 'p1', plan: 'docs/plan.md', owns: ['src/p1.ts'] },
+    { key: 'P-2', title: 'p2', plan: 'docs/plan.md', owns: ['src/p2.ts'] },
+    { key: 'P-3', title: 'p3', plan: 'docs/plan.md', owns: ['src/p3.ts'] }]));
+  run(['assess', 'set', 'P-1=low', 'P-2=low', 'P-3=low']);
+  const one = run(['run', 'open', 'P-1']);
+  ok('opening one of several says how many more could have gone with it',
+    has(one.out, 'more step(s) can open right now'), one.out);
+  ok('and names them, so stopping short is not a silent choice',
+    has(one.out, 'P-2') && has(one.out, 'P-3'), one.out);
+  ok('and says interference is the only reason to hold one back',
+    has(one.out, 'only reason to hold one back'), one.out);
+  run(['run', 'open', 'P-2']); run(['run', 'open', 'P-3']);
+  ok('once the round is fully open it stops nagging',
+    !has(run(['board']).out, 'can open right now'), run(['board']).out);
   ok('and how many runs each step took', has(board.out, 'run(s)'), board.out);
 }
 
@@ -3123,6 +3141,105 @@ say('verify is green on a recorded run nobody made up');
     has(run(['slot', 'status']).out, 'evicted'), run(['slot', 'status']).out);
 }
 
+// -------------------------------------------- the sweep before work goes out
+// Everything a step cites that can be checked without running anything. Its
+// whole value is in being run at the moment work is about to be handed out.
+{
+  say('the sweep before work goes out');
+  const ROOT = path.dirname(fileURLToPath(import.meta.url));
+  const O = path.join(ROOT, 'claude-cursor', 'orchestrate.mjs');
+  const d = bare('doctor');
+  const stub = path.join(d, 'stub');
+  fs.mkdirSync(stub, { recursive: true });
+  fs.writeFileSync(path.join(stub, 'agent'),
+    '#!/usr/bin/env bash\necho "Created chat 11111111-2222-3333-4444-555555555555"\n', { mode: 0o755 });
+  const wtRoot = path.join(d, 'worktrees');
+  fs.mkdirSync(wtRoot, { recursive: true });
+  const ENV = { ...process.env, PATH: stub + path.delimiter + process.env.PATH, CURSOR_ORCH_WT: wtRoot };
+  const run = (args, input) => {
+    try { return { code: 0, out: execFileSync('node', [O, ...args], { cwd: d, encoding: 'utf8', input, env: ENV, stdio: ['pipe', 'pipe', 'pipe'] }) }; }
+    catch (e) { return { code: e.status ?? -1, out: String(e.stdout || '') + String(e.stderr || '') }; }
+  };
+  const git = (args) => execFileSync('git', args, { cwd: d, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] });
+
+  git(['init', '-q', '-b', 'main']);
+  git(['config', 'user.email', 'ci@example.invalid']);
+  git(['config', 'user.name', 'ci']);
+  fs.mkdirSync(path.join(d, 'src'), { recursive: true });
+  fs.mkdirSync(path.join(d, 'docs'), { recursive: true });
+  fs.writeFileSync(path.join(d, 'docs', 'plan.md'), '# plan\n');
+  fs.writeFileSync(path.join(d, 'src', 'keep.ts'), 'x\n');
+  git(['add', '-A']); git(['commit', '-qm', 'init']);
+  run(['load', 'docs']);
+
+  // Nothing recorded yet: a tick over nothing checked is how a green report
+  // starts meaning nothing.
+  const empty = run(['doctor']);
+  ok('with nothing to check it says so rather than passing', has(empty.out, 'nothing to check'), empty.out);
+  ok('and says the tick would prove nothing', has(empty.out, 'proves nothing right now'), empty.out);
+
+  run(['step', 'add'], JSON.stringify([
+    { key: 'S-1', title: 'a', plan: 'docs/plan.md', owns: ['src/a.ts'], verify: ['node --version'] }]));
+  ok('a step with no model is caught', has(run(['doctor']).out, 'no model'), run(['doctor']).out);
+  run(['assess', 'set', 'S-1=low']);
+  const clean = run(['doctor']);
+  ok('a sound step passes', clean.code === 0, clean.out);
+  ok('and says how many it looked at', has(clean.out, '1 step(s) check out'), clean.out);
+
+  run(['step', 'add'], JSON.stringify([
+    { key: 'S-2', title: 'b', plan: 'docs/gone.md', owns: ['nowhere/deep/b.ts'],
+      needs: ['S-9'], verify: ['definitelynotarealbinary --go'] }]));
+  run(['assess', 'set', 'S-2=low']);
+  const bad = run(['doctor']);
+  ok('a plan that does not exist is caught', has(bad.out, 'plan does not exist'), bad.out);
+  ok('a dependency on a step that does not exist is caught', has(bad.out, 'not a step'), bad.out);
+  ok('owning a path in a directory that does not exist is caught',
+    has(bad.out, 'whose directory does not exist'), bad.out);
+  ok('a proof whose command does not resolve is caught',
+    has(bad.out, 'does not resolve to anything runnable'), bad.out);
+  ok('and it exits non-zero', bad.code === 1, bad.out);
+
+  // An owns entry that is not a path can never be matched against a diff, so
+  // guard cannot judge the step at all — it says nothing and lets anything past.
+  const st = path.join(d, '.claude', 'orch', 'state.json');
+  const poison = (fn) => { const j = JSON.parse(fs.readFileSync(st, 'utf8')); fn(j); fs.writeFileSync(st, JSON.stringify(j, null, 2)); };
+  poison((j) => { j.tasks.find((t) => t.key === 'S-2').owns = ['the config file — wherever it lives']; });
+  ok('prose that reached owns before the gate existed is still caught',
+    has(run(['doctor']).out, 'guard can never match'), run(['doctor']).out);
+
+  // A serialisation point only one step names is usually a spelling that missed
+  // its partner — which is the failure the whole comparison exists for.
+  poison((j) => { j.tasks.find((t) => t.key === 'S-2').owns = ['src/b.ts'];
+                  j.tasks.find((t) => t.key === 'S-2').serialises = ['docker-compose.yml'];
+                  j.tasks.find((t) => t.key === 'S-2').plan = 'docs/plan.md';
+                  j.tasks.find((t) => t.key === 'S-2').needs = [];
+                  j.tasks.find((t) => t.key === 'S-2').verify = ['node --version']; });
+  const lone = run(['doctor']);
+  ok('a serialisation point only one step names is reported', has(lone.out, 'only one step names'), lone.out);
+  ok('and it is a note, not a failure', lone.code === 0, lone.out);
+
+  // Two open steps holding one path, or one point, is the breach.
+  poison((j) => { for (const k of ['S-1', 'S-2']) { const t = j.tasks.find((x) => x.key === k);
+    t.status = 'open'; t.serialises = ['docker-compose.yml']; t.owns = ['src/same.ts']; } });
+  const breach = run(['doctor']);
+  ok('two open steps claiming one path is a failure', breach.code === 1, breach.out);
+  ok('and is named as the one thing this cannot survive',
+    has(breach.out, 'cannot survive'), breach.out);
+  ok('two open steps holding one serialisation point is a failure too',
+    has(breach.out, 'held by more than one open step'), breach.out);
+
+  // A brief handed out does not change when the record does, and the agent
+  // holding it will not know.
+  poison((j) => { for (const k of ['S-1', 'S-2']) { const t = j.tasks.find((x) => x.key === k);
+    t.status = 'planned'; t.serialises = []; } j.tasks.find((x) => x.key === 'S-2').owns = ['src/b.ts']; });
+  run(['run', 'open', 'S-1']);
+  ok('a fresh brief is not stale', !has(run(['doctor']).out, 'older than the step'), run(['doctor']).out);
+  poison((j) => { j.tasks.find((t) => t.key === 'S-1').owns = ['src/a.ts', 'src/extra.ts']; });
+  const stale = run(['doctor']);
+  ok('a brief older than the step it describes is caught', has(stale.out, 'older than the step'), stale.out);
+  ok('and says to tell the agent to re-read it', has(stale.out, 're-read'), stale.out);
+}
+
 // ---------------------------------------------------------------------- report
 if (!KEEP) for (const d of boxes) { try { fs.rmSync(d, { recursive: true, force: true }); } catch { /* gone */ } }
 else console.log('\nsandboxes kept: ' + boxes.join('\n                '));
@@ -3131,7 +3248,7 @@ else console.log('\nsandboxes kept: ' + boxes.join('\n                '));
 // an exception thrown before its first `ok`, a case quietly commented out — and
 // the suite still ends on "all green", because green is only ever measured
 // against however many checks happened to run.
-const EXPECTED = 599;   // every check above counts; raise it deliberately when you add one
+const EXPECTED = 622;   // every check above counts; raise it deliberately when you add one
 
 console.log('\n' + '-'.repeat(60));
 if (pass + failures.length !== EXPECTED)

@@ -495,6 +495,9 @@ CMDS.run = (argv) => {
     const brief = sub('briefs', key + '.md');
     fs.writeFileSync(brief, briefText(s, t, row));
     t.briefFile = path.relative(CWD, brief);
+    // What the brief was written from. A step whose owns or verify changed
+    // afterwards is holding an agent to instructions nobody has revised.
+    t.briefSha = sha(JSON.stringify([t.owns, t.serialises, t.verify, t.needs, t.title, t.plan]));
     t.status = 'open'; t.openedAt = new Date().toISOString();
     commit(s, 'run open', argv);
     ok(`${key} is open on ${row.shown}`);
@@ -505,6 +508,15 @@ CMDS.run = (argv) => {
     const abs = path.join(HERE, 'scripts', 'run.sh');
     const runner = rel.length < abs.length && !rel.startsWith('../..') ? rel : abs;
     console.log(`\nLaunch it in the background:\n  bash ${runner} \\\n    --role chip --tier ${t.tier} --key ${key} --workspace ${t.worktree} \\\n    --chat ${t.chat} --prompt-file ${t.briefFile}`);
+    // Opening one at a time is the slowest thing this can do, and it is easy to
+    // do by accident — one `run open` reads like progress. So the ones still
+    // waiting are counted here rather than left for somebody to run `check`.
+    const more = frontier(readState()).accepted;
+    if (more.length) {
+      console.log(`\n⚠ ${more.length} more step(s) can open right now and are not: ${more.map((x) => x.key).join(' ')}`);
+      console.log('  Open them in this same round. Interference is the only reason to hold one back,');
+      console.log('  and none of these interferes with anything — that is what put them on this list.');
+    }
     return;
   }
 
@@ -775,6 +787,196 @@ CMDS.slot = (argv) => {
   die('slot run <name> -- <cmd> | slot status | slot free <name> [--force]');
 };
 
+// ------------------------------------------------------------------- the doctor
+// Everything a step cites that can be checked without running anything. The one
+// that earns its place is duplicate ownership: on a real run 52 of 203 owned
+// paths turned out to be claimed twice, one of them seven times, and nothing
+// anywhere said so. `check` only ever compares what is open right now.
+function firstBinary(cmd) {
+  // `CI=1 pnpm test` tests pnpm, not CI=1.
+  const words = String(cmd).trim().split(/\s+/);
+  let i = 0;
+  while (i < words.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[i])) i++;
+  return words[i] || '';
+}
+function resolves(bin) {
+  if (!bin) return false;
+  if (bin.includes('/')) return fs.existsSync(path.resolve(CWD, bin));
+  // A shell builtin is not on PATH and is not a missing binary either.
+  if (['cd', 'echo', 'true', 'false', 'test', 'export', 'set', 'source', '.', ':'].includes(bin)) return true;
+  try { shq('sh', ['-c', `command -v ${JSON.stringify(bin)}`]); return true; } catch { return false; }
+}
+
+CMDS.doctor = () => {
+  const s = readState();
+  const bad = [], warn = [];
+
+  for (const p of s.plans || []) {
+    if (!fs.existsSync(path.resolve(CWD, p.path))) { bad.push(`the plan ${p.path} is gone — \`load\` again, or the steps built on it cite nothing`); continue; }
+    const now = sha(fs.readFileSync(path.resolve(CWD, p.path), 'utf8'));
+    // Refining rewrites its plan, so drift is expected there and only worth
+    // saying for a plan nobody has refined.
+    if (now !== p.sha && !p.refined) warn.push(`${p.path} changed since it was loaded, and has not been refined`);
+  }
+
+  const live = tasks(s).filter((t) => t.status !== 'cancelled');
+  const keys = new Set(live.map((t) => t.key));
+
+  // Every owned path, and who claims it. Landed work counts: a path two steps
+  // both wrote is how one of them quietly undid the other.
+  const claims = new Map();
+  for (const t of live) for (const o of t.owns || []) {
+    const k = norm(o);
+    (claims.get(k) || claims.set(k, []).get(k)).push(t.key);
+  }
+  const dup = [...claims.entries()].filter(([, who]) => who.length > 1);
+  if (dup.length) {
+    bad.push(`${dup.length} path(s) claimed by more than one step:`);
+    for (const [p2, who] of dup.slice(0, 20)) bad.push(`    ${p2}  ←  ${who.join(', ')}`);
+    if (dup.length > 20) bad.push(`    … ${dup.length - 20} more`);
+  }
+
+  for (const t of live) {
+    for (const n of t.needs || []) if (!keys.has(n)) bad.push(`${t.key} needs ${n}, which is not a step`);
+    if (!(t.owns || []).length) warn.push(`${t.key} owns nothing — guard cannot judge it`);
+    if (!DEAD_STATUS.includes(t.status) && !t.tier) warn.push(`${t.key} has no model yet`);
+    for (const o of t.owns || []) {
+      // A file it is about to create will not exist; the directory it goes in
+      // has to, or the agent cannot write it.
+      const abs = path.resolve(CWD, o);
+      if (!fs.existsSync(abs) && !fs.existsSync(path.dirname(abs)))
+        warn.push(`${t.key} owns ${o}, and neither it nor its directory exists`);
+    }
+    for (const v of t.verify || []) {
+      const bin = firstBinary(v);
+      if (bin && !/[|&;<>(){}$`]/.test(bin) && !resolves(bin))
+        bad.push(`${t.key} verifies with \`${bin}\`, which does not resolve here`);
+    }
+    // A record corrected after the brief was written does not correct the brief,
+    // and the agent holding it will never know.
+    if (t.briefFile && fs.existsSync(path.resolve(CWD, t.briefFile))) {
+      const at = fs.statSync(path.resolve(CWD, t.briefFile)).mtimeMs;
+      if (t.openedAt && Date.parse(t.openedAt) > at + 1000)
+        warn.push(`${t.key}'s brief is older than its record — rewrite it and tell the agent to re-read`);
+    }
+  }
+
+  // A step that cannot be placed is either in a dependency loop or waiting on a
+  // key that does not exist. The second is already named above, so say which.
+  const stuck = waves(s).find((w) => w.wave === -1);
+  if (stuck) {
+    const missing = stuck.tasks.filter((t) => (t.needs || []).some((n) => !keys.has(n)));
+    const looped = stuck.tasks.filter((t) => !missing.includes(t));
+    if (looped.length) bad.push('these steps depend on each other in a loop: ' + looped.map((t) => t.key).join(' '));
+    if (missing.length && !looped.length)
+      bad.push('and so ' + missing.map((t) => t.key).join(' ') + ' can never be placed until that is fixed');
+  }
+
+  for (const w of warn) console.log('· ' + w);
+  for (const b of bad) console.log((b.startsWith('    ') ? '' : '✗ ') + b);
+  if (!bad.length && !warn.length) ok('nothing to say — every path, command and plan a step cites checks out');
+  else if (!bad.length) ok(`${warn.length} thing(s) worth a look, nothing broken`);
+  else {
+    // The indented lines are detail on the problem above them, not problems.
+    const n = bad.filter((b) => !b.startsWith('    ')).length;
+    console.log(`\n${n} problem(s). Fix them before opening anything.`);
+    process.exit(1);
+  }
+};
+
+// ------------------------------------------------------------------- the doctor
+// Everything a step cites that can be checked without running anything. It is
+// the sweep before work goes out, and its value is entirely in being run then.
+CMDS.doctor = () => {
+  const s = readState();
+  const live = tasks(s).filter((t) => !DEAD_STATUS.includes(t.status));
+  let bad = 0;
+  const binCache = {};
+  const binOk = (b) => {
+    if (!(b in binCache)) {
+      try { execFileSync('bash', ['-c', 'command -v -- ' + JSON.stringify(b)], { stdio: 'ignore' }); binCache[b] = true; }
+      catch { binCache[b] = false; }
+    }
+    return binCache[b];
+  };
+
+  for (const t of live) {
+    const probs = [];
+    if (t.plan && !fs.existsSync(path.resolve(CWD, t.plan))) probs.push('its plan does not exist: ' + t.plan);
+    for (const n of t.needs || []) if (!depOf(s, n)) probs.push(`needs "${n}", which is not a step`);
+    if (!t.tier) probs.push('has no model — run `assess`');
+    // A backstop for prose that reached owns before the gate existed. An entry
+    // that is not a path can never be matched by a diff, so `guard` cannot judge
+    // the step at all and says nothing while letting anything through.
+    for (const o of t.owns || []) {
+      if (/\s[—–]\s|\s--\s/.test(o) || /:\d+$/.test(o) || (!/[/.]/.test(o) && o.split(/\s+/).length > 1))
+        probs.push(`owns "${o}", which guard can never match against a diff`);
+      else {
+        const dir = path.dirname(path.resolve(CWD, o));
+        if (!fs.existsSync(dir)) probs.push(`owns "${o}", whose directory does not exist`);
+      }
+    }
+    for (const v of t.verify || []) {
+      const first = String(v).trim().split(/\s+/)[0];
+      if (first && /^[A-Za-z0-9_.\/-]+$/.test(first) && !binOk(first))
+        probs.push(`its proof starts with "${first}", which does not resolve to anything runnable`);
+    }
+    // A brief already handed out does not change when the record does, and the
+    // agent holding it will not know.
+    if (t.briefSha) {
+      const now = sha(JSON.stringify([t.owns, t.serialises, t.verify, t.needs, t.title, t.plan]));
+      if (now !== t.briefSha) probs.push('its brief is older than the step — rewrite it and tell the agent to re-read');
+    }
+    if (probs.length) { bad += probs.length; console.log('✗ ' + t.key); for (const p of probs) console.log('    ' + p); }
+  }
+
+  // Two steps claiming one path. Between open ones this is the breach; between
+  // planned ones it only means they cannot open together, which `check` says.
+  const dupOpen = [], dupPlanned = [];
+  for (let i = 0; i < live.length; i++) for (let j = i + 1; j < live.length; j++) {
+    const f = overlap(live[i], live[j]);
+    if (!f.length) continue;
+    const both = OPEN_STATUSES.includes(live[i].status) && OPEN_STATUSES.includes(live[j].status);
+    (both ? dupOpen : dupPlanned).push(`${live[i].key} ↔ ${live[j].key}: ${f.join('; ')}`);
+  }
+  if (dupOpen.length) {
+    bad += dupOpen.length;
+    console.log(`✗ ${dupOpen.length} pair(s) of OPEN steps claim the same path:`);
+    for (const x of dupOpen) console.log('    ' + x);
+    console.log('    Two of them changing one thing is the one failure this cannot survive.');
+  }
+  if (dupPlanned.length) console.log(`· ${dupPlanned.length} pair(s) of planned steps share a path — they simply cannot open together.`);
+
+  // A serialisation point only one step names is usually a spelling that missed
+  // its partner, which is the failure mode this whole comparison exists for.
+  const pts = new Map();
+  for (const t of live) for (const x of t.serialises || []) {
+    const k = normPoint(x);
+    (pts.get(k) || pts.set(k, []).get(k)).push({ key: t.key, spelling: x, status: t.status });
+  }
+  const lone = [...pts.values()].filter((v) => v.length === 1);
+  if (lone.length) {
+    console.log(`· ${lone.length} serialisation point(s) only one step names:`);
+    for (const v of lone) console.log(`    ${v[0].key}: "${v[0].spelling}"`);
+    console.log('    If another step moves the same thing and spelled it differently, nothing will catch it.');
+  }
+  const contended = [...pts.values()].filter((v) => v.filter((x) => OPEN_STATUSES.includes(x.status)).length > 1);
+  if (contended.length) {
+    bad += contended.length;
+    console.log(`✗ ${contended.length} serialisation point(s) held by more than one open step:`);
+    for (const v of contended) console.log(`    ${v.map((x) => x.key).join(' ↔ ')}: "${v[0].spelling}"`);
+  }
+
+  // A tick over nothing checked is how a green report starts meaning nothing.
+  if (!live.length) {
+    console.log('· nothing to check — every step is landed, cancelled, or not yet recorded.');
+    console.log('  Run this again when work is about to go out; it proves nothing right now.');
+    return;
+  }
+  if (bad) { console.log(`\n✗ ${bad} problem(s) across ${live.length} step(s)`); process.exit(1); }
+  ok(`${live.length} step(s) check out — paths, proofs, briefs and ownership`);
+};
+
 const HELP = `orchestrate — five stages, on Cursor or Claude Code
 
   load <path>...            read the plan files, record them
@@ -787,7 +989,9 @@ const HELP = `orchestrate — five stages, on Cursor or Claude Code
   guard <key>               did it touch anything it does not own
   land <key> [--sha S]      record the merge
   board                     every step and its state
+  doctor                    everything a step cites that can be checked
   models [list|sync]        the ladder, and regenerating it from the CLI
+  doctor                    everything the steps cite that can be checked without running
   slot run <n> -- <cmd>     one shared machine slot, so parallel heavy checks queue
 
 State lives in .claude/orch/. events.jsonl is the record; state.json is a

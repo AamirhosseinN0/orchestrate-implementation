@@ -150,6 +150,24 @@ containing the other's file, or when they name the same serialisation point — 
 lockfile, a migration head, a shared test assertion. Overlapping steps are
 recorded, not refused; they simply cannot be open at the same time.
 
+Then sweep everything the steps cite, immediately before opening them:
+
+```bash
+node $ORCH doctor
+```
+
+It checks that each step's plan still exists, its dependencies are real steps,
+every `owns` entry is a path `guard` could match against a diff and sits in a
+directory that exists, every proof starts with something runnable, and every step
+has a model. It fails on the two things nothing else sees: two open steps
+claiming one path or holding one serialisation point. It also warns when a
+serialisation point is named by only one step — usually a spelling that missed
+its partner — and when a brief is older than the step it describes, because the
+agent holding it will not know.
+
+Run it here, not earlier. With nothing open it says so rather than passing, and a
+tick over nothing checked is how a green report starts meaning nothing.
+
 ## 5. Run
 
 ```bash

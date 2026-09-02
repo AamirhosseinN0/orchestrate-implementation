@@ -989,10 +989,9 @@ const HELP = `orchestrate — five stages, on Cursor or Claude Code
   guard <key>               did it touch anything it does not own
   land <key> [--sha S]      record the merge
   board                     every step and its state
-  doctor                    everything a step cites that can be checked
-  models [list|sync]        the ladder, and regenerating it from the CLI
   doctor                    everything the steps cite that can be checked without running
   slot run <n> -- <cmd>     one shared machine slot, so parallel heavy checks queue
+  models [list|sync]        the ladder, and regenerating it from the CLI
 
 State lives in .claude/orch/. events.jsonl is the record; state.json is a
 projection of it.`;

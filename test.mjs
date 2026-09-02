@@ -18,7 +18,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const DRIVER = path.join(path.dirname(fileURLToPath(import.meta.url)), 'driver.mjs');
@@ -2899,6 +2899,27 @@ say('verify is green on a recorded run nobody made up');
   ok('and when it ended outside the protocol', watch([DEAD]) === 0);
   ok('a missing log is refused rather than waited on forever',
     watch([path.join(d, 'nope.jsonl')]) === 2);
+
+  // The case the whole thing is for: a log still being written. The follow is
+  // done in the formatter rather than by piping `tail -f` into it, because tail
+  // only learns its reader has gone when it next writes — and a run that has
+  // ended is never written to again, so that pipeline hung for ever on exactly
+  // the case the watcher exists to handle.
+  const LIVE = path.join(d, 'live.jsonl');
+  fs.writeFileSync(LIVE, JSON.stringify({ type: 'system', subtype: 'init', model: 'Cursor Grok 4.6' }) + '\n');
+  const writer = spawn(process.execPath, ['-e',
+    `const fs=require('fs');const f=${JSON.stringify(LIVE)};` +
+    `setTimeout(()=>fs.appendFileSync(f,JSON.stringify({type:'assistant',message:{content:[{text:'still going'}]},timestamp_ms:1000})+'\\n'),400);` +
+    `setTimeout(()=>fs.appendFileSync(f,JSON.stringify({type:'result',result:'all done',timestamp_ms:3000})+'\\n'),900);`],
+    { stdio: 'ignore' });
+  let liveOut = '', liveCode = -1;
+  try { liveOut = execFileSync('bash', [W, LIVE], { encoding: 'utf8', timeout: 25000,
+    stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env, CURSOR_ORCH_WAIT: '1' } }); liveCode = 0; }
+  catch (e) { liveCode = e.killed ? 'hung' : (e.status ?? -1); liveOut = String(e.stdout || ''); }
+  try { writer.kill(); } catch { /* already gone */ }
+  ok('a log still being written is followed as it grows', has(liveOut, 'still going'), liveOut);
+  ok('and the watcher stops when the run does', liveCode === 0, liveCode);
+  ok('reporting the end it saw', has(liveOut, 'all done'), liveOut);
 }
 
 // ------------------------------------------------------- the five stages, in order
@@ -3248,7 +3269,7 @@ else console.log('\nsandboxes kept: ' + boxes.join('\n                '));
 // an exception thrown before its first `ok`, a case quietly commented out — and
 // the suite still ends on "all green", because green is only ever measured
 // against however many checks happened to run.
-const EXPECTED = 622;   // every check above counts; raise it deliberately when you add one
+const EXPECTED = 625;   // every check above counts; raise it deliberately when you add one
 
 console.log('\n' + '-'.repeat(60));
 if (pass + failures.length !== EXPECTED)

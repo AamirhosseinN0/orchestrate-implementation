@@ -9,12 +9,21 @@
 //   --key <name>        label each line, for when several runs share a pane
 //   --quiet-think       drop the thinking summaries, keep actions and answers
 //   --full              do not truncate command output
-//   --exit-on-result    stop once the run ends, instead of draining stdin
+//   --exit-on-result    stop once the run ends, instead of reading to the end
+//   --follow <log>      read that file and follow it, instead of reading stdin
+//   --from-end          with --follow, skip what is already there
 //
-// --exit-on-result is for a watcher sitting on `tail -f`, which has no stop
-// condition of its own and would otherwise follow a finished run forever. It is
-// deliberately NOT used by the launcher: there the formatter shares a pipe with
-// the `tee` writing the log, and exiting early would SIGPIPE the log short.
+// --exit-on-result is for a watcher, which would otherwise follow a finished run
+// for ever. It is deliberately NOT used by the launcher: there the formatter
+// shares a pipe with the `tee` writing the log, and exiting early would SIGPIPE
+// the log short.
+//
+// --follow does the tailing here rather than piping `tail -f` in. `tail` only
+// learns that its reader has gone when it next writes, and a run that has ended
+// is never written to again — so the pipeline could hang for ever on exactly the
+// case the watcher exists to handle.
+
+import fs from 'node:fs';
 
 const args = process.argv.slice(2);
 const opt = (n, d = null) => { const i = args.indexOf(n); return i === -1 ? d : args[i + 1]; };
@@ -22,6 +31,8 @@ const KEY = opt('--key', '');
 const QUIET_THINK = args.includes('--quiet-think');
 const FULL = args.includes('--full');
 const EXIT_ON_RESULT = args.includes('--exit-on-result');
+const FOLLOW = opt('--follow');
+const FROM_END = args.includes('--from-end');
 
 const TTY = process.stdout.isTTY;
 const c = (code, s) => (TTY ? `\x1b[${code}m${s}\x1b[0m` : s);
@@ -171,8 +182,7 @@ function feed(line) {
 }
 
 let buf = '';
-process.stdin.setEncoding('utf8');
-process.stdin.on('data', (chunk) => {
+function pump(chunk) {
   buf += chunk;
   let i;
   while ((i = buf.indexOf('\n')) !== -1) {
@@ -180,5 +190,30 @@ process.stdin.on('data', (chunk) => {
     feed(line);
     if (ended && EXIT_ON_RESULT) process.exit(0);
   }
-});
-process.stdin.on('end', () => { if (buf.trim()) feed(buf); });
+}
+
+if (FOLLOW) {
+  let at = 0;
+  if (FROM_END) { try { at = fs.statSync(FOLLOW).size; } catch { at = 0; } }
+  const read = () => {
+    let size;
+    try { size = fs.statSync(FOLLOW).size; } catch { return; }
+    if (size < at) at = 0;             // the file was replaced under us
+    if (size === at) return;
+    const fd = fs.openSync(FOLLOW, 'r');
+    const b = Buffer.alloc(size - at);
+    fs.readSync(fd, b, 0, b.length, at);
+    fs.closeSync(fd);
+    at = size;
+    pump(b.toString('utf8'));
+  };
+  read();
+  if (ended && EXIT_ON_RESULT) process.exit(0);
+  // A quarter of a second is under the threshold at which a person reading the
+  // pane would call it lag, and it costs one stat per tick.
+  setInterval(read, 250);
+} else {
+  process.stdin.setEncoding('utf8');
+  process.stdin.on('data', pump);
+  process.stdin.on('end', () => { if (buf.trim()) feed(buf); });
+}

@@ -56,11 +56,14 @@ if [ "$WINDOW" = 1 ]; then
   exit 0
 fi
 
-# --exit-on-result is what ends the follow: the formatter stops after the result
-# event (or a bare error tail), `tail` takes the SIGPIPE, and the pipeline ends.
-# Only reading here, so nothing can be truncated by that.
+# The formatter does the following itself. Piping `tail -f` into it looked
+# equivalent and was not: tail only learns its reader has gone when it next
+# writes, and a run that has ended is never written to again — so the pipeline
+# hung for ever on exactly the case this exists to handle.
 STOP=(--exit-on-result)
 [ "$KEEP" = 1 ] && STOP=()
+FROM_END=()
+[ "$FROM" = 0 ] && FROM_END=(--from-end)
 
-if [ "$FROM" = 1 ]; then tail -n +1 -f "$LOG"; else tail -n 0 -f "$LOG"; fi \
-  | node "$SELF/stream.mjs" --key "$(basename "$LOG" .jsonl)" "${PASS[@]:-}" "${STOP[@]:-}"
+exec node "$SELF/stream.mjs" --follow "$LOG" --key "$(basename "$LOG" .jsonl)" \
+  "${PASS[@]:-}" "${STOP[@]:-}" "${FROM_END[@]:-}"

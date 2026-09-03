@@ -1,13 +1,13 @@
 ---
 name: claude-cursor
-description: Run an implementation end to end in five stages — load the plans, judge how hard each step is and pick a model for it, refine away the ambiguity, check that nothing collides, then run every step that can run at once. Every step that can run is launched in the same round on its own agent; only an unlanded dependency or a serialisation point that open work is already moving holds one back. Two steps owning the same file run together and reconcile at the merge, because each builds in its own worktree. Agents execute on the Cursor CLI (`agent`) or as Claude Code subagents. Use when asked to orchestrate a plan, run an implementation, hand the building work to Cursor agents, run steps in parallel, drive work in parallel worktrees, pick models per step, or take a written plan through to merged code.
+description: Run an implementation end to end in six stages — load the plans, map which of them touch which files so the round can be made wide before anything runs, judge how hard each step is and pick a model for it, refine away the ambiguity, check that nothing collides, then run every step that can run at once. Every step that can run is launched in the same round on its own agent; only a dependency that is not yet on the main line or a serialisation point that open work is already moving holds one back. A dependency counts the moment it has merged, not once its suite is green. Two steps owning the same file run together and reconcile at the merge, because each builds in its own worktree. Agents execute on the Cursor CLI (`agent`) or as Claude Code subagents. Use when asked to orchestrate a plan, run an implementation, hand the building work to Cursor agents, run steps in parallel, drive work in parallel worktrees, pick models per step, or take a written plan through to merged code.
 allowed-tools: Bash, Read, Write, Edit, Grep, Glob, AskUserQuestion, TodoWrite
 ---
 
-# Five stages
+# Six stages
 
 ```
-load  →  assess  →  refine  →  check  →  run
+load  →  map  →  assess  →  refine  →  check  →  run
 ```
 
 Everything is one command. Run them all from the project root.
@@ -26,8 +26,16 @@ a projection of it, so nothing is lost if a session ends mid-build.
 ## The rule: run everything that can run at once
 
 **Every step that can run must be launched in the same round, on its own agent.
-Only two things hold a step back: a dependency that has not landed, and a
-serialisation point that open work is already moving.**
+Only two things hold a step back: a dependency that is not yet on the main
+line, and a serialisation point that open work is already moving.**
+
+**On the main line means merged, not proven.** A dependency counts from the
+moment `join` puts it on the main checkout's `HEAD` — not from `land`, which is
+the bookkeeping that follows a green suite. `run open` cuts a worktree from that
+`HEAD`, so a dependent opened after the join holds byte-identical code to one
+opened after the landing; what landing adds is proof, and the dependent consumes
+the code, not the proof. Waiting for it anyway put the whole slot queue on every
+hop of the chain.
 
 Not caution about the runner, not tidiness, not "let me see how the first one
 goes", not the size of the round. If `check` names five steps, five agents start
@@ -51,10 +59,16 @@ because it checks the candidates against each other as well as against what is
 out.
 
 The evidence for the rule is the refining stage: ten agents launched together
-turned 130 minutes of work into a 17-minute span. (The chip stage on that same
-build ran one at a time, but its steps were a near-total dependency chain —
-S-001 → S-002 → S-006 → S-007 → S-008 → S-009 → S-010 — so most of that was
-required, not wasted. The rule matters for graphs that are wider than that one.)
+turned 130 minutes of work into a 17-minute span.
+
+The chip stage on that same build ran one at a time, because its steps were a
+near-total dependency chain — S-001 → S-002 → S-006 → S-007 → S-008 → S-009 →
+S-010. That was read at the time as required rather than wasted. It was not.
+A seven-deep chain out of ten plans is not what the requirements demanded; it is
+what happens when ordering is recorded between whole plans instead of between
+the pieces of work that actually depend on each other, and when every hop waits
+for a suite the next hop does not consume. `map` addresses the first and
+joining-is-enough addresses the second.
 
 Up to twelve agents in flight is verified clean; the ceiling is memory, not the
 API. Heavy checks inside those agents go through `slot`, so twelve suites queue
@@ -82,7 +96,63 @@ node $ORCH load docs/plans/
 It prints every plan and how long it is. **Read every one of them in full before
 going further.** Nothing downstream can recover a plan you skimmed.
 
-## 2. Assess — how hard each step is, and what runs it
+## 2. Map — how wide this round can get, while you can still change it
+
+```bash
+node $ORCH map
+```
+
+**The width of a round is decided here, before any agent runs.** A plan becomes
+at most two steps, so ten plans cannot become more than twenty; and `step link`
+turns a plan-level `requires:` into a dependency between every pair of steps. A
+plan that is one coherent slice of files costs nothing under either rule. A plan
+holding four disjoint file sets pays under both.
+
+`map` reads the paths out of the plans' own prose and prints:
+
+- **Seams** — a path three or more plans reach for. Every one is a fan-in, and a
+  fan-in is the deepest part of any graph.
+- **Plans whose file sets touch nothing else** — the ones that can already run
+  beside each other. This is the number that says how wide the round can get.
+- **The ordering already declared**, and which plans declare none.
+- **Shared ground more than one plan moves** — these go one at a time.
+
+It is a reading of the prose, not a gate; nothing is held back on it. Once steps
+exist it measures the same thing from `owns` instead, which is the real answer.
+
+### What to do with what it says
+
+**Lift every seam into its own plan that lands first.** A file touched by three
+plans is either a contract or a queue. Written as its own small plan — one step,
+strongest tier, minutes of work — it lands once and everything else fans off it.
+Left where it is, three steps own it, each reconciles against the other two at
+the merge, and anything ordered after them waits for all three. `points.json`
+already names the usual ones: route table, schema registry, public exports, env
+schema, generated client.
+
+**Then split what is left into slices whose file sets do not intersect.** One
+slice is one plan. Where a slice still has to be two steps, that is what the cap
+is for and the refining agent will find the split itself.
+
+**Write the ordering as `requires:`, one line per real dependency.** This is the
+step that keeps the requirement intact: "first this part of the user API, then
+that part" stops being the order of paragraphs inside one document and becomes a
+header `load` reads, the cycle check verifies, and `doctor` confirms points at
+real steps. More auditable than prose order, not less.
+
+**Name the slices so their keys cannot collide.** Keys come from the plan's own
+filename and a trailing letter is read: `2.1a-contracts.md` gives `S-2.1a`,
+`2.1b-read.md` gives `S-2.1b`. Distinct first tokens are the whole of what keeps
+twelve plans' keys apart.
+
+**Give every slice enough of the why to stand alone.** This is the guard on the
+whole scheme. A thin plan is faster to build and easier to get wrong, because
+its agent sees a smaller piece of the intent. Keep the requirement narrative in
+one place every slice points at, and open each slice with what it is part of and
+what it is not allowed to decide. The round got wider, so each brief carries
+more context, not less.
+
+## 3. Assess — how hard each step is, and what runs it
 
 The ladder, weakest to strongest:
 
@@ -119,7 +189,28 @@ check` exits 1 while any step has no model.
 Assess runs on the steps, so on a first pass it comes after refining. On a
 re-run — a plan changed, the user wants it cheaper — run it any time.
 
-## 3. Refine — one agent per plan, all at once
+### Then let position argue too
+
+Difficulty is not the only thing that decides which model a step wants. Where it
+sits does as well, and the two come apart:
+
+```bash
+node $ORCH assess critical            # what position argues for
+node $ORCH assess critical --apply    # take it
+```
+
+A step with twenty steps behind it has its latency multiplied by all of them,
+and a wrong answer on it costs a re-run of everything it unblocks. A leaf costs
+only itself. So this suggests a notch up where the downstream cost is heavy, and
+a notch down on a leaf that nothing waits on. It counts the whole chain behind a
+step, not just its direct dependents — the first link of a seven-deep chain
+unblocks one step and gates six.
+
+It comes out roughly cost-neutral and puts the strongest model where a mistake
+is most expensive. It only ever suggests: nothing is written without `--apply`,
+and a row the user set is left alone.
+
+## 4. Refine — one agent per plan, all at once
 
 ```bash
 node $ORCH refine brief docs/plans/2.1.md > /tmp/refine-2.1.txt
@@ -166,6 +257,25 @@ idempotent, it refuses a `requires:` chain that loops, and it says which plans
 it could not link because they have no steps yet. Without it an integration
 plan opens in the same round as the five plans it integrates.
 
+That cross-product is the safe default and stays the default. It is also the
+coarsest thing here: with two steps each it records four edges where typically
+one is real, and the three spurious ones hold work that never conflicted.
+
+```bash
+node $ORCH step link --only-shared --dry-run
+```
+
+records the edge only where the two steps actually meet — one owns a path the
+other owns, or they name the same serialisation point — and says which file made
+each edge real. Thin plans make the difference moot, which is the better fix;
+this is for the round you have rather than the round you wish you had authored.
+
+**What it cannot see is a dependency with no footprint in the record**: B reads
+at runtime what A writes, and no file or point says so. So a requirement that
+comes out with no edges at all is not quietly dropped — it is named, and it
+fails the command, and nothing is written. Half a graph is worse than none,
+because the half that landed is the harder half to see.
+
 Keys come from the plan's own name: `S-013-capabilities.md` gives `S-013.1`,
 `2.1-flashcards.md` gives `S-2.1.1`. Name plans so that first token is distinct
 and the keys cannot collide.
@@ -173,7 +283,7 @@ and the keys cannot collide.
 `refine done` prints any question the agent could not settle from the code. **Put
 those to the user before building.** `refine check` exits 1 while one is open.
 
-## 4. Check — what can open together
+## 5. Check — what can open together
 
 ```bash
 node $ORCH check
@@ -184,8 +294,9 @@ exactly what they would collide with, and the steps still waiting on work to
 land.
 
 It holds a step back only for a serialisation point that open work is already
-moving, or a dependency that has not landed. Steps that share a file are listed
-separately, as merges to sequence rather than collisions to prevent.
+moving, or a dependency that is not yet on the main line. Steps that share a
+file are listed separately, as merges to sequence rather than collisions to
+prevent.
 
 Then sweep everything the steps cite, immediately before opening them:
 
@@ -202,9 +313,36 @@ for one migration head across eleven steps is a round where `check` opens two
 migration-writing steps together and git merges them cleanly and wrongly. A pair
 that differs by only one word is said out loud without failing.
 
+It also names every path three or more steps own. Each of those is a seam: all
+three reconcile against each other at the merge, and anything ordered after them
+waits for all three. A step that owns the seam alone and lands first removes the
+whole fan-in — which is what `map` was asking for before the plans were refined.
+
 A directory a step is about to create is a note, not a fault: on a build from
 nothing that is most of the round. What still fails is a first segment that does
 not exist beside something almost exactly like it — a typo, not a plan.
+
+### A point may name the instance it moves
+
+Two steps that both say `migration head` are held apart, full stop — and in a
+monorepo with a migration directory per package they may be moving genuinely
+separate heads. One shared word serialised eleven steps that never touched.
+
+So a name may say which instance it moves, after a colon:
+
+```
+migration head: orders          lockfile: apps/web
+```
+
+Two scoped names with the same class and different instances are different
+things, and run at the same time. **Only write one where you can point at two
+separate files.** If they are really one shared thing, a scoped name switches off
+the only gate that catches a clean merge producing a wrong tree.
+
+A scoped name against a *bare* one is still one thing, and `doctor` still fails
+it: a step that says plain `migration head` may well mean all of them. Add the
+scheme to the project's own list through `CURSOR_ORCH_POINTS` so it is a decision
+rather than a spelling drift.
 
 It also warns when a brief is older than the step it describes, because the agent
 holding it will not know. `doctor --all` adds the quieter notes: every
@@ -213,7 +351,7 @@ serialisation point only one step names, whether or not anything looks like it.
 Run it here, not earlier. With nothing open it says so rather than passing, and a
 tick over nothing checked is how a green report starts meaning nothing.
 
-## 5. Run
+## 6. Run
 
 ```bash
 node $ORCH run open S-1
@@ -276,10 +414,36 @@ Its process exit wakes you.
 node $ORCH run record S-1 --log .claude/orch/logs/S-1.jsonl
 node $ORCH guard S-1
 node $ORCH join S-1                          # merges it into the main line
-node $ORCH slot run ci -- <your test command>   # on the JOINED tree
+node $ORCH check                             # the merge alone usually widens what can open
+node $ORCH slot run ci -- <your test command>   # on the JOINED tree, beside the new round
 node $ORCH land S-1 --sha <sha>
-node $ORCH check                             # a landing usually widens what can open
 ```
+
+**`check` goes before the suite, not after it.** The merge is on `HEAD` the
+moment `join` returns, so whatever only needed S-1 can be cut from it now — and
+then the suite runs beside that work instead of in front of it. `join` says how
+many steps it just freed.
+
+### When several finish at once, join them as a batch
+
+Twelve branches finishing together used to mean twelve full suite runs in series
+through the slot, and the graph advanced at the rate of one of them.
+
+```bash
+node $ORCH join --batch S-1 S-2 S-3
+node $ORCH slot run ci -- <your test command>       # once, over all three
+node $ORCH land --batch S-1 S-2 S-3 --sha <sha>
+```
+
+Each branch merges in turn. One that conflicts is rolled back on its own and the
+rest of the batch stands, so a single bad branch does not cost the others their
+merge. Then one suite over the combined tree — which is the tree that will
+actually exist, and strictly better coverage than three pairwise trees nobody
+ever assembles.
+
+**What it costs is attribution.** A red batch does not say which branch did it.
+The order is recorded, and the red path is to reset to the base it prints and
+re-join in halves. You pay that only when something is genuinely broken.
 
 `run record` reads the log rather than asking what happened: what files were
 written and by how much, which commands failed and what they printed, how much
@@ -311,9 +475,16 @@ outside, which is strictly harder than what either of them was doing.
 A clean merge is not a working one. The suite on the *joined* tree is the check
 that matters: on the real build a step passed its own suite 22 out of 22 and went
 red once merged, on a route-set assertion — exactly the kind of breakage a clean
-textual merge produces.
+textual merge produces. **Batching that suite is fine; skipping it is not.** It
+is the only check that catches the failure mode this whole arrangement produces.
 
-Then loop: record, guard, join, verify, land, `check`, open everything it names.
+**When the joined tree goes red, the fix goes forward — it is not a reset.**
+Because dependents open off a merge rather than off a landing, worktrees may
+already be cut from the `HEAD` that carries it, and `git reset --hard` would
+strand them. `sendback` names those worktrees when there are any, and says so.
+Land the correction as a new commit on the step's branch and re-join.
+
+Then loop: record, guard, join, `check`, open everything it names, verify, land.
 Keep going until the board is empty.
 
 ### Heavy checks go through one slot
@@ -392,8 +563,40 @@ It stops when the run stops. `--quiet-think` drops the thinking summaries;
 `--full` stops clipping command output. The same formatter replays a saved log
 with the timings it actually ran at.
 
+## What not to trade away for speed
+
+Every one of these was earned from a specific failure, and each is load-bearing
+for exactly the kind of round that gets wider.
+
+- **Do not raise the two-steps-per-plan cap.** It is the guard against an agent
+  carving one plan into six to look thorough and losing the intent across the
+  seams. Width comes from writing four plans, not from a refiner splitting one
+  four ways. `map` is how you decide where to split; a person owns that call.
+- **Do not skip the suite on the joined tree.** Batch it, run it beside the next
+  round, but run it.
+- **Do not put two step keys on one agent.** It reads like a saving and it is the
+  opposite: two steps in one agent run one after the other, two agents run at
+  once. It also breaks the chat address, the unit of merge and the run record,
+  and none of the three complains.
+- **Do not narrow `owns` to make a step look independent.** A list that is too
+  narrow buys a wider round now and pays for it as a collision nobody sees until
+  the merge. `guard` catches the stray file; it cannot recover the hour.
+- **Do not let a thin slice ship a thin brief.** The cost of a wider round is
+  that each agent sees less of the whole. Spend some of what you save on
+  context.
+- **Do not skip `doctor` because the round got wide.** A wide round is where two
+  spellings of one serialisation point cost the most.
+
 ## Gotchas
 
+- **A dependency is met at `join`, not at `land`.** The merge is on the main
+  checkout's `HEAD` by then and worktrees are cut from that `HEAD`, so the code
+  is already there; landing only records that a suite proved it. The consequence
+  is the forward-commit rule above. `CURSOR_ORCH_OPEN_AT=land` restores the old
+  behaviour if you want the proof before the next hop.
+- **Landing stays in order even though opening does not.** `land` still refuses
+  while anything under a step is merely merged, because landing is the record of
+  proof and a step cannot claim a suite covered work that never went through one.
 - **A run's liveness is its log, not `ps`.** The process does not show up under
   `agent`. A growing log is what alive looks like; the elapsed stamp on each
   streamed line says the same thing without asking.

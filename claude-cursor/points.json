@@ -8,7 +8,20 @@
     "opened two migration-writing steps in the same round.",
     "",
     "Extend per project with CURSOR_ORCH_POINTS=<file>, same shape. The two",
-    "lists are unioned, so a project adds without losing these."
+    "lists are unioned, so a project adds without losing these.",
+    "",
+    "A name may say which instance it moves, after a colon:",
+    "",
+    "    migration head: orders        lockfile: apps/web",
+    "",
+    "Two scoped names with the same class and different instances are held to be",
+    "different things, and run at the same time. Only write one where you can",
+    "point at two separate files — separate migration directories, a lockfile",
+    "per package. If they are really one shared thing, a scoped name switches",
+    "off the only gate that catches a clean merge producing a wrong tree.",
+    "",
+    "A scoped name against a bare one is still one thing: a step that says plain",
+    "\"lockfile\" may mean all of them, so that pair is still reported."
   ],
   "points": [
     "migration head",

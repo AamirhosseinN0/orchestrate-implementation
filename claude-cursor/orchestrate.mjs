@@ -119,7 +119,48 @@ function willMerge(t, other) {
 const OPEN_STATUSES = ['open', 'reported'];
 const DEAD_STATUS = ['landed', 'cancelled'];
 const openTasks = (s, except) => tasks(s).filter((x) => x.key !== except && OPEN_STATUSES.includes(x.status));
-const heldNeeds = (s, t) => (t.needs || []).filter((n) => { const d = depOf(s, n); return !d || d.status !== 'landed'; });
+
+// A dependency is satisfied for the purpose of OPENING once its work is on the
+// main line, and that happens at `join`, not at `land`.
+//
+// `join` runs `git merge --no-ff` in the main checkout and rolls back only on
+// conflict, so on success the dependency's commits are on the main checkout's
+// HEAD. `run open` cuts the dependent's worktree with `git worktree add` and no
+// commit-ish, which branches from that same HEAD. A worktree cut just after
+// join and one cut after land therefore hold byte-identical code. What `land`
+// adds is proof — a green suite on the joined tree — and the dependent does not
+// consume the proof, it consumes the code.
+//
+// Waiting for the proof anyway put the whole slot queue on every hop of the
+// chain: twelve branches finishing together behind a ten-minute suite is two
+// hours before the last one lands, and on a seven-deep graph that queue was
+// most of the wall-clock.
+//
+// The cost is real and it is named where it bites. If the joined-tree suite
+// goes red, dependents have already been cut from that HEAD, so the fix lands
+// as a forward commit — a `git reset --hard` would strand them. `sendback`
+// says so when there is anything to strand.
+//
+// Set CURSOR_ORCH_OPEN_AT=land to go back to waiting for the proof.
+const OPEN_AT_JOIN = (process.env.CURSOR_ORCH_OPEN_AT || 'join') !== 'land';
+const onMainLine = (d) => d.status === 'landed' || (OPEN_AT_JOIN && !!d.joinedAt);
+const heldNeeds = (s, t) => (t.needs || []).filter((n) => { const d = depOf(s, n); return !d || !onMainLine(d); });
+// Landing is the bookkeeping that records proof, so it stays strict: a step is
+// not recorded as proven while something it was built on is only merged. Open
+// early, land in order.
+const unlandedNeeds = (s, t) => (t.needs || []).filter((n) => { const d = depOf(s, n); return !d || d.status !== 'landed'; });
+// Dependencies that are on the main line but not yet proven. A step opened on
+// these is the trade this makes, so every command that opens one says it.
+const unprovenNeeds = (s, t) => (t.needs || []).filter((n) => { const d = depOf(s, n); return d && d.status !== 'landed' && !!d.joinedAt; });
+// Steps whose worktree was cut from a HEAD that already carried this step's
+// merge. If this step's work has to be undone, these are what a reset would
+// strand, and the fix has to go forward instead.
+const cutFrom = (s, t) => {
+  if (!t.joinedAt) return [];
+  const after = Date.parse(t.joinedAt);
+  return tasks(s).filter((x) => x.key !== t.key && OPEN_STATUSES.includes(x.status) &&
+    x.openedAt && Date.parse(x.openedAt) >= after);
+};
 
 function waves(s) {
   const ts = tasks(s).filter((t) => t.status !== 'cancelled');
@@ -399,6 +440,145 @@ CMDS.load = (argv) => {
   console.log('\nRead every one of them in full before anything else.');
 };
 
+// ------------------------------------------------------------------- the map
+// Which plans touch which files, read out of the plans themselves.
+//
+// The width of a round is decided before any agent runs: a plan may become at
+// most two steps, so ten plans cannot become more than twenty, and the
+// cross-product in `step link` makes every step of a plan wait for every step
+// of what it comes after. Both of those are cheap to live with when a plan is
+// one coherent slice of files, and expensive when four disjoint file sets share
+// one document.
+//
+// This says which it is, while the plans can still be rearranged. After
+// refining the same information exists in `owns` and is accurate rather than
+// guessed — so both are shown when there are steps.
+const FILE_EXT = 'ts|tsx|js|jsx|mjs|cjs|json|md|yml|yaml|sql|py|go|rs|rb|java|kt|swift|c|h|cc|cpp|css|scss|less|html|toml|ini|sh|bash|lock|prisma|graphql|proto|tf|cfg|conf';
+// Deliberately narrow. A token counts as a path when it ends in an extension
+// this recognises, or when it is plainly a directory — which keeps "and/or",
+// "A/B" and a bare version number out. What it misses is a directory written
+// without its trailing slash, so the map says it is a reading of the prose and
+// not a gate. Nothing is held back on the strength of it.
+const looksLikePath = (x) => {
+  if (!x || /^https?:/i.test(x) || x.includes('://')) return false;
+  if (new RegExp(`\\.(?:${FILE_EXT})$`, 'i').test(x)) return true;
+  return x.endsWith('/') && x.includes('/');
+};
+function pathsIn(body) {
+  const out = new Set();
+  const re = new RegExp(String.raw`[\w.@~-]*(?:/[\w.@~-]+)+/?|[\w.@-]+\.(?:${FILE_EXT})\b`, 'gi');
+  for (const m of String(body).matchAll(re)) {
+    const x = m[0].replace(/[.,;:)\]}]+$/, '');
+    if (looksLikePath(x)) out.add(norm(x));
+  }
+  return out;
+}
+
+CMDS.map = () => {
+  const s = readState();
+  const plans = s.plans || [];
+  if (!plans.length) die('no plans loaded — run `load <path>` first');
+  const live = tasks(s).filter((t) => !DEAD_STATUS.includes(t.status));
+
+  // file → the plans that name it
+  const vocab = vocabulary();
+  const byFile = new Map();
+  const perPlan = new Map();
+  const pointsPerPlan = new Map();
+  // One read per plan: both the paths and the shared ground come out of the
+  // same body.
+  for (const p of plans) {
+    let body = '';
+    try { body = fs.readFileSync(path.resolve(CWD, p.path), 'utf8'); } catch { continue; }
+    const found = pathsIn(body);
+    perPlan.set(p.path, found);
+    for (const f of found) (byFile.get(f) || byFile.set(f, []).get(f)).push(p.path);
+    const lower = body.toLowerCase();
+    pointsPerPlan.set(p.path, vocab.filter((v) => lower.includes(v.toLowerCase())));
+  }
+
+  console.log(`${plans.length} plan(s), ${byFile.size} distinct path(s) named between them.`);
+  console.log('This is a reading of the plans\' prose, not a gate — nothing is held back on it.\n');
+
+  // The seams: what many plans reach for. Each one is a fan-in, and a fan-in is
+  // the deepest part of any graph. Lifting it into its own plan that lands
+  // first turns the fan-in into one early landing and lets the rest run wide.
+  const seams = [...byFile.entries()].filter(([, ps]) => ps.length >= 3)
+    .sort((a, b) => b[1].length - a[1].length);
+  const shared = [...byFile.entries()].filter(([, ps]) => ps.length === 2);
+  if (seams.length) {
+    console.log(`Seams — named by three or more plans (${seams.length}):`);
+    for (const [f, ps] of seams) console.log(`  ${String(ps.length).padStart(2)}×  ${f.padEnd(44)} ${ps.map((x) => planId(x)).join(' ')}`);
+    console.log('  Lift each into its own plan that lands first. Everything else then fans');
+    console.log('  off a contract instead of queueing behind whoever got there first.\n');
+  } else {
+    console.log('No path is named by three or more plans — no obvious seam to lift.\n');
+  }
+  if (shared.length) {
+    console.log(`Shared by exactly two plans (${shared.length}) — a merge to sequence, not a gate:`);
+    for (const [f, ps] of shared.slice(0, 15)) console.log(`      ${f.padEnd(44)} ${ps.map((x) => planId(x)).join(' ')}`);
+    if (shared.length > 15) console.log(`      … and ${shared.length - 15} more`);
+    console.log('');
+  }
+
+  // Which plans could already run beside each other, on files alone. This is
+  // the number that decides how wide the round can get.
+  const ids = plans.map((p) => p.path);
+  const clash = [];
+  for (let i = 0; i < ids.length; i++) for (let j = i + 1; j < ids.length; j++) {
+    const a = perPlan.get(ids[i]) || new Set(), b = perPlan.get(ids[j]) || new Set();
+    const both = [...a].filter((x) => [...b].some((y) => collides(x, y)));
+    if (both.length) clash.push({ a: ids[i], b: ids[j], files: both });
+  }
+  const disjoint = ids.filter((x) => !clash.some((c) => c.a === x || c.b === x));
+  console.log(`Plans whose file sets touch nothing else (${disjoint.length} of ${ids.length}): ` +
+    (disjoint.map((x) => planId(x)).join(' ') || '(none)'));
+  if (clash.length) {
+    console.log(`${clash.length} pair(s) of plans name a path in common:`);
+    for (const c of clash.slice(0, 12)) console.log(`  ${planId(c.a)} ↔ ${planId(c.b)}  ${c.files.slice(0, 4).join('; ')}${c.files.length > 4 ? ` (+${c.files.length - 4})` : ''}`);
+    if (clash.length > 12) console.log(`  … and ${clash.length - 12} more`);
+  }
+
+  // The ordering already written down, and what it will cost once linked.
+  const withReq = plans.filter((p) => (p.requires || []).length);
+  console.log(`\nOrdering declared in front matter: ${withReq.length} of ${plans.length} plan(s) name a requires:.`);
+  for (const p of withReq) console.log(`  ${planId(p.path)} comes after ${(p.requires || []).join(', ')}`);
+  const noReq = plans.filter((p) => !(p.requires || []).length);
+  if (noReq.length && withReq.length) {
+    console.log(`  ${noReq.length} plan(s) declare no ordering: ${noReq.map((p) => planId(p.path)).join(' ')}`);
+    console.log('  If one of those really does come after another, say so — an empty graph');
+    console.log('  lets an integration plan open beside the plans it integrates.');
+  }
+
+  // Serialisation points the plans already imply. Two plans naming one of these
+  // will be held apart one at a time, so it is worth knowing which, and worth
+  // knowing whether they are really the same instance of the thing.
+  const contended = vocab.map((v) => ({ v, who: plans.filter((p) => (pointsPerPlan.get(p.path) || []).includes(v)) }))
+    .filter((x) => x.who.length >= 2);
+  if (contended.length) {
+    console.log(`\nShared ground named by more than one plan (${contended.length}) — these go one at a time:`);
+    for (const { v, who } of contended) console.log(`  ${v.padEnd(22)} ${who.map((p) => planId(p.path)).join(' ')}`);
+    console.log('  If two of these are genuinely separate — a migration directory per package,');
+    console.log('  a lockfile per workspace — scope the name: "migration head: orders".');
+    console.log('  Only where you can point at two separate files.');
+  }
+
+  // Once steps exist, `owns` is the real answer and the prose is only a guess.
+  if (live.length) {
+    const owned = new Map();
+    for (const t of live) for (const o of t.owns || []) (owned.get(norm(o)) || owned.set(norm(o), []).get(norm(o))).push(t.key);
+    const fan = [...owned.entries()].filter(([, ks]) => ks.length >= 3).sort((a, b) => b[1].length - a[1].length);
+    console.log(`\n${live.length} step(s) recorded, owning ${owned.size} path(s).`);
+    if (fan.length) {
+      console.log(`  ${fan.length} path(s) owned by three or more steps — the same seam, now measured:`);
+      for (const [f, ks] of fan) console.log(`    ${String(ks.length).padStart(2)}×  ${f.padEnd(40)} ${ks.join(' ')}`);
+    }
+  } else {
+    console.log('\nNo steps yet. This is the moment to rearrange the plans — after refining,');
+    console.log('changing the shape means `step reset` and refining again.');
+  }
+};
+
 // Every step in a batch is judged before any of it is written. Half a batch
 // recorded and the rest refused leaves a register nobody planned.
 function vetBatch(s, list) {
@@ -421,7 +601,7 @@ function vetBatch(s, list) {
 
 CMDS.step = (argv) => {
   const s = readState();
-  const usage = 'step add < json | step link [--dry-run] | step rm <key>… [--force] | step reset <plan> [--force]';
+  const usage = 'step add < json | step link [--dry-run] [--only-shared] | step rm <key>… [--force] | step reset <plan> [--force]';
 
   // Plans are refined all at once, so when an agent writes its report the steps
   // of the plans it comes after usually do not exist yet and it cannot name
@@ -431,9 +611,24 @@ CMDS.step = (argv) => {
   // of A. It is safe to run more than once and says what it changed.
   if (argv[0] === 'link') {
     const dry = argv.includes('--dry-run');
+    // The cross-product is the safe default and stays the default: plan B comes
+    // after plan A, so every step of B waits for every step of A. It is also
+    // the coarsest thing here — with two steps each it records four edges where
+    // typically one is real, and the three spurious ones hold work that never
+    // conflicted.
+    //
+    // `--only-shared` records the edge only where the two steps actually meet:
+    // one owns a path the other owns, or they name the same serialisation
+    // point. That is the ordering the requirements really have.
+    //
+    // What it cannot see is a dependency with no footprint in the record — B
+    // reads at runtime what A writes, and no file or point says so. So a
+    // requirement that comes out with no edges at all is not quietly dropped:
+    // it is named and it fails the command.
+    const onlyShared = argv.includes('--only-shared');
     const live = tasks(s).filter((t) => !DEAD_STATUS.includes(t.status));
     const stepsOf = (rec) => live.filter((t) => samePlan(t.plan, rec.path));
-    const added = [], missing = [], unknown = [];
+    const added = [], missing = [], unknown = [], skipped = [], vanished = [];
     for (const rec of s.plans || []) {
       const mine = stepsOf(rec);
       if (!mine.length) continue;
@@ -442,15 +637,44 @@ CMDS.step = (argv) => {
         if (!dep) { unknown.push(`${rec.path} requires "${req}", which is not a loaded plan`); continue; }
         const theirs = stepsOf(dep);
         if (!theirs.length) { missing.push(`${rec.path} requires ${dep.path}, which has no steps recorded yet`); continue; }
+        // Edges this requirement ends up standing on, whether this run added
+        // them or a previous one did. Zero of them is the case that must fail.
+        let kept = 0;
         for (const t of mine) for (const d of theirs) {
-          if (t.key === d.key || (t.needs || []).includes(d.key)) continue;
-          (t.needs ||= []).push(d.key);
-          added.push(`${t.key} needs ${d.key}`);
+          if (t.key === d.key) continue;
+          if ((t.needs || []).includes(d.key)) { kept++; continue; }
+          if (onlyShared) {
+            const files = overlap(t, d), points = sharedPoints(t, d);
+            if (!files.length && !points.length) {
+              skipped.push(`${t.key} ↮ ${d.key} — nothing shared`);
+              continue;
+            }
+            (t.needs ||= []).push(d.key);
+            added.push(`${t.key} needs ${d.key}  (${files.length ? files.join('; ') : 'point ' + points.join('; ')})`);
+          } else {
+            (t.needs ||= []).push(d.key);
+            added.push(`${t.key} needs ${d.key}`);
+          }
+          kept++;
         }
+        // The ordering the plan asked for came out as nothing at all. Under the
+        // cross-product this cannot happen; under --only-shared it can, and it
+        // is the one outcome that must not pass quietly.
+        if (onlyShared && !kept) vanished.push(`${rec.path} requires ${dep.path}, and no step of either shares a file or a point — ` +
+          `so that ordering would be recorded nowhere. Name the real dependency in the plan's steps, or link without --only-shared.`);
       }
     }
     for (const u of unknown) console.log('✗ ' + u);
+    for (const v of vanished) console.log('✗ ' + v);
     for (const m of missing) console.log('· ' + m + ' — refine it, then run this again');
+    if (onlyShared && skipped.length) {
+      console.log(`· ${skipped.length} pair(s) left unlinked because they share nothing:`);
+      for (const x of skipped.slice(0, 20)) console.log('    ' + x);
+      if (skipped.length > 20) console.log(`    … and ${skipped.length - 20} more`);
+    }
+    // Nothing is recorded when a requirement would vanish. Half a graph is
+    // worse than none, because the half that landed is the harder half to see.
+    if (vanished.length) die(`${vanished.length} requirement(s) would be recorded nowhere. Nothing was written.`, 1);
     if (!added.length) { ok('nothing to add — every plan already waits on what it says it comes after'); return; }
     for (const a of added) console.log('  ' + a);
     if (dry) { console.log(`\n${added.length} link(s) — not recorded (--dry-run)`); return; }
@@ -553,7 +777,64 @@ CMDS.assess = (argv) => {
     if (missing.length) die(`${missing.length} step(s) have no model yet: ${missing.map((t) => t.key).join(' ')}`, 1);
     ok('every step has a model');
     return;
-  } else if (argv.length) die('assess [propose < json | set KEY=tier ... | check]');
+  } else if (argv[0] === 'critical') {
+    // Difficulty is not the only thing that decides which model a step wants.
+    // Position does too, and the two come apart: a step with twenty steps
+    // behind it has its latency multiplied by all of them, and a wrong answer
+    // on it costs a re-run of everything it unblocks. A leaf step costs only
+    // itself.
+    //
+    // `frontier` already sorts by how many steps a candidate unblocks, so the
+    // number exists; nothing was using it to choose a model. This does: it
+    // suggests a notch up where the downstream cost is heavy and a notch down
+    // on a leaf, which comes out roughly cost-neutral and puts the strongest
+    // model where a mistake is most expensive.
+    //
+    // It only ever suggests. A row the user set is left alone, the same as
+    // `propose`, and nothing is written without --apply.
+    const apply = argv.includes('--apply');
+    const live = tasks(s).filter((t) => !DEAD_STATUS.includes(t.status));
+    if (!live.length) { console.log('No steps yet — refine the plans first.'); return; }
+    // How many steps sit behind this one, all the way down, not just directly.
+    // Direct dependents undercount a chain: the first link of a seven-deep one
+    // unblocks a single step and gates all six.
+    const downstream = (key, seen = new Set()) => {
+      for (const x of live) {
+        if (seen.has(x.key) || !(x.needs || []).includes(key)) continue;
+        seen.add(x.key); downstream(x.key, seen);
+      }
+      return seen;
+    };
+    const rows = live.map((t) => {
+      const behind = downstream(t.key).size;
+      const at = tiers.indexOf(t.tier);
+      let want = at, why = '';
+      if (at === -1) { want = -1; }
+      else if (behind >= 3) { want = Math.min(tiers.length - 1, at + 1); why = `${behind} steps behind it`; }
+      else if (behind === 0 && (t.needs || []).length) { want = Math.max(0, at - 1); why = 'a leaf — nothing waits on it'; }
+      return { t, behind, at, want, why };
+    });
+    const moves = rows.filter((r) => r.want !== -1 && r.want !== r.at && r.t.model_by !== 'user');
+    const frozen = rows.filter((r) => r.want !== -1 && r.want !== r.at && r.t.model_by === 'user');
+    const w = (a, n) => String(a ?? '').slice(0, n).padEnd(n);
+    console.log(w('step', 10) + w('behind', 8) + w('now', 10) + w('suggest', 10) + 'why');
+    console.log('-'.repeat(78));
+    for (const r of rows.sort((a, b) => b.behind - a.behind)) {
+      const to = r.want === -1 ? '—' : tiers[r.want];
+      console.log(w(r.t.key, 10) + w(r.behind, 8) + w((r.t.tier || '—') + (r.t.model_by === 'user' ? '*' : ''), 10) +
+        w(r.want === r.at ? '' : to, 10) + r.why);
+    }
+    if (frozen.length) console.log(`\n${frozen.length} row(s) left alone because you set them: ${frozen.map((r) => r.t.key).join(' ')}`);
+    if (!moves.length) { console.log('\nNothing to change — every step is already at the tier its position argues for.'); return; }
+    if (!apply) {
+      console.log(`\n${moves.length} row(s) would move. Nothing written — run \`assess critical --apply\` to take them.`);
+      return;
+    }
+    for (const r of moves) { r.t.tier = tiers[r.want]; r.t.model_by = 'critical'; r.t.why_model = r.why; }
+    commit(s, 'assess critical', argv);
+    ok(`${moves.length} row(s) moved on position: ${moves.map((r) => r.t.key + '→' + r.t.tier).join(' ')}`);
+    return;
+  } else if (argv.length) die('assess [propose < json | set KEY=tier ... | critical [--apply] | check]');
 
   const rows = tasks(s).filter((t) => !DEAD_STATUS.includes(t.status));
   if (!rows.length) { console.log('No steps yet — refine the plans first.'); return; }
@@ -599,7 +880,10 @@ CMDS.check = () => {
       console.log('  ' + t.key.padEnd(10) + '↔ ' + o.key + '  ' + i.points.join('; '));
     }
   }
-  if (f.waiting.length) console.log('\nWaiting on work to land: ' + f.waiting.map((t) => t.key).join('  '));
+  // Not "to land": landing is the proof, and a dependency only has to be on the
+  // main line for a dependent to be cut from it. Saying "land" here described
+  // the gate as it was before joining was enough.
+  if (f.waiting.length) console.log('\nWaiting on work to reach the main line: ' + f.waiting.map((t) => t.key).join('  '));
   process.exit(bad ? 1 : 0);
 };
 
@@ -793,7 +1077,11 @@ CMDS.run = (argv) => {
     if (t.status !== 'planned') die(`${key} is already ${t.status}`);
     if (!t.tier) die(`${key} has no model yet — run \`assess\` first`);
     const held = heldNeeds(s, t);
-    if (held.length) die(`${key} needs ${held.join(', ')} to land first`);
+    if (held.length) die(`${key} needs ${held.join(', ')} on the main line first`);
+    // Opened off a merge that has not been proven. Worth saying every time,
+    // because it is what the send-back will have to work around if that merge
+    // turns out to be wrong.
+    const unproven = unprovenNeeds(s, t);
     // Only a serialisation point stops a step opening. A shared file does not:
     // the two build in separate worktrees and reconcile at the merge.
     for (const o of openTasks(s, key)) {
@@ -828,6 +1116,11 @@ CMDS.run = (argv) => {
     t.status = 'open'; t.openedAt = new Date().toISOString();
     commit(s, 'run open', argv);
     ok(`${key} is open on ${modelName(row)}`);
+    if (unproven.length) {
+      console.log(`  built on ${unproven.join(', ')} — merged, not yet proven. Its worktree is`);
+      console.log(`  cut from that merge, so if the suite goes red there the fix lands as a`);
+      console.log(`  forward commit; a reset would strand this worktree.`);
+    }
     if (willReconcile.length) {
       console.log(`  shares files with open work — whichever lands second reconciles:`);
       for (const { o, m } of willReconcile) console.log(`    ↔ ${o.key}: ${m.files.join('; ')}`);
@@ -954,14 +1247,37 @@ CMDS.guard = (argv) => {
 
 CMDS.land = (argv) => {
   const s = readState();
-  const t = getTask(s, argv[0]);
-  const held = heldNeeds(s, t);
-  if (held.length) die(`${t.key} cannot land before ${held.join(', ')}`);
-  t.status = 'landed'; t.landedAt = new Date().toISOString();
-  const i = argv.indexOf('--sha'); if (i !== -1) t.landedSha = argv[i + 1];
+  const i = argv.indexOf('--sha');
+  const shaArg = i === -1 ? null : argv[i + 1];
+  // Not `n !== i + 1`: with no --sha at all, indexOf gives -1 and i + 1 is 0,
+  // which silently ate the first key.
+  const keys = argv.filter((a, n) => !a.startsWith('--') && !(i !== -1 && n === i + 1));
+  if (!keys.length) die('land <key> [--sha <sha>] | land --batch <key>… --sha <sha>');
+  // One suite covered the whole batch, so one command records what it proved.
+  // Landing them one at a time would be the same bookkeeping typed six times,
+  // and the strict gate below still holds for each.
+  const batch = argv.includes('--batch');
+  if (!batch && keys.length > 1) die(`land takes one step unless you say --batch. Got: ${keys.join(' ')}`);
+  const ts = keys.map((k) => getTask(s, k));
+  // Strict on purpose: opening is allowed off a merge, but recording proof is
+  // not. A step landed while something it was built on is merely merged would
+  // claim a green suite covers work that has not been through one.
+  //
+  // Within a batch, the others are landing in the same breath, so a dependency
+  // that is also in this batch counts as satisfied.
+  const inBatch = new Set(keys);
+  for (const t of ts) {
+    const held = unlandedNeeds(s, t).filter((n) => !inBatch.has(n));
+    if (held.length) die(`${t.key} cannot land before ${held.join(', ')}`);
+  }
+  for (const t of ts) {
+    t.status = 'landed'; t.landedAt = new Date().toISOString();
+    if (shaArg) t.landedSha = shaArg;
+  }
   commit(s, 'land', argv);
-  ok(`${t.key} landed`);
-  const freed = tasks(s).filter((x) => x.status === 'planned' && (x.needs || []).includes(t.key) && heldNeeds(s, x).length === 0);
+  ok(ts.length === 1 ? `${ts[0].key} landed` : `${ts.length} step(s) landed: ${keys.join(' ')}`);
+  const freed = tasks(s).filter((x) => x.status === 'planned' &&
+    (x.needs || []).some((n) => inBatch.has(n)) && heldNeeds(s, x).length === 0);
   if (freed.length) console.log(`  frees: ${freed.map((x) => x.key).join(' ')} — run \`check\` and open everything it names.`);
   else console.log('  run `check`: a landing usually widens what can open.');
 };
@@ -1179,11 +1495,35 @@ function pointTokens(x) {
     .map((w) => (w.length > 3 && w.endsWith('s') && !w.endsWith('ss') ? w.slice(0, -1) : w))
     .filter((w) => !POINT_NOISE.has(w)));
 }
+// A point may name the instance it moves and not just the class of thing:
+//
+//     migration head: orders          lockfile: apps/web
+//
+// Two such names with the same class and different instances are two different
+// shared things, said deliberately, and holding them apart is the entire reason
+// for writing them that way. In a monorepo with a migration directory per
+// package, one shared word serialised eleven steps that never touched.
+//
+// A scoped name against a BARE one is still treated as the same thing, and must
+// stay that way: a step that says plain "lockfile" may well mean all of them,
+// and that is exactly the pair worth catching.
+const scopeOf = (x) => {
+  const m = /^([^:]+):\s*(\S.*)$/.exec(String(x).trim());
+  return m ? { cls: m[1], inst: m[2] } : null;
+};
 // Two spellings are the same thing when what is left of them is the same, or
 // when one says everything the other does and more. Differing by one token is
 // weaker evidence — "ci workflow" and "ci cache" are two things — so that one
 // is said out loud and not treated as a fault.
 function pointKinship(a, b) {
+  // Same class, different instance, both said explicitly: not a spelling drift.
+  const sa = scopeOf(a), sb = scopeOf(b);
+  if (sa && sb) {
+    const ca = pointTokens(sa.cls), cb = pointTokens(sb.cls);
+    const shareCls = [...ca].filter((x) => cb.has(x));
+    const sameClass = ca.size > 0 && shareCls.length === ca.size && shareCls.length === cb.size;
+    if (sameClass && normPoint(sa.inst) !== normPoint(sb.inst)) return null;
+  }
   const A = pointTokens(a), B = pointTokens(b);
   if (!A.size || !B.size) return null;
   const shared = [...A].filter((x) => B.has(x));
@@ -1276,6 +1616,26 @@ CMDS.doctor = () => {
     const both = OPEN_STATUSES.includes(live[i].status) && OPEN_STATUSES.includes(live[j].status);
     (both ? dueOpen : duePlanned).push(`${live[i].key} ↔ ${live[j].key}: ${f.join('; ')}`);
   }
+  // A path three or more steps own is a seam, and a seam is a fan-in: every one
+  // of those steps reconciles against every other at the merge, and any step
+  // ordered after them waits for all of them. Saying it here is cheap, and the
+  // answer is a plan of its own that lands first — after which nothing else
+  // needs to own the file at all.
+  {
+    const owned = new Map();
+    for (const t of live) for (const o of t.owns || []) {
+      const k = norm(o);
+      (owned.get(k) || owned.set(k, []).get(k)).push(t.key);
+    }
+    const fan = [...owned.entries()].filter(([, ks]) => ks.length >= 3)
+      .sort((a, b) => b[1].length - a[1].length);
+    if (fan.length) {
+      console.log(`· ${fan.length} path(s) owned by three or more steps — each is a seam:`);
+      for (const [f, ks] of fan) console.log(`    ${f} — ${ks.join(', ')}`);
+      console.log('    Every one of those reconciles against every other at the merge. A step');
+      console.log('    that owns the seam alone and lands first removes the whole fan-in.');
+    }
+  }
   if (dueOpen.length) {
     console.log(`· ${dueOpen.length} pair(s) of open steps share files — a merge to sequence, not a collision:`);
     for (const x of dueOpen) console.log('    ' + x);
@@ -1352,10 +1712,9 @@ CMDS.doctor = () => {
 // it is still on its chat and it knows why it made those changes. A fresh agent
 // reading logs would have to reconstruct two agents' intent from outside, which
 // is strictly harder than what either of them was doing.
-CMDS.join = (argv) => {
-  const s = readState();
-  const t = getTask(s, argv[0]);
-  if (!t.branch) die(`${t.key} has no branch — it was never opened`);
+// The main checkout has to be clean before anything merges into it, and the
+// reasons are the same whether one branch is going in or six.
+function refuseIfDirty() {
   // Excluding .claude: this tool's own state lives there and is written on every
   // command, so a bare status is dirty before anything has happened and would
   // refuse every merge for ever.
@@ -1367,8 +1726,10 @@ CMDS.join = (argv) => {
   if (dirty) die("the main checkout has uncommitted changes to tracked files:\n" +
     dirty.split('\n').slice(0, 10).map((l) => '    ' + l).join('\n') +
     "\n  Merging on top of them would mix your work into the step's. Commit or stash first.");
-
-  const before = shq('git', ['rev-parse', 'HEAD']);
+}
+// One branch into the main line. Returns the conflicted paths, having rolled the
+// merge back, or an empty list having left it in place.
+function mergeOne(s, t) {
   let conflicted = [];
   try {
     execFileSync('git', ['merge', '--no-ff', t.branch, '-m', `land ${t.key}`],
@@ -1380,7 +1741,6 @@ CMDS.join = (argv) => {
     try { execFileSync('git', ['merge', '--abort'], { stdio: 'ignore' }); } catch { /* nothing to abort */ }
   }
   t.joinAttempts = (t.joinAttempts || 0) + 1;
-
   if (conflicted.length) {
     // Who landed the other side, so the resume can say what it is reconciling
     // against rather than just naming files.
@@ -1388,6 +1748,85 @@ CMDS.join = (argv) => {
       conflicted.some((f) => (x.owns || []).some((o) => collides(o, f))));
     t.conflictedWith = others.map((x) => x.key);
     t.conflictedOn = conflicted;
+    return { conflicted, others };
+  }
+  t.joinedAt = new Date().toISOString();
+  t.joinedSha = shq('git', ['rev-parse', '--short', 'HEAD']);
+  return { conflicted: [] };
+}
+
+// Several branches into the main line, then ONE suite over the result.
+//
+// Twelve branches finishing together used to mean twelve full suite runs in
+// series through the slot, and the graph advanced at the rate of one of them.
+// Merging the green ones together and testing once cuts that by the batch
+// factor — and tests the tree that will actually exist, which is strictly
+// better coverage than twelve pairwise trees nobody ever assembles.
+//
+// What it costs is attribution. A red batch does not say which branch did it,
+// so the order is recorded here and the red path re-joins one at a time from
+// the recorded sha. That cost is only paid when something is genuinely broken.
+function joinBatch(s, argv) {
+  const keys = argv.filter((a) => !a.startsWith('--'));
+  if (keys.length < 2) die('join --batch wants two or more steps. One branch is just `join <key>`.');
+  const ts = keys.map((k) => getTask(s, k));
+  for (const t of ts) if (!t.branch) die(`${t.key} has no branch — it was never opened`);
+  refuseIfDirty();
+
+  const before = shq('git', ['rev-parse', '--short', 'HEAD']);
+  const merged = [], failed = [];
+  for (const t of ts) {
+    const r = mergeOne(s, t);
+    if (r.conflicted.length) failed.push({ t, ...r });
+    else merged.push(t);
+  }
+  // The order matters for the bisect, and only the record can still say what it
+  // was once six merges sit on top of each other.
+  (s.batches ||= []).push({ at: new Date().toISOString(), before,
+    merged: merged.map((t) => t.key), failed: failed.map((x) => x.t.key) });
+  commit(s, 'join --batch', argv);
+
+  if (merged.length) {
+    const head = shq('git', ['rev-parse', '--short', 'HEAD']);
+    ok(`${merged.length} of ${ts.length} merged cleanly onto ${head} (was ${before}): ${merged.map((t) => t.key).join(' ')}`);
+  } else {
+    console.log(`✗ none of the ${ts.length} merged — the main line is untouched at ${before}.`);
+  }
+  for (const { t, conflicted, others } of failed) {
+    console.log(`\n✗ ${t.key} conflicts with the main line on ${conflicted.length} file(s):`);
+    for (const f of conflicted) console.log('    ' + f);
+    if (others.length) console.log(`  The other side is ${others.map((x) => x.key).join(', ')}, already landed.`);
+    console.log('  That one merge was rolled back; the rest of the batch stands.');
+    console.log(`    node ${SELF()} sendback ${t.key} --why conflict`);
+  }
+  if (!merged.length) process.exit(1);
+
+  console.log('\n  One suite over the whole batch, which is the tree that will actually exist:');
+  console.log(`    node ${SELF()} slot run ci -- <your test command>`);
+  console.log(`  Green: land --batch ${merged.map((t) => t.key).join(' ')} --sha ${shq('git', ['rev-parse', '--short', 'HEAD'])}`);
+  console.log('  Red:   the batch does not say which branch did it. Bisect from the');
+  console.log(`         recorded base:  git reset --hard ${before}  then re-join in halves.`);
+  console.log(`         The order is recorded: ${merged.map((t) => t.key).join(' → ')}`);
+  // Everything the batch put on the main line may already be built on.
+  const nowFree = tasks(s).filter((x) => x.status === 'planned' && heldNeeds(s, x).length === 0 &&
+    (x.needs || []).some((n) => merged.some((t) => t.key === n)));
+  if (nowFree.length) {
+    console.log(`\n  ${nowFree.length} step(s) can open off this batch now: ${nowFree.map((x) => x.key).join(' ')}`);
+  }
+  if (failed.length) process.exit(1);
+}
+
+CMDS.join = (argv) => {
+  const s = readState();
+  if (argv.includes('--batch')) return joinBatch(s, argv);
+  const t = getTask(s, argv[0]);
+  if (!t.branch) die(`${t.key} has no branch — it was never opened`);
+  refuseIfDirty();
+
+  const before = shq('git', ['rev-parse', 'HEAD']);
+  const { conflicted, others } = mergeOne(s, t);
+
+  if (conflicted.length) {
     commit(s, 'join (conflict)', argv);
     console.log(`✗ ${t.key} conflicts with the main line on ${conflicted.length} file(s):`);
     for (const f of conflicted) console.log('    ' + f);
@@ -1397,14 +1836,24 @@ CMDS.join = (argv) => {
     console.log(`    node ${SELF()} sendback ${t.key} --why conflict`);
     process.exit(1);
   }
-  t.joinedAt = new Date().toISOString();
-  t.joinedSha = shq('git', ['rev-parse', '--short', 'HEAD']);
   commit(s, 'join', argv);
   ok(`${t.key} merged cleanly at ${t.joinedSha} (was ${before.slice(0, 7)})`);
   console.log('  A clean merge is not a working one. Run the suite on the joined tree now:');
   console.log(`    node ${SELF()} slot run ci -- <your test command>`);
   console.log(`  Green: land ${t.key} --sha ${t.joinedSha}`);
-  console.log(`  Red:   sendback ${t.key} --why "<what broke>"   (then git reset --hard ${before.slice(0, 7)})`);
+  console.log(`  Red:   sendback ${t.key} --why "<what broke>"`);
+  // The merge is on HEAD now, so anything that only needed this can be cut from
+  // it — that is the whole point of not waiting for the proof. Say it here,
+  // where the merge just happened, rather than leaving it for `land`.
+  if (OPEN_AT_JOIN) {
+    const freed = tasks(s).filter((x) => x.status === 'planned' &&
+      (x.needs || []).includes(t.key) && heldNeeds(s, x).length === 0);
+    if (freed.length) {
+      console.log(`\n  This merge is on HEAD, so ${freed.length} step(s) can open now without waiting`);
+      console.log(`  for the suite: ${freed.map((x) => x.key).join(' ')}`);
+      console.log('  Open them, then run the suite beside them. `check` names the full set.');
+    }
+  }
 };
 
 CMDS.sendback = (argv) => {
@@ -1438,33 +1887,52 @@ Then re-run your proof and commit.`;
   t.status = 'open';
   commit(s, 'sendback', argv);
   ok(`${t.key} sent back — the prompt is at ${path.relative(CWD, f)}`);
+  // A step whose merge is already on HEAD may have had other worktrees cut from
+  // it. Undoing it with a reset would strand those, so the fix has to go
+  // forward. This is the one place the open-at-join trade has to be paid, and
+  // it is paid by being told about it rather than by discovering it.
+  const stranded = cutFrom(s, t);
+  if (stranded.length) {
+    console.log(`\n  ⚠ ${stranded.length} step(s) were opened off this merge: ${stranded.map((x) => x.key).join(' ')}`);
+    console.log('    Their worktrees are cut from the HEAD that carries it, so do NOT');
+    console.log(`    \`git reset --hard\` past ${t.joinedSha || 'that merge'} — the fix has to land as a`);
+    console.log('    forward commit on this branch, and re-join.');
+  }
   console.log('\n  Resume the agent that wrote it, on its own chat:');
   console.log(`    agent -p --force --trust --resume ${t.chat} "$(cat ${path.relative(CWD, f)})"`);
   console.log('\n  It has the context for why it made those changes. A new agent reading logs');
   console.log('  would have to reconstruct that from outside.');
 };
 
-const HELP = `orchestrate — five stages, on Cursor or Claude Code
+const HELP = `orchestrate — six stages, on Cursor or Claude Code
 
   load <path>...            read the plan files, record them
-  assess [propose|set|check]  how hard each step is, and which model it gets
+  map                       which plans touch which files, and where the seams are
+  assess [propose|set|critical|check]  how hard each step is, and which model
   refine brief <plan>       the prompt for a refining agent
   refine done <plan>        read its report; records the steps it found
   step add < json           record steps by hand, in one batch or not at all
   step rm <key>…            cancel a step, and drop it from what needed it
-  step link                 turn each plan's requires: into needs between steps
+  step link [--only-shared] turn each plan's requires: into needs between steps
   step reset <plan>         cancel every live step of one plan
   check                     which steps can open together, and what blocks the rest
   run open <key>            worktree, chat, brief — everything a step needs to start
   run record <key> --log L  harvest a finished run into the record
   guard <key>               did it touch anything it does not own
   join <key>                merge it into the main line; says when it conflicts
+  join --batch <key>…       merge several, then one suite over the result
   sendback <key> --why W    resume the agent that wrote it, with what to fix
   land <key> [--sha S]      record the merge
+  land --batch <key>… --sha S   record what one suite proved
   board                     every step and its state
   doctor [--all]            everything the steps cite that can be checked without running
   slot run <n> -- <cmd>     one shared machine slot, so parallel heavy checks queue
   models [list|sync]        the ladder, and regenerating it from the CLI
+
+A dependency counts as met once it has JOINED, not once it has landed: the
+merge is on the main checkout's HEAD by then and a worktree cut from it holds
+the same code, so dependents no longer queue behind the suite. Set
+CURSOR_ORCH_OPEN_AT=land to wait for the proof instead.
 
 State lives in .claude/orch/. events.jsonl is the record; state.json is a
 projection of it.`;

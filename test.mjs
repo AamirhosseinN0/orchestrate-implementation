@@ -3058,7 +3058,7 @@ say('verify is green on a recorded run nobody made up');
   const check1 = run(['check']);
   ok('the two independent steps can open together', has(check1.out, 'together') && has(check1.out, '(2)'), check1.out);
   ok('and it says to open all of them', has(check1.out, 'Open all of them'), check1.out);
-  ok('the one with unmet needs is waiting', has(check1.out, 'Waiting on work to land: S-3'), check1.out);
+  ok('the one with unmet needs is waiting', has(check1.out, 'Waiting on work to reach the main line: S-3'), check1.out);
 
   // --- run open ---
   const open1 = run(['run', 'open', 'S-1']);
@@ -3169,7 +3169,7 @@ say('verify is green on a recorded run nobody made up');
   run(['land', 'S-2']);
   const after = run(['check']);
   ok('once both have landed the step that waited can open', has(after.out, 'S-3'), after.out);
-  ok('and it is no longer listed as waiting', !has(after.out, 'Waiting on work to land: S-3'), after.out);
+  ok('and it is no longer listed as waiting', !has(after.out, 'Waiting on work to reach the main line: S-3'), after.out);
   const board = run(['board']);
   ok('the board shows what landed', has(board.out, 'landed'), board.out);
 
@@ -3661,7 +3661,7 @@ say('verify is green on a recorded run nobody made up');
     ok('step link turns requires: into needs between real keys',
       linked.code === 0 && has(linked.out, 'S-013.1 needs S-011.1'), linked.out);
     const after = erun(['check']);
-    ok('and the integration step now waits', has(after.out, 'Waiting on work to land') && has(after.out, 'S-016.1'), after.out);
+    ok('and the integration step now waits', has(after.out, 'Waiting on work to reach the main line') && has(after.out, 'S-016.1'), after.out);
     ok('while what it comes after can open', has(after.out, 'S-011.1'), after.out);
     ok('running it again adds nothing', has(erun(['step', 'link']).out, 'nothing to add'), erun(['step', 'link']).out);
   }
@@ -3673,6 +3673,322 @@ say('verify is green on a recorded run nobody made up');
     !has(badModels.out, 'at Object.') && !has(badModels.out, 'genericNodeError'), badModels.out);
 }
 
+// ------------------------------------------ widening the round: the seven levers
+// Each case guards a place the orchestrator lost wall-clock for nothing. The
+// two that cost most were invisible from the outside: a dependent queueing
+// behind a suite it does not consume, and a plan-level requirement recorded as
+// a cross-product of step-level ones.
+{
+  say('widening the round');
+  const ROOT = path.dirname(fileURLToPath(import.meta.url));
+  const O = path.join(ROOT, 'claude-cursor', 'orchestrate.mjs');
+
+  // One sandbox, set up the way the five-stages group does it: a stub `agent`
+  // so `run open` can mint a chat, and a worktree root inside the sandbox so
+  // nothing lands beside the real project.
+  function box(name, plans, steps, tiers) {
+    const d = bare(name);
+    const stub = path.join(d, 'stub');
+    fs.mkdirSync(stub, { recursive: true });
+    fs.writeFileSync(path.join(stub, 'agent'),
+      '#!/usr/bin/env bash\necho "Created chat 11111111-2222-3333-4444-555555555555"\n', { mode: 0o755 });
+    const wts = path.join(d, 'wts');
+    fs.mkdirSync(wts, { recursive: true });
+    const env = { ...process.env, PATH: stub + path.delimiter + process.env.PATH, CURSOR_ORCH_WT: wts };
+    const run = (args, input) => {
+      try { return { code: 0, out: execFileSync('node', [O, ...args], { cwd: d, encoding: 'utf8', input, env, stdio: ['pipe', 'pipe', 'pipe'] }) }; }
+      catch (e) { return { code: e.status ?? -1, out: String(e.stdout || '') + String(e.stderr || '') }; }
+    };
+    const git = (args, cwd = d) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] });
+    git(['init', '-q', '-b', 'main']);
+    git(['config', 'user.email', 'ci@example.invalid']);
+    git(['config', 'user.name', 'ci']);
+    fs.mkdirSync(path.join(d, 'docs'), { recursive: true });
+    fs.mkdirSync(path.join(d, 'src'), { recursive: true });
+    for (const [name, body] of Object.entries(plans)) fs.writeFileSync(path.join(d, 'docs', name), body);
+    for (const f of ['a', 'b', 'c', 'shared']) fs.writeFileSync(path.join(d, 'src', f + '.ts'), 'orig\n');
+    git(['add', '-A']); git(['commit', '-qm', 'init']);
+    run(['load', 'docs']);
+    if (steps) run(['step', 'add'], JSON.stringify(steps));
+    if (tiers) run(['assess', 'propose'], JSON.stringify(tiers));
+    return { d, run, git, wts };
+  }
+  const tier = (keys, t = 'high') => keys.map((k) => ({ key: k, tier: t, why: 'test' }));
+  // The agent's side of a run: commit something on its own branch.
+  const work = (b, wts, d, key, file, body) => {
+    const wt = path.join(wts, path.basename(d) + '-wt-' + key);
+    fs.writeFileSync(path.join(wt, file), body);
+    b.git(['add', '-A'], wt); b.git(['commit', '-qm', 'work ' + key], wt);
+  };
+  const PASSED = JSON.stringify({ outcome: 'passed', seconds: 60, files: [], commands: [], answer: 'done' });
+
+  // --- lever 1: a dependency is met at join, not at land ------------------
+  // Before: heldNeeds required status === 'landed'. `join` leaves the merge on
+  // the main checkout's HEAD and `run open` cuts a worktree from that HEAD, so
+  // the dependent already had the code — and sat behind the joined-tree suite
+  // anyway. Through the slot, one suite at a time, that queue was most of the
+  // wall-clock on a deep chain.
+  {
+    const b = box('widen-join', { '1-a.md': '# A\n' },
+      [{ key: 'S-1', title: 'one', plan: 'docs/1-a.md', owns: ['src/a.ts'], verify: ['true'] },
+       { key: 'S-3', title: 'three', plan: 'docs/1-a.md', owns: ['src/c.ts'], needs: ['S-1'], verify: ['true'] }],
+      tier(['S-1', 'S-3']));
+    ok('a step whose dependency has not moved is waiting',
+      has(b.run(['check']).out, 'Waiting on work to reach the main line: S-3'), b.run(['check']).out);
+    b.run(['run', 'open', 'S-1']);
+    work(b, b.wts, b.d, 'S-1', 'src/a.ts', 'S-1-WAS-HERE\n');
+    b.run(['run', 'record', 'S-1', '--json', '/dev/stdin'], PASSED);
+    const joined = b.run(['join', 'S-1']);
+    ok('joining says what it frees, rather than leaving it for land',
+      has(joined.out, 'can open now without waiting') && has(joined.out, 'S-3'), joined.out);
+    const after = b.run(['check']);
+    ok('the dependent can open on a merge alone, before any suite has run',
+      has(after.out, 'Can open together') && has(after.out, 'S-3'), after.out);
+    ok('and is no longer listed as waiting',
+      !has(after.out, 'Waiting on work to reach the main line'), after.out);
+    const opened = b.run(['run', 'open', 'S-3']);
+    ok('opening it works', opened.code === 0, opened.out);
+    ok('and it says the merge under it is not yet proven',
+      has(opened.out, 'merged, not yet proven'), opened.out);
+    ok('and that the fix would have to go forward rather than reset',
+      has(opened.out, 'forward commit'), opened.out);
+    // The claim the whole change rests on: the code is really there.
+    const wt = path.join(b.wts, path.basename(b.d) + '-wt-S-3');
+    ok('the dependent worktree holds the dependency\'s work already',
+      readIf(path.join(wt, 'src/a.ts')).trim() === 'S-1-WAS-HERE', readIf(path.join(wt, 'src/a.ts')));
+    // Landing stays strict, because landing is the record of proof.
+    const early = b.run(['land', 'S-3']);
+    ok('but landing is refused while what it was built on is only merged',
+      early.code === 2 && has(early.out, 'cannot land before S-1'), early.out);
+    // And the cost is stated where it is paid.
+    const sb = b.run(['sendback', 'S-1', '--why', 'joined tree red']);
+    ok('sending back a merge names the worktrees cut from it',
+      has(sb.out, 'opened off this merge') && has(sb.out, 'S-3'), sb.out);
+    ok('and says not to reset past it', has(sb.out, 'reset --hard'), sb.out);
+  }
+
+  // --- the opt-out, for anyone who wants the proof before the next hop -----
+  {
+    const b = box('widen-strict', { '1-a.md': '# A\n' },
+      [{ key: 'S-1', title: 'one', plan: 'docs/1-a.md', owns: ['src/a.ts'], verify: ['true'] },
+       { key: 'S-3', title: 'three', plan: 'docs/1-a.md', owns: ['src/c.ts'], needs: ['S-1'], verify: ['true'] }],
+      tier(['S-1', 'S-3']));
+    b.run(['run', 'open', 'S-1']);
+    work(b, b.wts, b.d, 'S-1', 'src/a.ts', 'one\n');
+    b.run(['run', 'record', 'S-1', '--json', '/dev/stdin'], PASSED);
+    b.run(['join', 'S-1']);
+    const strict = execFileSync('node', [O, 'check'],
+      { cwd: b.d, encoding: 'utf8', env: { ...process.env, CURSOR_ORCH_OPEN_AT: 'land' } });
+    ok('CURSOR_ORCH_OPEN_AT=land waits for the proof again',
+      has(strict, 'Waiting on work to reach the main line: S-3'), strict);
+  }
+
+  // --- lever 4: one suite over a batch, instead of one per landing --------
+  // Before: twelve branches finishing together meant twelve full suite runs in
+  // series through the slot, and the graph advanced at the rate of one of them.
+  {
+    const b = box('widen-batch', { '1-a.md': '# A\n' },
+      [{ key: 'S-1', title: 'one', plan: 'docs/1-a.md', owns: ['src/a.ts', 'src/shared.ts'], verify: ['true'] },
+       { key: 'S-2', title: 'two', plan: 'docs/1-a.md', owns: ['src/b.ts'], verify: ['true'] },
+       { key: 'S-3', title: 'three', plan: 'docs/1-a.md', owns: ['src/c.ts', 'src/shared.ts'], verify: ['true'] },
+       { key: 'S-4', title: 'four', plan: 'docs/1-a.md', owns: ['src/d.ts'], needs: ['S-1', 'S-2'], verify: ['true'] }],
+      tier(['S-1', 'S-2', 'S-3', 'S-4']));
+    for (const k of ['S-1', 'S-2', 'S-3']) b.run(['run', 'open', k]);
+    work(b, b.wts, b.d, 'S-1', 'src/shared.ts', 'FROM-S1\n');
+    work(b, b.wts, b.d, 'S-2', 'src/b.ts', 'two\n');
+    work(b, b.wts, b.d, 'S-3', 'src/shared.ts', 'FROM-S3\n');
+    ok('a batch of one is refused — that is just join',
+      b.run(['join', '--batch', 'S-1']).code === 2, b.run(['join', '--batch', 'S-1']).out);
+    const batch = b.run(['join', '--batch', 'S-1', 'S-2', 'S-3']);
+    ok('two of the three merge', has(batch.out, '2 of 3 merged cleanly'), batch.out);
+    ok('and the conflicting one is named', has(batch.out, 'S-3 conflicts'), batch.out);
+    ok('with the rest of the batch left standing',
+      has(batch.out, 'the rest of the batch stands'), batch.out);
+    ok('it offers one suite over the whole batch',
+      has(batch.out, 'One suite over the whole batch'), batch.out);
+    ok('and records the order, because a red batch has to be bisected',
+      has(batch.out, 'S-1 → S-2'), batch.out);
+    ok('a batch with a conflict in it exits non-zero', batch.code === 1, String(batch.code));
+    // The main line really is the merge of the two that worked.
+    ok('the main line took the two that merged',
+      readIf(path.join(b.d, 'src/b.ts')).trim() === 'two' &&
+      readIf(path.join(b.d, 'src/shared.ts')).trim() === 'FROM-S1', readIf(path.join(b.d, 'src/shared.ts')));
+    ok('and not the one that did not',
+      readIf(path.join(b.d, 'src/c.ts')).trim() === 'orig', readIf(path.join(b.d, 'src/c.ts')));
+    const landed = b.run(['land', '--batch', 'S-1', 'S-2', '--sha', 'deadbee']);
+    ok('one command records what one suite proved',
+      has(landed.out, '2 step(s) landed'), landed.out);
+    ok('and it frees what was waiting on both', has(landed.out, 'frees: S-4'), landed.out);
+    // The flag is what makes it a batch. Two keys without it is a typo.
+    ok('two keys without --batch is refused',
+      b.run(['land', 'S-1', 'S-2']).code === 2, b.run(['land', 'S-1', 'S-2']).out);
+  }
+
+  // --- lever 5: step link --only-shared -----------------------------------
+  // Before: plan B comes after plan A, so every step of B was given a need on
+  // every step of A. With two steps each that is four edges where one is real,
+  // and the three spurious ones hold work that never conflicted.
+  {
+    const plans = { '1-a.md': '# A\n', '2-b.md': '---\nrequires: [1]\n---\n# B\n' };
+    const steps = [
+      { key: 'S-1.1', title: 'contracts', plan: 'docs/1-a.md', owns: ['src/shared.ts'], verify: ['true'] },
+      { key: 'S-2.1', title: 'reads it', plan: 'docs/2-b.md', owns: ['src/a.ts', 'src/shared.ts'], verify: ['true'] },
+      { key: 'S-2.2', title: 'unrelated', plan: 'docs/2-b.md', owns: ['src/b.ts'], verify: ['true'] }];
+    const b = box('widen-link', plans, steps, tier(['S-1.1', 'S-2.1', 'S-2.2']));
+    const wide = b.run(['step', 'link', '--dry-run']);
+    ok('the cross-product is still the default, and links both steps',
+      has(wide.out, 'S-2.1 needs S-1.1') && has(wide.out, 'S-2.2 needs S-1.1'), wide.out);
+    const narrow = b.run(['step', 'link', '--only-shared', '--dry-run']);
+    ok('--only-shared keeps the edge where they actually meet',
+      has(narrow.out, 'S-2.1 needs S-1.1'), narrow.out);
+    ok('and says which file made it real', has(narrow.out, 'src/shared.ts'), narrow.out);
+    ok('and drops the one that shares nothing',
+      !has(narrow.out, 'S-2.2 needs S-1.1') && has(narrow.out, 'S-2.2 ↮ S-1.1'), narrow.out);
+  }
+
+  // A requirement that comes out with no edges at all is the one thing
+  // --only-shared must not do quietly: the ordering the plan asked for would be
+  // recorded nowhere, and nothing downstream would ever say so.
+  {
+    const plans = { '1-a.md': '# A\n', '2-b.md': '---\nrequires: [1]\n---\n# B\n' };
+    const steps = [
+      { key: 'S-1.1', title: 'a', plan: 'docs/1-a.md', owns: ['src/a.ts'], verify: ['true'] },
+      { key: 'S-2.1', title: 'b', plan: 'docs/2-b.md', owns: ['src/b.ts'], verify: ['true'] }];
+    const b = box('widen-vanish', plans, steps, tier(['S-1.1', 'S-2.1']));
+    const gone = b.run(['step', 'link', '--only-shared']);
+    ok('a requirement that would be recorded nowhere fails the command', gone.code === 1, gone.out);
+    ok('and says which requirement it was', has(gone.out, 'recorded nowhere'), gone.out);
+    ok('and writes nothing at all', has(gone.out, 'Nothing was written'), gone.out);
+    const state = JSON.parse(readIf(path.join(b.d, '.claude/orch/state.json')) || '{}');
+    ok('so no half-graph is left behind',
+      (state.tasks || []).every((t) => !(t.needs || []).length), JSON.stringify(state.tasks));
+  }
+
+  // --- lever 6: a serialisation point may name its instance ---------------
+  // Before: two steps that both said "migration head" were held apart even
+  // when they moved separate heads in separate packages, and the doctor's
+  // near-name note fired on every deliberately scoped pair.
+  {
+    const b = box('widen-points', { '1-a.md': '# A\n' },
+      [{ key: 'S-1', title: 'orders', plan: 'docs/1-a.md', owns: ['src/a.ts'], serialises: ['migration head: orders'], verify: ['true'] },
+       { key: 'S-2', title: 'users', plan: 'docs/1-a.md', owns: ['src/b.ts'], serialises: ['migration head: users'], verify: ['true'] }],
+      tier(['S-1', 'S-2']));
+    const c = b.run(['check']);
+    ok('two scoped instances of one class can open together',
+      has(c.out, 'Can open together') && has(c.out, '(2)'), c.out);
+    ok('and are not held apart as one shared point',
+      !has(c.out, 'Held back'), c.out);
+    const doc = b.run(['doctor']);
+    ok('the doctor does not call them a spelling drift',
+      !has(doc.out, 'spelled two ways') && !has(doc.out, 'differ by one word'), doc.out);
+    // A scoped name against a bare one is still one thing, and still caught:
+    // a step that says plain "migration head" may mean all of them.
+    b.run(['step', 'add'], JSON.stringify([{ key: 'S-9', title: 'bare', plan: 'docs/1-a.md',
+      owns: ['src/c.ts'], serialises: ['migration head'], verify: ['true'] }]));
+    b.run(['assess', 'propose'], JSON.stringify(tier(['S-9'])));
+    const doc2 = b.run(['doctor']);
+    ok('but a scoped name beside a bare one is still a fault',
+      doc2.code === 1 && has(doc2.out, 'spelled two ways'), doc2.out);
+    ok('and names both spellings',
+      has(doc2.out, 'migration head: orders') && has(doc2.out, '"migration head"'), doc2.out);
+  }
+
+  // --- lever 7: the tier a step's position argues for ---------------------
+  // Before: assess weighed how hard a step is and ignored where it sits, so a
+  // step gating six others got the same model as a leaf. A wrong answer on the
+  // first costs a re-run of everything behind it.
+  {
+    const b = box('widen-critical', { '1-a.md': '# A\n' },
+      [{ key: 'S-1', title: 'head', plan: 'docs/1-a.md', owns: ['src/a.ts'], verify: ['true'] },
+       { key: 'S-2', title: 'mid', plan: 'docs/1-a.md', owns: ['src/b.ts'], needs: ['S-1'], verify: ['true'] },
+       { key: 'S-3', title: 'mid2', plan: 'docs/1-a.md', owns: ['src/c.ts'], needs: ['S-2'], verify: ['true'] },
+       { key: 'S-4', title: 'leaf', plan: 'docs/1-a.md', owns: ['src/shared.ts'], needs: ['S-3'], verify: ['true'] }],
+      tier(['S-1', 'S-2', 'S-3', 'S-4'], 'medium'));
+    const crit = b.run(['assess', 'critical']);
+    ok('it counts the whole chain behind a step, not just its direct dependents',
+      has(crit.out, 'S-1') && has(crit.out, '3 steps behind it'), crit.out);
+    ok('and argues the head of a chain up a tier', has(crit.out, 'high'), crit.out);
+    ok('while a leaf goes down one', has(crit.out, 'a leaf — nothing waits on it'), crit.out);
+    ok('nothing is written without --apply',
+      has(crit.out, 'Nothing written'), crit.out);
+    // Read the record, not the table: the table's footer lists every tier on
+    // the ladder, so "high" appears in it whatever any row says.
+    const tierOfKey = (k) => ((JSON.parse(readIf(path.join(b.d, '.claude/orch/state.json')) || '{}').tasks || [])
+      .find((t) => t.key === k) || {}).tier;
+    ok('and the record is unchanged until then',
+      tierOfKey('S-1') === 'medium' && tierOfKey('S-4') === 'medium',
+      tierOfKey('S-1') + '/' + tierOfKey('S-4'));
+    const applied = b.run(['assess', 'critical', '--apply']);
+    ok('--apply takes the moves', has(applied.out, 'moved on position'), applied.out);
+    ok('the head of the chain went up a tier', tierOfKey('S-1') === 'high', tierOfKey('S-1'));
+    ok('and the leaf went down one', tierOfKey('S-4') === 'low', tierOfKey('S-4'));
+    // A row the user chose is never moved by this, the same as `propose`.
+    b.run(['assess', 'set', 'S-1=composer']);
+    const again = b.run(['assess', 'critical']);
+    ok('a row the user set is left alone',
+      has(again.out, 'left alone because you set them') && has(again.out, 'S-1'), again.out);
+  }
+
+  // --- levers 2 and 3: the map, read before the plans are refined ---------
+  // The width of a round is decided before any agent runs, and nothing used to
+  // say what shape the plans were in while they could still be rearranged.
+  {
+    const plans = {
+      '2.1a-contracts.md': '# Contracts\nDefines src/shared.ts for everyone.\n',
+      '2.1b-read.md': '---\nrequires: [2.1a]\n---\n# Read\nTouches src/a.ts and reads src/shared.ts.\n',
+      '2.1c-write.md': '---\nrequires: [2.1a]\n---\n# Write\nTouches src/b.ts, reads src/shared.ts.\nMoves the migration head.\n',
+      '2.2-billing.md': '# Billing\nTouches src/c.ts. Moves the migration head.\n',
+    };
+    const b = box('widen-map', plans, null, null);
+    const m = b.run(['map']);
+    ok('the map runs off the plans alone', m.code === 0, m.out);
+    ok('it finds the file three plans reach for',
+      has(m.out, 'Seams') && has(m.out, 'src/shared.ts'), m.out);
+    ok('and says to lift it into a plan that lands first',
+      has(m.out, 'lands first'), m.out);
+    ok('it names the plan whose files touch nothing else',
+      has(m.out, 'touch nothing else') && has(m.out, '2.2'), m.out);
+    ok('it reads the ordering already written down',
+      has(m.out, '2.1b comes after 2.1a'), m.out);
+    ok('and says which plans declare none', has(m.out, 'declare no ordering'), m.out);
+    ok('it names the shared ground two plans both move',
+      has(m.out, 'migration head') && has(m.out, 'go one at a time'), m.out);
+    ok('and offers the scoped spelling for it', has(m.out, 'migration head: orders'), m.out);
+    ok('it says it is a reading of the prose, not a gate',
+      has(m.out, 'not a gate'), m.out);
+    ok('and that now is the moment to rearrange',
+      has(m.out, 'moment to rearrange the plans'), m.out);
+    // Prose is a guess; `owns` is the answer. Once steps exist it measures.
+    b.run(['step', 'add'], JSON.stringify([
+      { key: 'S-2.1a.1', title: 'a', plan: 'docs/2.1a-contracts.md', owns: ['src/shared.ts'], verify: ['true'] },
+      { key: 'S-2.1b.1', title: 'b', plan: 'docs/2.1b-read.md', owns: ['src/shared.ts', 'src/a.ts'], verify: ['true'] },
+      { key: 'S-2.1c.1', title: 'c', plan: 'docs/2.1c-write.md', owns: ['src/shared.ts', 'src/b.ts'], verify: ['true'] }]));
+    const m2 = b.run(['map']);
+    ok('with steps recorded it measures the seam instead of guessing',
+      has(m2.out, 'owned by three or more steps'), m2.out);
+    ok('and no longer says to rearrange',
+      !has(m2.out, 'moment to rearrange the plans'), m2.out);
+    // And the doctor says the same thing where it can act on it.
+    b.run(['assess', 'propose'], JSON.stringify(tier(['S-2.1a.1', 'S-2.1b.1', 'S-2.1c.1'])));
+    const doc = b.run(['doctor']);
+    ok('the doctor calls a path three steps own a seam',
+      has(doc.out, 'each is a seam'), doc.out);
+    ok('and says a step that owns it alone removes the fan-in',
+      has(doc.out, 'removes the whole fan-in'), doc.out);
+  }
+
+  // A path is read out of prose narrowly on purpose: "and/or" is not a file,
+  // and a map that cries wolf is a map nobody reads.
+  {
+    const b = box('widen-paths', { '1-a.md': '# A\nEither and/or or A/B, at 1.2/3.4, see https://x.dev/y/z.\nBut src/a.ts is real.\n' }, null, null);
+    const m = b.run(['map']);
+    ok('prose that merely contains a slash is not read as a path',
+      !has(m.out, 'and/or') && !has(m.out, 'A/B'), m.out);
+    ok('nor is a url', !has(m.out, 'x.dev'), m.out);
+    ok('while a real path is found', has(m.out, '1 plan(s)'), m.out);
+  }
+}
+
 // ---------------------------------------------------------------------- report
 if (!KEEP) for (const d of boxes) { try { fs.rmSync(d, { recursive: true, force: true }); } catch { /* gone */ } }
 else console.log('\nsandboxes kept: ' + boxes.join('\n                '));
@@ -3681,7 +3997,7 @@ else console.log('\nsandboxes kept: ' + boxes.join('\n                '));
 // an exception thrown before its first `ok`, a case quietly commented out — and
 // the suite still ends on "all green", because green is only ever measured
 // against however many checks happened to run.
-const EXPECTED = 717;   // every check above counts; raise it deliberately when you add one
+const EXPECTED = 780;   // every check above counts; raise it deliberately when you add one
 
 console.log('\n' + '-'.repeat(60));
 if (pass + failures.length !== EXPECTED)

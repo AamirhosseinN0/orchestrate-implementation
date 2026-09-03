@@ -410,6 +410,8 @@ CMDS.board = () => {
 };
 
 // ------------------------------------------------------------------- refining
+// A plan may become at most this many steps. See `refine done`.
+const MAX_STEPS_PER_PLAN = 2;
 const planSlug = (p) => String(p).replace(/[^A-Za-z0-9]+/g, '-').replace(/^-|-$/g, '');
 const refineReport = (p) => sub('refine', planSlug(p) + '.json');
 
@@ -452,10 +454,11 @@ Do two things:
      }]
    }
 
-   One plan is one step unless it genuinely has to be more than one. Split it
-   only when a part must land before another can start, or when two parts write
-   disjoint files and are worth running at the same time. A plan this size is
-   usually a single step - do not carve it up to look thorough.
+   One plan is one step unless it genuinely has to be more than one, and never
+   more than ${MAX_STEPS_PER_PLAN}. Split it only when a part must land before another can
+   start, or when two parts write disjoint files and are worth running at the
+   same time. A plan this size is usually a single step - do not carve it up to
+   look thorough; a report with more steps than that is refused.
 
    \`owns\` is the important one. Two steps that own the same file cannot run at
    the same time, so a list that is too narrow causes a collision nobody sees
@@ -473,6 +476,10 @@ Report the file written, not a summary in your reply.`);
     let rep; try { rep = JSON.parse(fs.readFileSync(f, 'utf8')); } catch (e) { die(`the report at ${f} is not valid JSON: ${e.message}`); }
     const steps = rep.steps || [];
     if (!steps.length) die('the report names no steps');
+    // A plan is one step, or two when a part must land before the rest. More
+    // than that is an agent carving up work that was already small enough.
+    if (steps.length > MAX_STEPS_PER_PLAN) die(`the report splits ${rec.path} into ${steps.length} steps; ${MAX_STEPS_PER_PLAN} is the most a plan may become.
+  Have the agent merge them and rewrite ${path.relative(CWD, f)}.`);
     // Every step goes through the same gate as a hand-written one. The old
     // driver merged refined steps in raw, which put a hole in the one invariant
     // that matters on the path that creates almost every step.

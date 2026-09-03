@@ -33,6 +33,9 @@ const FULL = args.includes('--full');
 const EXIT_ON_RESULT = args.includes('--exit-on-result');
 const FOLLOW = opt('--follow');
 const FROM_END = args.includes('--from-end');
+// Which log format is arriving. The two share an envelope and nothing else, so
+// guessing per event would mean reading a Cursor 'result' as an opencode one.
+const RUNNER = opt('--runner', 'cursor');
 
 const TTY = process.stdout.isTTY;
 const c = (code, s) => (TTY ? `\x1b[${code}m${s}\x1b[0m` : s);
@@ -47,9 +50,13 @@ const mag = (s) => c('35', s);
 // missing stamp gets.
 let t0 = null, lastTs = null;
 const wall0 = Date.now();
-const clock = (ev) => { const t = ev && ev.timestamp_ms; if (t) { if (t0 === null) t0 = t; lastTs = t; } };
+// opencode stamps its events `timestamp`, Cursor `timestamp_ms`. Reading only
+// the second made every opencode line 00:00, which is the whole of what the
+// elapsed column is for.
+const tsOf = (ev) => (ev && (ev.timestamp_ms || ev.timestamp)) || null;
+const clock = (ev) => { const t = tsOf(ev); if (t) { if (t0 === null) t0 = t; lastTs = t; } };
 const stamp = (ev) => {
-  const now = (ev && ev.timestamp_ms) || null;
+  const now = tsOf(ev);
   if (now) clock(ev);
   // A line with no clock of its own — a bare error tail — is stamped with the
   // last one seen. It is the moment the run stopped, and printing 00:00 there
@@ -92,7 +99,51 @@ const describe = (kind, call) => {
 let think = '';
 let ended = false;
 
+// opencode's events are a different vocabulary in the same envelope. Rather
+// than fold them into the cases below — where `type: 'text'` and `type: 'error'`
+// would collide with nothing and be dropped in silence — they are formatted
+// here and the Cursor switch is left exactly as it was.
+//
+// Backgrounded, this is what shows in the task pane, so a round on opencode is
+// visible instead of silent for minutes.
+function handleOpencode(ev) {
+  const part = ev.part || {};
+  switch (ev.type) {
+    case 'step_start':
+      say(ev, cyan('●') + ' ' + bold('DeepSeek') + dim('  session ' + String(ev.sessionID || '').slice(0, 12)));
+      break;
+    case 'text':
+      if (part.text) say(ev, part.text.split('\n').map((l) => '  ' + l).join('\n'));
+      break;
+    case 'tool_use': {
+      const st = part.state || {}, input = st.input || {}, meta = st.metadata || {};
+      const what = part.tool === 'bash' ? clip(input.command, FULL ? 4000 : 160)
+        : (meta.filepath || input.filePath || input.path || input.pattern || '');
+      const failed = part.tool === 'bash' && typeof meta.exit === 'number' && meta.exit !== 0;
+      say(ev, (failed ? c('31', '✗') : green('✓')) + ' ' + bold(part.tool || 'tool') + '  ' + dim(clip(what, FULL ? 4000 : 160)));
+      if (failed) say(ev, dim('    exit ' + meta.exit + '  ' + clip(meta.output ?? st.output, FULL ? 4000 : 300)));
+      break;
+    }
+    case 'step_finish': {
+      const t = part.tokens || {};
+      if (part.reason === 'stop') {
+        say(ev, dim(`— ${(t.total || 0).toLocaleString()} tokens, $${(part.cost || 0).toFixed(4)}`));
+        ended = true;
+      }
+      break;
+    }
+    case 'error': {
+      const e = ev.error || {};
+      say(ev, c('31', '✗ ') + ((e.name || 'error') + ': ' + ((e.data && e.data.message) || '')));
+      ended = true;
+      break;
+    }
+    default: break;
+  }
+}
+
 function handle(ev) {
+  if (RUNNER === 'opencode') return handleOpencode(ev);
   switch (ev.type) {
     case 'system':
       if (ev.subtype === 'init') say(ev, cyan('●') + ' ' + bold(ev.model || 'unknown model') +

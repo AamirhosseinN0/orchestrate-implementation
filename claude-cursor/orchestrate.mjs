@@ -346,6 +346,39 @@ function tierOf(name) {
   return row;
 }
 
+// ------------------------------------------------------------------ runners
+// Which CLI executes the steps. Chosen once, before `load`, and the round is
+// automated from there — so this is a property of the round, not of a step.
+//
+// Cursor runs a ladder of five models. opencode runs one model, DeepSeek V4
+// Flash, and the tier chooses how hard it thinks instead of which model
+// answers. The two are never compared: they share a tier vocabulary and
+// nothing else.
+const RUNNERS = ['cursor', 'opencode'];
+const runnerOf = (s) => s.runner || 'cursor';
+const runnerRow = (name) => (ladder().runners || {})[name] || null;
+// What a step will actually run on, as one line, for a table or a brief.
+function runnerModel(s, tier) {
+  const name = runnerOf(s);
+  if (name === 'cursor') { const row = tierOf(tier); return { name, model: modelName(row), detail: modelName(row), verifiable: true }; }
+  const r = runnerRow(name);
+  if (!r) return { name, model: '(unknown runner)', detail: '(unknown runner)', verifiable: false };
+  const effort = (r.efforts || {})[(ladder().roles[tier] || tier)];
+  return { name, model: r.model, effort,
+    detail: `${r.shown || r.model} · ${effort || '?'}`, verifiable: !!r.verifiable };
+}
+// The launcher's own answer to "where is the binary". Asked here so a round
+// fails before it opens rather than once per step inside a backgrounded run.
+function runnerBin(name) {
+  if (name === 'cursor') return { ok: true, path: 'agent' };
+  try {
+    const p = execFileSync('node', [path.join(HERE, 'scripts', 'models.mjs'), 'which', '--runner', name],
+      { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }).trim();
+    return { ok: true, path: p };
+  } catch (e) { return { ok: false, why: String(e.stderr || e.message).trim() }; }
+}
+
+
 // The mechanical signals available about a step. They are thin on purpose:
 // nothing here knows how hard code is. They exist so a proposal can be sanity
 // checked against something, not so a model can be picked by formula.
@@ -416,6 +449,50 @@ function vocabulary() {
 }
 
 const CMDS = {};
+
+CMDS.runner = (argv) => {
+  const s = readState();
+  if (!argv.length || argv[0] === 'show') {
+    const name = runnerOf(s);
+    const m = runnerRow(name);
+    console.log(`This round runs on: ${name}${s.runner ? '' : '  (the default — nothing has chosen yet)'}`);
+    if (name === 'cursor') {
+      console.log('  Five models, weakest to strongest. The model that answered is read out of');
+      console.log('  the run\'s own opening event and checked against what was asked for.');
+    } else if (m) {
+      console.log(`  One model: ${m.shown || m.model}  (${m.model})`);
+      console.log('  A tier chooses the effort, not the model:');
+      for (const [t, e] of Object.entries(m.efforts || {})) console.log(`    ${t.padEnd(10)} ${e}`);
+      console.log('  Nothing in the log names the model that answered, so a run records what was');
+      console.log('  asked for and is marked unverified. The effort is checked before the run.');
+    }
+    const bin = runnerBin(name);
+    console.log(bin.ok ? `  binary: ${bin.path}` : `  ✗ ${bin.why}`);
+    if (tasks(s).some((t) => (t.runs || []).length))
+      console.log('\n  Runs already recorded on this round were made on the runner it had then.');
+    return;
+  }
+  if (argv[0] !== 'use') die('runner [show] | runner use <' + RUNNERS.join('|') + '>');
+  const want = argv[1];
+  if (!RUNNERS.includes(want)) die(`unknown runner "${want}". Known: ${RUNNERS.join(', ')}`);
+  // Changing it mid-round is allowed and said out loud, because the records
+  // already filed were made somewhere else and comparing them is on whoever
+  // reads them.
+  const out = tasks(s).filter((t) => OPEN_STATUSES.includes(t.status));
+  if (out.length) console.log(`⚠ ${out.length} step(s) are already out on ${runnerOf(s)}: ${out.map((t) => t.key).join(' ')}`);
+  const bin = runnerBin(want);
+  if (!bin.ok) die(`${want} cannot be used here.\n  ${bin.why}`);
+  s.runner = want;
+  commit(s, 'runner use', argv);
+  ok(`this round runs on ${want}`);
+  const m = runnerRow(want);
+  if (m && !m.verifiable) {
+    console.log('  Nothing in its log names the model that answered, so runs are recorded as');
+    console.log('  what was asked for and marked unverified. With one model there is nothing');
+    console.log('  to confuse it with; a silent downgrade would still not be caught.');
+  }
+  console.log(`  binary: ${bin.path}`);
+};
 
 CMDS.load = (argv) => {
   if (!argv.length) die('load needs at least one plan file or directory');
@@ -849,6 +926,21 @@ CMDS.assess = (argv) => {
   }
   console.log('\n* you set it. Change any row with:  assess set <key>=<tier>');
   console.log('Tiers, weakest first: ' + tiers.join(' → '));
+  // On a one-model runner a tier is an effort, and two tiers can be the same
+  // effort. That collapse decides what these rows actually buy, so it is shown
+  // here rather than left to be discovered in a launcher.
+  const rn = runnerOf(s);
+  if (rn !== 'cursor') {
+    const r = runnerRow(rn);
+    console.log(`\nRunning on ${rn}: ${r ? (r.shown || r.model) : rn}, one model, so a tier is an effort.`);
+    if (r) {
+      const byEffort = {};
+      for (const [t, e] of Object.entries(r.efforts || {})) (byEffort[e] ||= []).push(t);
+      console.log('  ' + Object.entries(byEffort).map(([e, ts]) => `${ts.join('/')} → ${e}`).join('   '));
+      const shared = Object.entries(byEffort).filter(([, ts]) => ts.length > 1);
+      for (const [e, ts] of shared) console.log(`  ${ts.join(' and ')} are the same effort (${e}), so moving between them changes nothing.`);
+    }
+  }
 };
 
 CMDS.check = () => {
@@ -1106,7 +1198,12 @@ CMDS.run = (argv) => {
       const known = (() => { try { return shq('git', ['worktree', 'list']).includes(t.worktree); } catch { return false; } })();
       if (!known) die(`${t.worktree} already exists and is not a worktree of this repo.\n  Move it, or pass a different one.`);
     }
-    if (!t.chat) t.chat = sh('bash', [path.join(HERE, 'scripts', 'cursor-chat.sh')]);
+    // Cursor needs an address before it has a conversation, so one is minted
+    // here. opencode puts `sessionID` on every event, so the address does not
+    // exist until the run does and is read out of the log afterwards — minting
+    // one would be inventing an id nothing will answer to.
+    t.runner = runnerOf(s);
+    if (t.runner === 'cursor' && !t.chat) t.chat = sh('bash', [path.join(HERE, 'scripts', 'cursor-chat.sh')]);
     const brief = sub('briefs', key + '.md');
     fs.writeFileSync(brief, briefText(s, t, row));
     t.briefFile = path.relative(CWD, brief);
@@ -1115,7 +1212,12 @@ CMDS.run = (argv) => {
     t.briefSha = sha(JSON.stringify([t.owns, t.serialises, t.verify, t.needs, t.title, t.plan]));
     t.status = 'open'; t.openedAt = new Date().toISOString();
     commit(s, 'run open', argv);
-    ok(`${key} is open on ${modelName(row)}`);
+    const rm = runnerModel(s, t.tier);
+    ok(`${key} is open on ${rm.detail}`);
+    if (!rm.verifiable) {
+      console.log('  Its log will not name the model that answered, so the record says what was');
+      console.log('  asked for and is marked unverified.');
+    }
     if (unproven.length) {
       console.log(`  built on ${unproven.join(', ')} — merged, not yet proven. Its worktree is`);
       console.log(`  cut from that merge, so if the suite goes red there the fix lands as a`);
@@ -1125,9 +1227,13 @@ CMDS.run = (argv) => {
       console.log(`  shares files with open work — whichever lands second reconciles:`);
       for (const { o, m } of willReconcile) console.log(`    ↔ ${o.key}: ${m.files.join('; ')}`);
     }
-    console.log(`  worktree  ${t.worktree}\n  branch    ${t.branch}\n  chat      ${t.chat}\n  brief     ${t.briefFile}`);
-    const runner = shortest(path.join(HERE, 'scripts', 'run.sh'));
-    console.log(`\nLaunch it in the background:\n  bash ${runner} \\\n    --role chip --tier ${t.tier} --key ${key} --workspace ${t.worktree} \\\n    --chat ${t.chat} --prompt-file ${t.briefFile}`);
+    console.log(`  worktree  ${t.worktree}\n  branch    ${t.branch}` +
+      (t.chat ? `\n  chat      ${t.chat}` : `\n  session   (opencode mints one; it is read back out of the log)`) +
+      `\n  brief     ${t.briefFile}`);
+    const launcher = shortest(path.join(HERE, 'scripts', 'run.sh'));
+    console.log(`\nLaunch it in the background:\n  bash ${launcher} \\\n` +
+      `    --runner ${t.runner} --role chip --tier ${t.tier} --key ${key} --workspace ${t.worktree} \\\n` +
+      (t.chat ? `    --chat ${t.chat} ` : '    ') + `--prompt-file ${t.briefFile}`);
     // Opening one at a time is the slowest thing this can do, and it is easy to
     // do by accident — one `run open` reads like progress. So the ones still
     // waiting are counted here rather than left for somebody to run `check`.
@@ -1150,9 +1256,25 @@ CMDS.run = (argv) => {
     else {
       // Harvest rather than ask: what the run did is in the log, and asking the
       // agent to summarise it is how 36 MB became five lines of prose.
-      try { rec = JSON.parse(execFileSync('node', [path.join(HERE, 'scripts', 'harvest.mjs'), log], { encoding: 'utf8', maxBuffer: 1 << 28 })); }
+      //
+      // Which harvester depends on which runner wrote the log — the two formats
+      // share nothing. The step records its runner when it opens, so an old
+      // record with no runner is Cursor's, which is what it was.
+      const which = t.runner || 'cursor';
+      const args = which === 'opencode'
+        ? [path.join(HERE, 'scripts', 'harvest-opencode.mjs'), log,
+           // Paths in an opencode log are absolute and belong to the worktree,
+           // so `guard` gets repo-relative ones only if the root is passed.
+           '--root', t.worktree || CWD,
+           '--model', runnerModel(s, t.tier).model, '--effort', runnerModel(s, t.tier).effort || '']
+        : [path.join(HERE, 'scripts', 'harvest.mjs'), log];
+      try { rec = JSON.parse(execFileSync('node', args, { encoding: 'utf8', maxBuffer: 1 << 28 })); }
       catch (e) { rec = e.stdout ? JSON.parse(e.stdout) : die('could not harvest ' + log); }
     }
+    // opencode's address does not exist until the run does, so this is where it
+    // is learned. `chat` is the one address field for either runner, which is
+    // what lets `sendback` resume without knowing which one it is talking to.
+    if (rec.session && !t.chat) t.chat = rec.session;
     t.runs ||= [];
     const n = t.runs.length + 1;
     const out = sub('runs', key, n + '.json');
@@ -1551,6 +1673,21 @@ CMDS.doctor = () => {
     if (sha(fs.readFileSync(path.resolve(CWD, p.path), 'utf8')) !== p.sha && !p.refined)
       soft.push(`${p.path} changed since it was loaded, and has not been refined`);
   }
+  // The runner, once for the round rather than once per step. A missing binary
+  // is the same fault forty-seven times over, and saying it forty-seven times
+  // buries everything else.
+  {
+    const rn = runnerOf(s);
+    const bin = runnerBin(rn);
+    if (!bin.ok) {
+      bad++;
+      console.log(`✗ this round runs on ${rn}, which cannot be found:`);
+      for (const l of String(bin.why).split('\n')) console.log('    ' + l.replace(/^✗ /, ''));
+    } else if (rn !== 'cursor') {
+      const r = runnerRow(rn);
+      soft.push(`runs on ${rn} (${r ? r.shown || r.model : rn}) — its log does not name the model that answered, so every run is recorded unverified`);
+    }
+  }
   const binCache = {};
   const binOk = (b) => {
     if (!(b in binCache)) {
@@ -1898,14 +2035,23 @@ Then re-run your proof and commit.`;
     console.log(`    \`git reset --hard\` past ${t.joinedSha || 'that merge'} — the fix has to land as a`);
     console.log('    forward commit on this branch, and re-join.');
   }
-  console.log('\n  Resume the agent that wrote it, on its own chat:');
-  console.log(`    agent -p --force --trust --resume ${t.chat} "$(cat ${path.relative(CWD, f)})"`);
+  console.log('\n  Resume the agent that wrote it, on its own conversation:');
+  if ((t.runner || 'cursor') === 'opencode') {
+    const bin = runnerBin('opencode');
+    const rm = runnerModel(s, t.tier);
+    console.log(`    ${bin.ok ? bin.path : 'opencode'} run --dir ${t.worktree} --session ${t.chat} \\`);
+    console.log(`      -m ${rm.model} --variant ${rm.effort} --auto --format json \\`);
+    console.log(`      "$(cat ${path.relative(CWD, f)})"`);
+  } else {
+    console.log(`    agent -p --force --trust --resume ${t.chat} "$(cat ${path.relative(CWD, f)})"`);
+  }
   console.log('\n  It has the context for why it made those changes. A new agent reading logs');
   console.log('  would have to reconstruct that from outside.');
 };
 
-const HELP = `orchestrate — six stages, on Cursor or Claude Code
+const HELP = `orchestrate — plan to merged code, on Cursor, opencode or Claude Code
 
+  runner [use <name>]       which CLI runs the steps: cursor or opencode
   load <path>...            read the plan files, record them
   map                       which plans touch which files, and where the seams are
   assess [propose|set|critical|check]  how hard each step is, and which model

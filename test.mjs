@@ -22,8 +22,39 @@ import { execFileSync, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const DRIVER = path.join(path.dirname(fileURLToPath(import.meta.url)), 'driver.mjs');
+
+// The sweep starts the driver several hundred times, and each start re-parses
+// five thousand lines. Node's compile cache keeps the compiled form on disk and
+// hands it back to every later process, which is most of a cold start saved.
+// Node turns it off by itself under NODE_V8_COVERAGE, so the coverage job is
+// unaffected. Children inherit it because it lives in this process's env.
+if (!process.env.NODE_COMPILE_CACHE)
+  process.env.NODE_COMPILE_CACHE = path.join(os.tmpdir(), 'orch-compile-cache');
 const KEEP = process.argv.includes('--keep');
 let pass = 0; const failures = [];
+
+// Every case below is registered rather than run on sight, so that one run of
+// this file can be told to execute a slice of them. `scripts/sweep.mjs` starts
+// one process per slice and adds the counts back up; `node test.mjs` with no
+// arguments still runs all of them, in order, in one process.
+//
+//   node test.mjs --shard 3/16    run the cases whose index mod 16 is 3
+//   node test.mjs --only ledger   run the cases whose label contains 'ledger'
+//   node test.mjs --report-json   print one JSON line for the runner to read
+const flag = (name) => { const i = process.argv.indexOf(name); return i >= 0 ? process.argv[i + 1] : null; };
+const SHARD = (() => {
+  const v = flag('--shard');
+  if (!v) return null;
+  const [i, n] = v.split('/').map(Number);
+  if (!Number.isInteger(i) || !Number.isInteger(n) || n < 1 || i < 0 || i >= n)
+    { console.error('--shard wants i/n with 0 <= i < n'); process.exit(2); }
+  return { i, n };
+})();
+const ONLY = flag('--only');
+const REPORT_JSON = process.argv.includes('--report-json');
+const cases = [];
+let pendingLabel = '';
+const sect = (fn) => { cases.push({ label: pendingLabel, fn }); pendingLabel = ''; };
 
 function ok(what, cond, detail) {
   if (cond) { pass++; return true; }
@@ -89,7 +120,7 @@ function forceHollow(d, id) {
   g.status = 'answered'; g.answer = null;
   fs.writeFileSync(p, JSON.stringify(r, null, 2) + '\n');
 }
-const say = (m) => console.log('\n· ' + m);
+const say = (m) => { pendingLabel = m; };
 
 // An empty directory with nothing but a name — for the cases that need to build
 // their own git repository, or their own register, by hand.
@@ -144,7 +175,7 @@ function transcript(cwd, body) {
 
 // --------------------------------------------------------------- the lifecycle
 say('a run goes all the way through');
-{
+sect(() => {
   const d = box('life');
   ok('three tasks are on the board', has(drv(d, ['board']).out, 't1'));
   ok('graph reports no collision', drv(d, ['graph']).code === 0);
@@ -161,24 +192,24 @@ say('a run goes all the way through');
   ok('it lands', has(drv(d, ['landed', 't1', '--sha', 'abc123']).out, 't1 landed'));
   ok('landing frees t3', has(drv(d, ['frontier']).out, 't3'));
   ok('the record agrees with the register', has(drv(d, ['verify']).out, 'agree exactly'));
-}
+});
 
 // A partial report must not read like a success — it opens a defect on itself.
 say('a half-failure is not a pass');
-{
+sect(() => {
   const d = box('partial');
   drv(d, ['chip', 't2', '--id', 'chip-t2']);   // a report can only come from a chip that exists
   drv(d, ['done', 't2'], { stdin: '{"verified":"two of three suites","outcome":"partial"}' });
   const r = reg(d);
   ok('a partial report opens a defect', (r.defects || []).some((x) => x.kind === 'bug' && x.task === 't2'));
   ok('and it is on the waiting list', has(drv(d, ['outstanding']).out, 't2'));
-}
+});
 
 // ------------------------------------------------------------------ the fixes
 // Was: harvest stamps every recovered message kind 'derived', and both readers
 // filtered on kind 'question' — so nothing ingest recovered could ever surface.
 say('a message with no kind still reaches the waiting list');
-{
+sect(() => {
   const d = box('waiting');
   const m = path.join(d, '.claude/orchestration/messages.jsonl');
   fs.appendFileSync(m, JSON.stringify({ at: '2026-01-01T09:00:00.000Z', dir: 'in', kind: 'derived',
@@ -200,12 +231,12 @@ say('a message with no kind still reaches the waiting list');
   // would satisfy this.
   ok('t2 is on the list', has(o, 't2'));
   ok('and is not also reported as spoke-last', has(o, 't2') && (o.match(/spoke last/g) || []).length === 0);
-}
+});
 
 // Was: ingest kept Claude Code's wrapper around the message and then cut the
 // result at 2000 chars, so the conclusion of a long report was thrown away.
 say('ingest keeps the message and drops the wrapper');
-{
+sect(() => {
   const d = box('ingest');
   const fx = fs.mkdtempSync(path.join(os.tmpdir(), 'orch-fx-'));
   const body = 't1 is done.\n' + Array.from({ length: 40 }, (_, i) => `LINE ${i}: ` + 'detail '.repeat(9)).join('\n') +
@@ -233,11 +264,11 @@ say('ingest keeps the message and drops the wrapper');
   ok('it was attributed to its task', e && e.key === 't1');
 
   boxes.push(fx);
-}
+});
 
 // Was: an owed item assigned to a task that landed was never mentioned again.
 say('an owed item outliving its task is not lost quietly');
-{
+sect(() => {
   const d = box('owed');
   drv(d, ['chip', 't1', '--id', 'chip-t1']);   // a report can only come from a chip that exists
   drv(d, ['owed', 'add', '--to', 't1', '--load-bearing', '--what', 'drop the shim', '--why', 'only while t1 is open']);
@@ -253,12 +284,12 @@ say('an owed item outliving its task is not lost quietly');
   ok('doctor fails on it', doc.code === 1 && has(doc.out, 'work that is over'));
   drv(d, ['owed', 'assign', 'o01', '--to', 't3']);
   ok('reassigning to open work clears it', drv(d, ['doctor']).code === 0);
-}
+});
 
 // Was: bundle merged everything describing the work but left defects and owed
 // items naming a task it had just cancelled.
 say('a bundle carries the absorbed task’s problems with it');
-{
+sect(() => {
   const d = box('bundle');
   drv(d, ['defect', 'add', '--task', 't2', '--kind', 'bug', '--what', 'a wrong helper']);
   drv(d, ['owed', 'add', '--to', 't2', '--what', 'drop the old shim', '--why', 'window']);
@@ -270,12 +301,12 @@ say('a bundle carries the absorbed task’s problems with it');
   ok('so does the owed item', (r.owed || [])[0]?.to === 't1' && (r.owed || [])[0]?.movedFrom === 't2');
   ok('outstanding names the task being built', has(drv(d, ['outstanding']).out, 't1'));
   ok('the record still agrees', has(drv(d, ['verify']).out, 'agree exactly'));
-}
+});
 
 // Was: `readReg` locked before checking, and the lock's parent directory did not
 // exist, so every command in a fresh project spun for ~7s then blamed a lock.
 say('a project with no register says so');
-{
+sect(() => {
   const d = fs.mkdtempSync(path.join(os.tmpdir(), 'orch-blank-'));
   boxes.push(d);
   const t0 = Date.now();
@@ -283,12 +314,12 @@ say('a project with no register says so');
   ok('it says there is no register', has(res.out, 'no register'));
   ok('it does not blame a lock', !has(res.out, 'lock'));
   ok('and it does not spin first', Date.now() - t0 < 2000, (Date.now() - t0) + 'ms');
-}
+});
 
 // A live holder must still be refused, or the fix above would have traded a bad
 // message for a corrupt register.
 say('the lock still holds against a live holder');
-{
+sect(() => {
   const d = box('lock');
   holdLock(d, process.pid);
   ok('a live holder is not robbed', drv(d, ['iam', 'x']).code !== 0);
@@ -310,14 +341,14 @@ say('the lock still holds against a live holder');
   ok('a command that succeeds leaves no lock behind', !fs.existsSync(lockPath));
   drv(d, ['show', 'nosuchgap']);
   ok('and neither does one that fails', !fs.existsSync(lockPath));
-}
+});
 
 // Was: an edit to register.json from outside the tool became the trusted
 // baseline at the very next command — commit() diffs against whatever is on
 // disk — so the divergence was never recorded, never healed and never mentioned.
 // Only a hand-run `verify` ever saw it.
 say('an edit from outside the tool is noticed rather than absorbed');
-{
+sect(() => {
   const d = box('stamp');
   const p = path.join(d, '.claude/orchestration/register.json');
   const r = JSON.parse(fs.readFileSync(p, 'utf8'));
@@ -333,13 +364,13 @@ say('an edit from outside the tool is noticed rather than absorbed');
   // was reached from one place, inside rebuild. hook-install fires digest at
   // every SessionStart, which is exactly when nobody is able to ask.
   ok('and the digest says it too', has(drv(d, ['digest']).out, 'disagree in'), drv(d, ['digest']).out.slice(0, 400));
-}
+});
 
 // Was: `rebuild` is one of the two opposite fixes `verify` offers, and it
 // overwrites the register from the record — then said "nothing was thrown away",
 // which is true of backups/ and false of the file it just replaced.
 say('rebuild names the ground it is about to take');
-{
+sect(() => {
   const d = box('rebuildloss');
   const p = path.join(d, '.claude/orchestration/register.json');
   const r = JSON.parse(fs.readFileSync(p, 'utf8'));
@@ -350,14 +381,14 @@ say('rebuild names the ground it is about to take');
      out.out.slice(0, 400));
   ok('and points at the other fix', has(out.out, 'log reseed'), out.out);
   ok('and does not claim nothing was thrown away', !has(out.out, 'nothing was thrown away'), out.out);
-}
+});
 
 // Was: the backups are described as a second net, and on a gitignored register
 // they are the only one — but their depth is counted in writes, not time, so a
 // busy run silently thins the net. On a real run thirty states covered half an
 // hour of three days, which is why the drift it carried could not be dated.
 say('doctor says how far back the backup ring actually reaches');
-{
+sect(() => {
   const d = box('backupspan');
   const bdir = path.join(d, '.claude/orchestration/backups');
   fs.mkdirSync(bdir, { recursive: true });
@@ -371,11 +402,11 @@ say('doctor says how far back the backup ring actually reaches');
   ok('it says the ring is full and how far it reaches',
      has(out, 'backup ring is full') && has(out, 'reaches back'), out.slice(0, 300));
   ok('and that depth is counted in writes, not time', has(out, 'counted in writes'), out.slice(0, 300));
-}
+});
 
 // Was: r.ci held eight real results that no reader could reach any more.
 say('legacy CI results become readable history and prove nothing');
-{
+sect(() => {
   const d = box('ci');
   const p = path.join(d, '.claude/orchestration/register.json');
   const r = JSON.parse(fs.readFileSync(p, 'utf8'));
@@ -409,11 +440,11 @@ say('legacy CI results become readable history and prove nothing');
   ok('the first real checkpoint after an import is c01',
      has(drv(d, ['ci', '--status', 'green', '--ref', 'run-3']).out, 'c01:'),
      (reg(d).checkpoints || []).map((c) => c.id).join(' '));
-}
+});
 
 // The archive is only safe because a removal is recorded like any other change.
 say('archiving shrinks the register without breaking the record');
-{
+sect(() => {
   const d = box('archive');
   drv(d, ['chip', 't1', '--id', 'chip-t1']);   // a report can only come from a chip that exists
   drv(d, ['done', 't1'], { stdin: '{"verified":"ran true","outcome":"passed","notes":"' + 'x'.repeat(3000) + '"}' });
@@ -439,14 +470,14 @@ say('archiving shrinks the register without breaking the record');
   drv(d, ['rebuild', '--to', String(seq), '--why', 'winding back to the pre-archive state']);
   ok('the record replays the pre-archive register exactly',
      fs.readFileSync(path.join(d, '.claude/orchestration/register.json'), 'utf8') === snap);
-}
+});
 
 // ------------------------------------------------------------------ the parser
 // Was: "takes a value unless the next word starts with --", so an agent whose
 // words began with a dash had them replaced by the boolean true, and a flag
 // nobody knew was dropped in silence while the command ran on without it.
 say('the parser keeps what was written, and says so when it cannot');
-{
+sect(() => {
   const d = box('parse');
   drv(d, ['heard', 't1', '--kind', 'note', '--text', '--force was what I ran']);
   ok('a --text value beginning with -- is kept word for word',
@@ -480,38 +511,38 @@ say('the parser keeps what was written, and says so when it cannot');
   const refused = ['bogus', '0', '-5', '999999'].filter((v) => drv(d, ['rebuild', '--to', v]).code !== 0);
   ok('rebuild --to refuses bogus, 0, -5 and 999999 alike', refused.length === 4, 'accepted ' +
      ['bogus', '0', '-5', '999999'].filter((v) => !refused.includes(v)).join(', '));
-}
+});
 
 // ------------------------------------------------------------------ the record
 // Was: an empty record under a full register made `commit` append the delta
 // alone, so the one line that resulted claimed to be the whole history and the
 // next rebuild replayed it over the register — leaving {}.
 say('a lost record does not take the register with it');
-{
+sect(() => {
   const d = box('lostlog');
   fs.rmSync(path.join(d, '.claude/orchestration/events.jsonl'));
   drv(d, ['iam', 'zed']);
   drv(d, ['rebuild']);
   ok('the tasks are all still there', tasksOf(d).length === 3, tasksOf(d).length + ' task(s)');
   ok('and the record was seeded, not started as a delta', has(drv(d, ['verify']).out, 'agree exactly'));
-}
+});
 
 // Was: rebuild, verify and log reseed wrote the register without taking the lock,
 // landing on the same temp file a locked writer was using.
 say('the commands that rewrite the record respect a lock somebody holds');
-{
+sect(() => {
   const d = box('reclock');
   const lock = holdLock(d, process.pid);
   ok('rebuild waits and then refuses', drv(d, ['rebuild']).code !== 0);
   ok('verify does too', drv(d, ['verify']).code !== 0);
   ok('and so does log reseed', drv(d, ['log', 'reseed', '--why', 'x']).code !== 0);
   fs.rmSync(lock, { recursive: true, force: true });
-}
+});
 
 // Was: --to rewound the register and left the log at full length, so every
 // verify from then on reported the difference as damage.
 say('rewinding the record moves both halves together');
-{
+sect(() => {
   const d = box('rewind');
   drv(d, ['chip', 't1', '--id', 'chip-t1']);
   drv(d, ['done', 't1'], { stdin: '{"verified":"ran true","outcome":"passed"}' });
@@ -528,35 +559,35 @@ say('rewinding the record moves both halves together');
   ok('and the rewind is itself on the record', has(rew.out, 'rewind is itself on the record'), rew.out);
   const tail = readIf(path.join(d, '.claude/orchestration/events.jsonl')).trim().split('\n').slice(-1)[0];
   ok('with the reason it was given', has(tail, 'checking a partial rebuild') && has(tail, 'rewind'), tail);
-}
+});
 
 // Was: the event's cmd column held the raw argv, and an argv leading with
 // `--register <abs path>` pushed the command itself off the end of the line.
 say('an event names the command even when --register comes first');
-{
+sect(() => {
   const d = box('label');
   drv(d, ['--register', path.join(d, '.claude/orchestration/register.json'), 'iam', 'probe-name']);
   const first = drv(d, ['events', '--n', '1']).out.split('\n')[0];
   ok('the newest row says iam', has(first, 'iam'), first);
-}
+});
 
 // Was: a record that is a directory came back as a raw Node stack trace out of
 // every single command.
 say('a record that is not a file is bad input, not a crash');
-{
+sect(() => {
   const d = box('dirlog');
   const f = path.join(d, '.claude/orchestration/events.jsonl');
   fs.rmSync(f); fs.mkdirSync(f);
   const res = drv(d, ['verify']);
   ok('it says error and stops', res.code === 2 && has(res.out, 'error:'), 'exit ' + res.code);
   ok('and prints no stack trace', !traced(res.out));
-}
+});
 
 // Was: a final line with no newline was concatenated with the next append, so
 // two good events became one unreadable one and the reader dropped both — while
 // verify went green on the loss because the register was never told.
 say('a final line with no newline is closed, not welded to the next event');
-{
+sect(() => {
   const d = box('seal');
   const f = path.join(d, '.claude/orchestration/events.jsonl');
   drv(d, ['iam', 'one']);
@@ -567,13 +598,13 @@ say('a final line with no newline is closed, not welded to the next event');
   ok('the new event is a line of its own', lines.length === before + 1, lines.length + ' vs ' + (before + 1));
   ok('every line still reads back', lines.every((l) => { try { JSON.parse(l); return true; } catch { return false; } }));
   ok('and nothing was lost behind the reader’s back', has(drv(d, ['verify']).out, 'agree exactly'));
-}
+});
 
 // -------------------------------------------------------- dispatch, and the guard
 // Was: "two tasks may not touch one file" was asserted in the error text above
 // and then never checked against another task.
 say('one path has one owner, and task add is where that is cheap to fix');
-{
+sect(() => {
   const d = box('own');
   const same = drv(d, ['task', 'add'], { stdin: JSON.stringify([
     { key: 'x1', title: 'x', plan: 'docs/plans/p.md', owns: ['src/shared.py'], needs: [] },
@@ -608,12 +639,12 @@ say('one path has one owner, and task add is where that is cheap to fix');
   ]) });
   ok('nor a directory that swallows a path another task owns',
      under.code !== 0 && has(under.out, 't1 owns src/a.py'));
-}
+});
 
 // Was: a chip could be opened with no id, on work that was already landed, on
 // top of an unlanded requirement, or straight across something still open.
 say('a chip only opens when it is safe to open one');
-{
+sect(() => {
   const d = box('chip');
   ok('the first chip must say which chip it is',
      drv(d, ['chip', 't2']).code !== 0 && has(drv(d, ['chip', 't2']).out, '--id'));
@@ -625,13 +656,13 @@ say('a chip only opens when it is safe to open one');
   drv(d, ['landed', 't1', '--sha', 'abc']);
   const late = drv(d, ['chip', 't1', '--id', 'chip-again']);
   ok('and never rewinds work that has landed', late.code !== 0 && has(late.out, 'cannot rewind'));
-}
+});
 
 // Was: serialisation points were compared by exact string equality, so the check
 // could only fire when two authors typed the same characters — and on the real
 // run a docker-compose.yml collision this reported clean.
 say('two chips may not move the same serialisation point, however it is spelled');
-{
+sect(() => {
   const d = box('point');
   drv(d, ['task', 'add'], { stdin: JSON.stringify([
     { key: 'u1', title: 'one', plan: 'docs/plans/p.md', owns: ['src/u1.py'], needs: [], serialises: ['docker-compose.yml'] },
@@ -642,13 +673,13 @@ say('two chips may not move the same serialisation point, however it is spelled'
   const second = drv(d, ['chip', 'u2', '--id', 'cu2']);
   ok('the second is refused on the shared point',
      second.code !== 0 && has(second.out, 'serialisation point'), second.out.split('\n')[0]);
-}
+});
 
 // Was: `git diff --name-only` with rename detection prints only a rename's
 // destination, so `git mv other/x.ts src/x.ts` deleted a file the task did not
 // own and guard called it clean. And the base was hardcoded to "main".
 say('the guard sees a file renamed out of somewhere the task does not own');
-{
+sect(() => {
   const g = bare('guard');
   const git = (...a) => execFileSync('git', a, { cwd: g, stdio: 'ignore' });
   fs.mkdirSync(path.join(g, 'src')); fs.mkdirSync(path.join(g, 'other'));
@@ -683,11 +714,11 @@ say('the guard sees a file renamed out of somewhere the task does not own');
   ok('and leaves a trace that it ran',
      !!(reg(g).tasks || []).find((t) => t.key === '1.1')?.guardedAt,
      JSON.stringify((reg(g).tasks || []).find((t) => t.key === '1.1')?.guardedAt));
-}
+});
 
 // Was: the diff was built as a shell string, so a branch name was a command.
 say('a branch name cannot run a command');
-{
+sect(() => {
   const i = bare('inject');
   const mark = path.join(i, 'PWNED');
   const git = (...a) => execFileSync('git', a, { cwd: i, stdio: 'ignore' });
@@ -704,12 +735,12 @@ say('a branch name cannot run a command');
   drv(i, ['log', 'reseed', '--why', 'fixture']);
   drv(i, ['guard', '1.1', '--base', 'main']);
   ok('the injected command did not run', !fs.existsSync(mark));
-}
+});
 
 // Was: `done` was the one command an agent runs itself and the only one that did
 // not check what state the task was in.
 say('a report has to be about work that was actually handed out');
-{
+sect(() => {
   const d = box('report');
   const never = drv(d, ['done', 't2'], { stdin: '{"verified":"v","outcome":"passed"}' });
   ok('a task nobody handed out cannot report', never.code !== 0 && has(never.out, 'never been handed out'));
@@ -719,12 +750,12 @@ say('a report has to be about work that was actually handed out');
   const after = drv(d, ['done', 't1'], { stdin: '{"verified":"nothing","outcome":"failed"}' });
   ok('and a landed task cannot report again', after.code !== 0);
   ok('the landing survived the attempt', tasksOf(d).find((t) => t.key === 't1')?.status === 'landed');
-}
+});
 
 // Was: landing did not ask whether the task had ever reported, nor whether what
 // it was built on had landed.
 say('nothing lands that has not reported, or that stands on unlanded work');
-{
+sect(() => {
   const d = box('land');
   const unreported = drv(d, ['landed', 't2', '--sha', 'abc']);
   ok('a task that never reported cannot land',
@@ -741,23 +772,23 @@ say('nothing lands that has not reported, or that stands on unlanded work');
   const early = drv(d, ['landed', 't3', '--sha', 'abc']);
   ok('nor does work land on top of a requirement that has not',
      early.code !== 0 && has(early.out, 'waits for t2'), early.out.split('\n')[0]);
-}
+});
 
 // Was: graph ended on "Nothing clashes. Every round above can run side by side."
 // — an absolute sentence about a check that skips every pair with a landed side.
 say('graph says what it actually looked at');
-{
+sect(() => {
   const d = box('graph');
   const out = drv(d, ['graph']).out;
   ok('it counts the pairs it compared', has(out, 'pair(s) of tasks that could still collide were checked'));
   ok('and no longer claims a flat all-clear',
      !has(out, 'Nothing clashes. Every round above can run side by side.'));
-}
+});
 
 // Was: an absorbed member's key still appeared in other tasks' `needs`, so the
 // dependent was never placed and its chip could never open.
 say('a bundle takes the dependencies of what it absorbed');
-{
+sect(() => {
   const d = box('repoint');
   const out = drv(d, ['bundle', 't1', 't2', '--into', 't2']).out;
   ok('it says which task was repointed', has(out, 'repointed at t2'), out.split('\n').slice(-2)[0]);
@@ -765,13 +796,13 @@ say('a bundle takes the dependencies of what it absorbed');
   ok('t3 now waits for the host', (t3.needs || []).includes('t2'));
   ok('and no longer for the cancelled member', !(t3.needs || []).includes('t1'));
   ok('so the graph can still be ordered', drv(d, ['graph']).code === 0);
-}
+});
 
 // ------------------------------------------------------------------- the grill
 // Was: SETTLED_HEADING matched "resolved" inside "Unresolved", so a section
 // headed "Unresolved questions" silenced everything under it.
 say('a section headed Unresolved is the opposite of settled');
-{
+sect(() => {
   const d = planBox('scan', ['# The plan', '', '## Unresolved questions', '',
     'The retry limit is TBD.', 'Timeouts should probably be configurable.', '',
     '## Unanswered so far', '', 'The page size is a threshold somebody must pick.', '',
@@ -782,12 +813,12 @@ say('a section headed Unresolved is the opposite of settled');
   ok('so is the Unanswered one', sections.includes('Unanswered so far'));
   ok('and a genuinely settled heading still silences its own section',
      !sections.includes('Already decided'));
-}
+});
 
 // Was: the plain-words lint matched jargon as bare substrings, so "normal",
 // "form", "platform", "performance" and "information" were all rejected.
 say('ordinary English passes the plain-words lint and jargon still does not');
-{
+sect(() => {
   const d = planBox('words', '# a plan\n\n## What is open\n\nThe retry limit is TBD.\n');
   drv(d, ['scan']);
   const g = gapsOf(d)[0]?.id;
@@ -802,12 +833,12 @@ say('ordinary English passes the plain-words lint and jargon still does not');
   ok('but schema, endpoint and authorisation are still caught', jargon.code !== 0);
   ok('and the offending word is named', /"(schema|endpoint|authorisation)"/.test(jargon.out),
      jargon.out.split('\n').slice(0, 2).join(' '));
-}
+});
 
 // Was: an empty gap list read the same as "everything was judged", and a status
 // of "answered" was taken as the decision it only claims to be.
 say('check will not call a session finished on a claim');
-{
+sect(() => {
   const d = planBox('check', '# a plan\n\n## What is open\n\nThe retry limit is TBD.\n');
   const never = drv(d, ['check']);
   ok('a register nothing was ever scanned against is refused',
@@ -825,13 +856,13 @@ say('check will not call a session finished on a claim');
   const hollow = drv(d, ['check']);
   ok('and so is a gap marked answered with no answer under it',
      hollow.code !== 0 && has(hollow.out, 'no answer recorded'));
-}
+});
 
 // ------------------------------------------------------------------ the ledger
 // Was: attribution took the LONGEST key the message happened to mention, so a
 // report from 1.1 that named 1.10 in passing was filed against 1.10.
 say('a message belongs to the task it opens with');
-{
+sect(() => {
   const d = box('attrib');
   drv(d, ['task', 'add'], { stdin: JSON.stringify([
     { key: '1.1', title: 'one', plan: 'docs/plans/p.md', owns: ['src/one.py'], needs: [] },
@@ -842,12 +873,12 @@ say('a message belongs to the task it opens with');
   const e = ledger(d).find((x) => x.uuid === 'tx1');
   ok('the message was recovered', !!e);
   ok('it is filed against 1.1, not the longer key it mentions', e && e.key === '1.1', e && e.key);
-}
+});
 
 // Was: a cut message was stored as a bare slice — no mark, no original length —
 // so it was read afterwards as a complete statement.
 say('a message too long to keep whole says so');
-{
+sect(() => {
   const d = box('cut');
   const body = 't1 is done. ' + 'and then a further consideration that runs on and on. '.repeat(120) +
     'DO-NOT-MERGE-UNTIL-THE-MIGRATION-LANDS';
@@ -858,12 +889,12 @@ say('a message too long to keep whole says so');
   ok('the true length is on the record', e && e.fullLength === body.length, e && e.fullLength);
   ok('and the cut is visible in the text itself', e && has(e.text, 'cut at 4000 of ' + body.length));
   ok('the tail really is gone, not quietly kept', e && !has(e.text, 'DO-NOT-MERGE'));
-}
+});
 
 // Was: a `release` counted as an answer, so an agent waited for ever on a list
 // that said nothing was waiting.
 say('telling an agent to go ahead is not answering what it asked');
-{
+sect(() => {
   const d = box('release');
   drv(d, ['heard', 't1', '--kind', 'question', '--text', 'which settings file did you mean']);
   drv(d, ['say', 't1', '--kind', 'release', '--text', 'released, rebase now']);
@@ -871,12 +902,12 @@ say('telling an agent to go ahead is not answering what it asked');
      has(drv(d, ['outstanding']).out, 'asked you something'));
   drv(d, ['say', 't1', '--kind', 'reply', '--text', 'the one in config/']);
   ok('and only a reply clears it', !has(drv(d, ['outstanding']).out, 'asked you something'));
-}
+});
 
 // Was: inbox, reply, ack, post and read were a whole message subsystem nothing
 // called and nothing read back.
 say('the dead message commands are gone');
-{
+sect(() => {
   const d = box('dead');
   // They were unreachable from the dispatch long before they were removed, so
   // asking the command line about them proves nothing. The source is the only
@@ -887,13 +918,13 @@ say('the dead message commands are gone');
   for (const c of ['inbox', 'reply', 'ack', 'post', 'read'])
     ok('`' + c + '` is not a command either',
        has(drv(d, [c]).out, 'orchestrate-implementation driver'), c);
-}
+});
 
 // -------------------------------------------------------------------- the slot
 // Was: `slot take` wrote a claim in a shape `slot run` did not read, so a slot
 // held by hand did not hold at all.
 say('a slot taken by hand holds against a run');
-{
+sect(() => {
   const d = box('slot-hold');
   ok('taking it by hand works', drv(d, ['slot', 'take', 'ci', '--task', 'probe']).code === 0);
   const barge = drv(d, ['slot', 'run', 'ci', '--timeout', '1', '--', '/bin/echo', 'BARGED'],
@@ -901,22 +932,22 @@ say('a slot taken by hand holds against a run');
   ok('a later run does not barge in', !has(barge.out, 'BARGED'));
   drv(d, ['slot', 'free', 'ci', '--force']);
   ok('and it can be handed back', !fs.existsSync(path.join(d, '.claude/orchestration/slots/ci.lock')));
-}
+});
 
 // Was: the command after `--` was quoted word by word, so a leading VAR=value
 // became a filename and the run died with 127.
 say('a slot run takes a command that starts with an environment setting');
-{
+sect(() => {
   const d = box('slot-env');
   const res = drv(d, ['slot', 'run', 'ci', '--', 'FOO=1', '/bin/echo', 'hi'], { timeout: 30000 });
   ok('it prints hi rather than exiting 127', res.code === 0 && /(^|\n)hi(\n|$)/.test(res.out),
      'exit ' + res.code + ': ' + res.out.split('\n').filter(Boolean).slice(-1)[0]);
-}
+});
 
 // Was: the claim was taken with a plain existence check, so two runs starting at
 // once both believed they had it — which is the crash the slot exists to stop.
 say('two runs for one slot take their turn');
-{
+sect(() => {
   const d = box('slot-race');
   const log = path.join(d, 'serial.log');
   fs.writeFileSync(log, '');
@@ -928,12 +959,12 @@ say('two runs for one slot take their turn');
   } catch { /* the assertion below says what happened */ }
   const seen = readIf(log).split('\n').filter(Boolean).join(' ');
   ok('one finishes before the other starts', seen === 'START END START END', seen);
-}
+});
 
 // Was: none of the words the heavy list looks for appear in "pnpm install", so
 // every agent was told to run one bare and in parallel.
 say('installing dependencies is heavy work and goes through the slot');
-{
+sect(() => {
   const d = box('slot-install');
   drv(d, ['task', 'add'], { stdin: JSON.stringify([
     { key: 't2', verify: ['pnpm install', 'ruff check .'] }]) });
@@ -941,13 +972,13 @@ say('installing dependencies is heavy work and goes through the slot');
   ok('pnpm install is put behind the slot wrapper', /with-ci-slot" pnpm install/.test(brief));
   ok('and a linter is still left to run straight away',
      /(^|\n)ruff check/.test(brief.replace(/.*with-ci-slot.*/g, '')));
-}
+});
 
 // ------------------------------------------------------------------ stale briefs
 // Was: briefSha was computed over fields the brief is not built from, or not at
 // all, so an agent kept working from a brief the record had since contradicted.
 say('a brief the record has moved past is called out');
-{
+sect(() => {
   const d = box('stale');
   drv(d, ['brief', 't1']);
   ok('a brief just written is not stale', !has(drv(d, ['board']).out, 'record changed after these briefs'));
@@ -973,7 +1004,7 @@ say('a brief the record has moved past is called out');
   drv(d, ['iam', 'somebody-else']);
   ok('a change of orchestrator does not make every brief stale',
      !has(drv(d, ['board']).out, 'record changed after these briefs'), drv(d, ['board']).out.slice(0, 300));
-}
+});
 
 // Was: cmdBrief rendered neither the task's own `notes` nor the pre-flight's
 // notes, so a pre-flight — which exists to find what the plan missed before
@@ -981,7 +1012,7 @@ say('a brief the record has moved past is called out');
 // real run two thirds of tasks carried a note and every pre-flight finding was
 // invisible to the agent it was written for.
 say('a brief carries the notes the record holds for that task');
-{
+sect(() => {
   const d = box('briefnotes');
   drv(d, ['task', 'add'], { stdin: JSON.stringify([
     { key: 't1', notes: 'YOU DO NOT OWN THE PLANS DIRECTORY — only your own plan document.' },
@@ -999,13 +1030,13 @@ say('a brief carries the notes the record holds for that task');
      has(brief, 'THE SHARPEST THING I FOUND'), brief.slice(0, 200));
   ok('and the pre-flight is marked as coming from the pre-flight',
      has(brief, 'From the pre-flight agent'));
-}
+});
 
 // Was: chip checked status, unmet needs and interference, and then said "can
 // start now" over a brief the record had moved past — the one moment where the
 // agent is about to start reading it. doctor said so and nothing stopped it.
 say('chip will not hand over a brief the record has moved past');
-{
+sect(() => {
   const d = box('chipstale');
   drv(d, ['brief', 't1']);
   drv(d, ['task', 'add'], { stdin: JSON.stringify([{ key: 't1', title: 'rewritten after briefing' }]) });
@@ -1015,14 +1046,14 @@ say('chip will not hand over a brief the record has moved past');
   ok('and no chip was recorded', !tasksOf(d).find((t) => t.key === 't1')?.chip);
   drv(d, ['brief', 't1']);
   ok('after re-briefing it opens', drv(d, ['chip', 't1', '--id', 'chip-t1']).code === 0);
-}
+});
 
 // --------------------------------------------------------------- the grill, in full
 // The gap commands are the register's edit surface. Together they take a plan
 // with open questions, judge each candidate, settle it, and write the decisions
 // file — and every one of them was part of the coverage gap before this block.
 say('the grill runs a gap all the way to a rendered decision');
-{
+sect(() => {
   const d = planBox('grill', ['# The plan', '',
     '## What is open', '',
     'The retry limit is TBD.', 'The upload size cap should probably be configurable.','',
@@ -1069,12 +1100,12 @@ say('the grill runs a gap all the way to a rendered decision');
   ok('check passes once everything is judged and answered', chk.code === 0, chk.out.split('\n')[0].slice(0, 60));
   ok('render writes the decisions file', drv(d, ['render']).code === 0 &&
      fs.readFileSync(path.join(d, 'docs/decisions-implementation.md'), 'utf8').includes('Store it'));
-}
+});
 
 // A gap added by hand (via `add`) is a candidate for the same lifecycle, and a
 // question marked batched lands on the batch list instead of being asked now.
 say('an added gap can be batched and batched ones are approved in one list');
-{
+sect(() => {
   const d = planBox('grill2', '# a plan\n\n## What is open\n\nThe retry limit is TBD.\n');
   drv(d, ['scan']);
   const g = gapsOf(d)[0].id;
@@ -1089,13 +1120,13 @@ say('an added gap can be batched and batched ones are approved in one list');
               { label: 'Look it up', gain: 'never stale', cost: 'slower' }] }) });
   const batch = drv(d, ['batch']).out;
   ok('the batch names the batched item', has(batch, '1 item(s)') && has(batch, 'ids: ' + g));
-}
+});
 
 // -------------------------------------------------------------- refining a plan
 // Refinement turns a settled plan into a buildable one. It reads the agent's own
 // report file, records the proposed tasks, and reopens gaps it found.
 say('refine drives a plan from settled to buildable');
-{
+sect(() => {
   const d = planBox('refine', '# the plan\n\n## What is open\n\nThe retry limit is TBD.\n');
   drv(d, ['scan']);
   const g = gapsOf(d)[0].id;
@@ -1119,12 +1150,12 @@ say('refine drives a plan from settled to buildable');
   const reopened = r.gaps.find((x) => x.title === 'a thing nobody decided');
   drv(d, ['answer', reopened.id], { stdin: JSON.stringify({ choice: 'Store it', note: 'settled' }) });
   ok('refine check passes once everything is refined', drv(d, ['refine', 'check']).code === 0);
-}
+});
 
 // A refine done report can also come over stdin when the file is missing, but it
 // must be told that is second best.
 say('refine done falls back to stdin and says the file is better');
-{
+sect(() => {
   const d = planBox('refine-stdin', '# p\n\n## What is open\n\nThe retry limit is TBD.\n');
   drv(d, ['scan']);
   const g = gapsOf(d)[0].id;
@@ -1137,13 +1168,13 @@ say('refine done falls back to stdin and says the file is better');
   // thrown away, so afterwards a report that could not lose a line and one that
   // passed through somebody's context looked identical on the record.
   ok('and recorded which route it came in by', (reg(d).plans || [])[0]?.refineSource === 'stdin');
-}
+});
 
 // Was: `refine brief` reads g.answer.choice and was the one such reader with no
 // check that there is an answer to read, so a gap marked answered with nothing
 // under it threw a raw TypeError out of the driver.
 say('refine brief names a hollow claim rather than throwing');
-{
+sect(() => {
   const d = planBox('refhollow', '# a plan\n\n## What is open\n\nThe retry limit is TBD.\n');
   drv(d, ['scan']);
   const g = gapsOf(d)[0].id;
@@ -1153,12 +1184,12 @@ say('refine brief names a hollow claim rather than throwing');
   ok('it refuses', out.code !== 0);
   ok('it says which gap and what fixes it', has(out.out, g) && has(out.out, 'answer ' + g), out.out.split('\n')[1]);
   ok('and no stack trace reaches the user', !traced(out.out), out.out.slice(0, 200));
-}
+});
 
 // ---------------------------------------------------------------- pre-flight
 // A read-only agent tests a task's owns against the code before a chip exists.
 say('pre-flight finds what the record missed and gates the round');
-{
+sect(() => {
   const d = planBox('preflight', '# the plan\n\n## What is open\n\nThe retry limit is TBD.\n');
   drv(d, ['scan']);
   const g = gapsOf(d)[0].id;
@@ -1189,12 +1220,12 @@ say('pre-flight finds what the record missed and gates the round');
   ok('and says it carried it forward', has(again.out, 'carried forward'), again.out.split('\n')[0]);
   // The load-bearing gap is not in owns yet, so the round is still not ready.
   ok('preflight check still refuses the load-bearing gap', drv(d, ['preflight', 'check']).code !== 0);
-}
+});
 
 // ------------------------------------------------------------ whoami and the rest
 // whoami reads the local session registry; a missing registry is a clean error.
 say('whoami says when there is no session registry');
-{
+sect(() => {
   const d = bare('whoami');
   const home = path.join(d, 'home');
   // Point HOME at a dir with no registry so the error path is real, not env wild.
@@ -1203,14 +1234,14 @@ say('whoami says when there is no session registry');
   const res = drv(d, ['whoami']);
   process.env.HOME = old;
   ok('whoami names the missing registry', res.code !== 0 && has(res.out, 'no session registry'));
-}
+});
 
 // -------------------------------------------------------------- release, resume
 // A task that has never been handed out has no chip; release refuses on a held
 // task that is still waiting, and a live task with a landed requirement can be
 // released.
 say('release refuses blocked work and frees what it can');
-{
+sect(() => {
   const d = box('release2');
   drv(d, ['chip', 't1', '--id', 'chip-t1']);
   // t3 waits on t1; t1 is still unlanded, so t3's chip refuses.
@@ -1220,11 +1251,11 @@ say('release refuses blocked work and frees what it can');
   drv(d, ['agent', 't1', '--name', 'peer-a']);
   const rel = drv(d, ['release', 't1']);
   ok('release tells the agent to start', rel.code === 0 && has(rel.out, 'you may start'));
-}
+});
 
 // ------------------------------------------------------------------- ci and wave
 say('ci records a green run and the next round may open');
-{
+sect(() => {
   const d = box('ci2');
   drv(d, ['chip', 't1', '--id', 'chip-t1']);
   drv(d, ['done', 't1'], { stdin: '{"verified":"ran true","outcome":"passed"}' });
@@ -1238,22 +1269,22 @@ say('ci records a green run and the next round may open');
   ok('green records a checkpoint', green.code === 0 && has(green.out, 'c01'));
   ok('ci list shows it', has(drv(d, ['ci', 'list']).out, 'run-1'));
   ok('wave says the finished round is green and the next may open', has(drv(d, ['wave', '--wave', '1']).out, 'may be opened'));
-}
+});
 
 // ------------------------------------------------------------- bundle suggest
 // Two unstarted, non-interfering siblings share a plan; suggest proposes one chip.
 say('bundle suggest names the siblings worth merging');
-{
+sect(() => {
   const d = box('bundle-suggest');
   ok('bundle suggest proposes a group', has(drv(d, ['bundle', 'suggest']).out, 'one chip'));
-}
+});
 
 // Was: members were stored in whatever order the command line gave, and the
 // brief printed the host first whether or not it was first — so a step could be
 // listed above the step it needs. `bundle suggest` built its suggestion from
 // discovery order too, and so suggested a command line with the same fault.
 say('a bundled brief lists a step after the step it needs');
-{
+sect(() => {
   const d = box('bundleorder');
   drv(d, ['task', 'add'], { stdin: JSON.stringify([
     { key: 'b1', title: 'the base', plan: 'docs/plans/p.md', needs: [], owns: ['src/x.py'], verify: ['true'] },
@@ -1268,12 +1299,12 @@ say('a bundled brief lists a step after the step it needs');
   ok('both steps are listed', first >= 0 && second >= 0, brief.slice(0, 400));
   ok('the dependency comes first', first >= 0 && second >= 0 && first < second,
      'b1 at ' + first + ', b2 at ' + second);
-}
+});
 
 // --------------------------------------------------------------- hook install
 // The SessionStart hook rewrites settings.json; installing twice is a no-op.
 say('hook-install writes a SessionStart hook and is idempotent');
-{
+sect(() => {
   const d = box('hook');
   const first = drv(d, ['hook-install']);
   ok('it writes the hook once', first.code === 0 && has(first.out, 'added a SessionStart hook'));
@@ -1281,25 +1312,25 @@ say('hook-install writes a SessionStart hook and is idempotent');
   ok('installing again says it is already there', has(second.out, 'already installed'));
   const settings = JSON.parse(fs.readFileSync(path.join(d, '.claude/settings.json'), 'utf8'));
   ok('the hook is on SessionStart', (settings.hooks.SessionStart || []).length === 1);
-}
+});
 
 // -------------------------------------------------------------- resume the run
 // A dead session's address is replaced; agents are re-announced.
 say('resume takes over a run and names what to do next');
-{
+sect(() => {
   const d = box('resume');
   drv(d, ['iam', 'old-boss']);
   ok('resume needs a name', drv(d, ['resume']).code !== 0);
   const out = drv(d, ['resume', '--name', 'new-boss']);
   ok('resume records the new address', out.code === 0 && has(out.out, 'now yours'));
   ok('the register carries it', (reg(d).orchestrator) === 'new-boss');
-}
+});
 
 // ------------------------------------------------- load with globs and dirs
 // A plan directory (or glob) is walked for plan files; a wildcard matches a
 // segment at a time so `docs/**/*.md` resolves instead of looking literally.
 say('load walks a directory and resolves a glob across nesting');
-{
+sect(() => {
   const d = bare('loadglob');
   fs.mkdirSync(path.join(d, 'docs/plans/nested'), { recursive: true });
   fs.writeFileSync(path.join(d, 'docs/plans/a.md'), '# a\n\nbuild the a thing.\n');
@@ -1310,12 +1341,12 @@ say('load walks a directory and resolves a glob across nesting');
   const dir = drv(d, ['load', 'docs/plans']);
   ok('a directory is walked for plans', dir.code === 0 && has(dir.out, '2 plan file(s)'));
   ok('a non-plan .json is never loaded', !has(drv(d, ['load', 'docs/plans']).out, 'notes.json'));
-}
+});
 
 // ------------------------------------------------------------ list and status
 // list filters by status, scope and plan; status reports the open and unsettled.
 say('list filters the gap register and status reports the open ones');
-{
+sect(() => {
   const d = planBox('listfilt', '# p\n\n## What is open\n\nThe retry limit is TBD.\nThe upload cap is TBD too.\n');
   drv(d, ['scan']);
   const gs = gapsOf(d);
@@ -1332,12 +1363,12 @@ say('list filters the gap register and status reports the open ones');
   const st = drv(d, ['status']).out;
   ok('status names the in-scope unanswered gap', has(st, g0) && has(st, 'in scope and still unanswered'));
   ok('status names the dropped gap in the count', has(st, 'dropped=1'));
-}
+});
 
 // --------------------------------------------------------------- render --plan
 // render can emit just the settled decisions for one plan, as a table to paste.
 say('render --plan prints the settled table for one plan');
-{
+sect(() => {
   const d = planBox('renderplan', '# the plan\n\n## What is open\n\nThe retry limit is TBD.\nThe upload cap is TBD too.\n');
   drv(d, ['scan']);
   const gs = gapsOf(d);
@@ -1347,13 +1378,13 @@ say('render --plan prints the settled table for one plan');
   for (const x of gs) { if (x.id === g0) continue; drv(d, ['set', x.id, 'status=dropped']); }
   const out = drv(d, ['render', '--plan', 'docs/plan.md']);
   ok('render --plan emits the decision table', out.code === 0 && has(out.out, '| Decision | Choice |'));
-}
+});
 
 // ----------------------------------------------------- a long decision is interned
 // A standing decision repeated across tasks is stored once and referenced by a
 // hash, so the register does not carry 413 KB of byte-identical text.
 say('a repeated long decision is interned, not duplicated');
-{
+sect(() => {
   const d = sandbox('intern');
   const long = 'A standing decision about the retry behaviour that is deliberately long enough that interning it once is cheaper than repeating it inline in every single task record that must obey it.';
   drv(d, ['task', 'add'], { stdin: JSON.stringify([
@@ -1367,12 +1398,12 @@ say('a repeated long decision is interned, not duplicated');
      !(r.tasks || [])[0].decisions[0].includes('standing decision') && /^@[0-9a-f]{12}$/.test((r.tasks || [])[0].decisions[0]));
   ok('the brief resolves the reference back to the real words',
      has(drv(d, ['brief', 't1', '--stdout']).out, 'standing decision about the retry'));
-}
+});
 
 // ---------------------------------------------------------------- brief --all
 // brief --all rewrites every open task's brief; an unchanged one writes nothing.
 say('brief --all rewrites the open briefs and says which changed');
-{
+sect(() => {
   const d = box('briefall');
   drv(d, ['brief', 't1']);
   drv(d, ['chip', 't1', '--id', 'chip-t1']);
@@ -1380,12 +1411,12 @@ say('brief --all rewrites the open briefs and says which changed');
   const out = drv(d, ['brief', '--all']);
   ok('brief --all checks the open briefs in', out.code === 0 && has(out.out, 'brief(s) checked in'));
   ok('previously-written briefs are recognised as current', has(out.out, 'already current'));
-}
+});
 
 // ------------------------------------------------------------------ whoami
 // whoami --session reads one session's name from the registry.
 say('whoami --session reads a name from the local session registry');
-{
+sect(() => {
   const d = bare('whoamisession');
   const sess = path.join(d, 'home/.claude/sessions');
   fs.mkdirSync(sess, { recursive: true });
@@ -1402,12 +1433,12 @@ say('whoami --session reads a name from the local session registry');
   process.env.HOME = old;
   ok('whoami --session names the session', res.code === 0 && has(res.out, 'the-boss'));
   ok('an unknown session id is a clean error', missing.code !== 0 && has(missing.out, 'no live session'));
-}
+});
 
 // -------------------------------------------------------------- ingest reclean
 // A message recovered before the wrapper was stripped can be re-derived.
 say('ingest --reclean re-derives entries already stored');
-{
+sect(() => {
   const d = box('reclean');
   const fx = fs.mkdtempSync(path.join(os.tmpdir(), 'orch-fx-reclean-'));
   const body = 't1 is done.\n' + Array.from({ length: 40 }, (_, i) => `LINE ${i}: ` + 'detail '.repeat(9)).join('\n') +
@@ -1422,24 +1453,24 @@ say('ingest --reclean re-derives entries already stored');
   const rc = drv(d, ['ingest', '--from', fx, '--reclean']);
   ok('ingest --reclean runs clean', rc.code === 0 && has(rc.out, 're-derived'));
   boxes.push(fx);
-}
+});
 
 // ----------------------------------------------------- wave across earlier rounds
 // wave names the earlier round still holding the current one up.
 say('wave says which earlier round is still blocking');
-{
+sect(() => {
   const d = box('waveblock');
   drv(d, ['chip', 't1', '--id', 'chip-t1']);
   drv(d, ['done', 't1'], { stdin: '{"verified":"ran true","outcome":"passed"}' });
   drv(d, ['landed', 't1', '--sha', 'abc']);
   const out = drv(d, ['wave', '--wave', '2']).out;
   ok('wave names the earlier unfinished round', has(out, 'Earlier rounds still holding this one up') && has(out, 't2'));
-}
+});
 
 // ---------------------------------------------------------------- events filters
 // events narrows by sequence, task and grep — and reports how many it showed.
 say('events filters by task, grep and since');
-{
+sect(() => {
   const d = box('eventsf');
   drv(d, ['task', 'add'], { stdin: JSON.stringify([{ key: 't1', title: 'first, rewritten', owns: ['src/a.py'] }]) });
   const g = drv(d, ['events', '--grep', 'rewritten']);
@@ -1474,14 +1505,14 @@ say('events filters by task, grep and since');
   ok('and so is an owed item pointed at it',
      has(drv(d, ['events', '--task', 't1', '--n', '200']).out, 'owed add'),
      drv(d, ['events', '--task', 't1', '--n', '200']).out.slice(-600));
-}
+});
 
 // Was: `lintText` names reference/plain-words.md as the authority for what it
 // refuses, and was catching eighteen of the thirty-two words that file forbids.
 // A question could reach the user saying "add a soft delete and a throttle,
 // using RBAC to gate it" and be told it passed the plain-words rules.
 say('the plain-words filter refuses every word its own reference forbids');
-{
+sect(() => {
   const d = planBox('jargondoc', '# p\n\n## What is open\n\nThe retry limit is TBD.\n');
   drv(d, ['scan']);
   const g = gapsOf(d)[0].id;
@@ -1510,21 +1541,21 @@ say('the plain-words filter refuses every word its own reference forbids');
   ok('a plain question still passes',
      has(ask('Should a student be able to hide a card they have finished with?').out, 'passes the plain-words rules'),
      ask('Should a student be able to hide a card they have finished with?').out.slice(0, 200));
-}
+});
 
 // ---------------------------------------------------- lint with nothing to say
 // lint with no question yet is a calm message, not a crash.
 say('lint says when no question has been written');
-{
+sect(() => {
   const d = planBox('lintnone', '# p\n\n## What is open\n\nThe retry limit is TBD.\n');
   drv(d, ['scan']);
   ok('lint reports no questions written', drv(d, ['lint']).code === 0 && has(drv(d, ['lint']).out, 'no questions written yet'));
-}
+});
 
 // ------------------------------------------------------- a missing task is named
 // A command that names a task that is not on the record says the list it had.
 say('a command names the task when one is missing');
-{
+sect(() => {
   const d = box('missingtask');
   const res = drv(d, ['show', 'no-such']);
   ok('show says there is no such gap', res.code !== 0 && has(res.out, 'no gap no-such'));
@@ -1532,12 +1563,12 @@ say('a command names the task when one is missing');
   drv(d, ['agent', 't1', '--name', 'peer-a']);
   const rel = drv(d, ['release', 'ghost']);
   ok('release names the task it cannot find', rel.code !== 0 && has(rel.out, 'no task "ghost"'));
-}
+});
 
 // ------------------------------------------------------------- task create/update
 // task add ignores fields it does not set, and an update keeps a task's state.
 say('task add records what it can and ignores the rest');
-{
+sect(() => {
   const d = box('taskadd');
   const out = drv(d, ['task', 'add'], { stdin: JSON.stringify([
     { key: 't1', title: 'first, rewritten', owns: ['src/a.py'], ignored: 'nope' },
@@ -1545,23 +1576,23 @@ say('task add records what it can and ignores the rest');
   ok('a re-add updates the task in place', out.code === 0 && (tasksOf(d).find((t) => t.key === 't1')?.title === 'first, rewritten'));
   ok('the update keeps unrelated state', (tasksOf(d).find((t) => t.key === 't1')?.needs || []).length === 0);
   ok('the ignored field is reported, not saved', has(out.out, 'ignored'));
-}
+});
 
 // ------------------------------------------------------------------ agent note
 // agent on a task with a need that is not on the record says so.
 say('agent points out a dependency that is not on the record');
-{
+sect(() => {
   const d = box('agentnote');
   drv(d, ['chip', 't1', '--id', 'chip-t1']);
   drv(d, ['task', 'add'], { stdin: JSON.stringify([{ key: 't1', needs: ['missing-dep'] }]) });
   const out = drv(d, ['agent', 't1', '--name', 'peer-a']);
   ok('agent flags the unresolvable need', out.code === 0 && has(out.out, 'not on record'));
-}
+});
 
 // ------------------------------------------------------------ ci, in its cover
 // Red records a defect and names the landed work it covers; skipped needs a why.
 say('ci covers red, skipped and an empty list');
-{
+sect(() => {
   const d = box('cired');
   drv(d, ['chip', 't1', '--id', 'chip-t1']);
   drv(d, ['done', 't1'], { stdin: '{"verified":"ran true","outcome":"passed"}' });
@@ -1575,12 +1606,12 @@ say('ci covers red, skipped and an empty list');
   ok('CI skipped needs and takes a why', skip.code === 0, skip.out.split('\n')[0]);
   const listEmpty = drv(d, ['ci', 'list']);
   ok('ci list reports its checkpoints', has(listEmpty.out, 'checkpoint(s)'));
-}
+});
 
 // ------------------------------------------------------------------ slot doors
 // slot status and free on an empty slot are calm; take claims it by hand.
 say('slot status and free speak plainly when nothing is held');
-{
+sect(() => {
   const d = box('slots');
   ok('slot status says nothing is held', has(drv(d, ['slot', 'status']).out, 'no slot is held'));
   ok('slot free says it was already free', has(drv(d, ['slot', 'free', 'ci']).out, 'already free'));
@@ -1588,24 +1619,24 @@ say('slot status and free speak plainly when nothing is held');
   ok('slot take claims it by hand', take.code === 0 && has(take.out, 'taken'));
   const taken = drv(d, ['slot', 'take', 'ci', '--task', 't1']);
   ok('a second take is refused', taken.code !== 0 && has(taken.out, 'held by'));
-}
+});
 
 // --------------------------------------------------------- board reports state
 // Board shows the round, open owed items, and held work that can now start.
 say('board reports the round and any held-but-freed work');
-{
+sect(() => {
   const d = box('boardstate');
   drv(d, ['owed', 'add', '--to', 't1', '--what', 'drop the shim', '--why', 'window']);
   const out = drv(d, ['board']).out;
   ok('board names the owed item', has(out, 'owed: 1 open'));
   ok('board names the round', has(out, 'round 1 of 2'));
-}
+});
 
 // ----------------------------------------------------- ingest from a transcript
 // ingest reads the transcript directory under ~/.claude/projects, and an
 // entry written from a subdirectory of the run still belongs to it.
 say('ingest finds the transcript directory and keeps a subdir-cwd line');
-{
+sect(() => {
   const d = box('ingestsub');
   // Override HOME so transcriptDir resolves to our scratch dir, and write a
   // transcript whose cwd is a subdirectory of this run.
@@ -1627,12 +1658,12 @@ say('ingest finds the transcript directory and keeps a subdir-cwd line');
   process.env.HOME = old;
   ok('ingest found the transcript directory', res.code === 0 && has(res.out, 'transcript(s)'));
   ok('the subdirectory-cwd line was kept', has(res.out, 'from a directory under this one'));
-}
+});
 
 // --------------------------------------------------------------- owed settles
 // owed done and defect fixed record a resolution.
 say('owed done and defect fixed record a resolution');
-{
+sect(() => {
   const d = box('oweddone');
   drv(d, ['owed', 'add', '--what', 'drop the shim', '--why', 'window']);
   const oid = (reg(d).owed || [])[0].id;
@@ -1640,12 +1671,12 @@ say('owed done and defect fixed record a resolution');
   const did = (reg(d).defects || []).find((x) => x.task === 't1').id;
   ok('owed done settles it', has(drv(d, ['owed', 'done', oid]).out, 'settled'));
   ok('defect fixed clears it', has(drv(d, ['defect', 'fixed', did]).out, 'marked fixed'));
-}
+});
 
 // --------------------------------------------------------- render, in its cover
 // render with nothing answered dies; a hollow "answered" is refused cleanly.
 say('render refuses an empty register and a hollow answer');
-{
+sect(() => {
   const d = planBox('rendernone', '# p\n\n## What is open\n\nThe retry limit is TBD.\n');
   drv(d, ['scan']);
   const none = drv(d, ['render']);
@@ -1654,12 +1685,12 @@ say('render refuses an empty register and a hollow answer');
   forceHollow(d, g);                       // a claim with no answer under it
   const hollow = drv(d, ['render']);
   ok('render refuses a hollow answered claim', hollow.code !== 0 && has(hollow.out, 'no answer recorded'));
-}
+});
 
 // ------------------------------------------------------ refine check, all gates
 // refine check refuses unrefined plans and a reopened gap, and reads git status.
 say('refine check names every plan still unrefined');
-{
+sect(() => {
   const d = planBox('refinecheck', '# p\n\n## What is open\n\nThe retry limit is TBD.\n');
   drv(d, ['scan']);
   const g = gapsOf(d)[0].id;
@@ -1667,12 +1698,12 @@ say('refine check names every plan still unrefined');
   drv(d, ['answer', g], { stdin: JSON.stringify({ choice: 'Store it' }) });
   const chk = drv(d, ['refine', 'check']);
   ok('refine check refuses a never-refined plan', chk.code !== 0 && has(chk.out, 'not refined'));
-}
+});
 
 // --------------------------------------------------------- graph, the collision
 // graph reports two tasks that move the same serialisation point.
 say('graph names a shared serialisation point');
-{
+sect(() => {
   const d = box('graphpoint');
   drv(d, ['task', 'add'], { stdin: JSON.stringify([
     { key: 't2', serialises: ['alembic-head'] },
@@ -1682,14 +1713,14 @@ say('graph names a shared serialisation point');
   ]) });
   const out = drv(d, ['graph']);
   ok('graph names the shared point', out.code !== 0 && has(out.out, 'serialisation point'));
-}
+});
 
 // Was: `covers` was every landed task in the round, resolved when the checkpoint
 // was filed — so a task that landed WHILE CI was running was written down as
 // proven by a run that never contained its code. Under ordinary use (land, kick
 // CI, land again, record) that is not a risk, it is what happens.
 say('a checkpoint proves only the work the run actually contained');
-{
+sect(() => {
   const d = box('cisha');
   const git = (...a) => execFileSync('git', ['-c', 'user.email=a@b.c', '-c', 'user.name=a', ...a],
     { cwd: d, encoding: 'utf8' }).trim();
@@ -1711,13 +1742,13 @@ say('a checkpoint proves only the work the run actually contained');
   ok('and not what landed after it', !(cp.covers || []).includes('t2'), JSON.stringify(cp.covers));
   ok('and it says so rather than staying quiet',
      has(out.out, 'NOT covered') && has(out.out, 't2'), out.out);
-}
+});
 
 // Was: `landed` checked unmet needs and nothing else, so a task could land on
 // top of its own open guard failure — and a clean guard wrote nothing at all, so
 // afterwards there was no way to ask whether one had ever run.
 say('nothing lands over a known break, and a guard leaves a trace');
-{
+sect(() => {
   const d = box('landguard');
   drv(d, ['chip', 't1', '--id', 'c1']);
   drv(d, ['done', 't1'], { stdin: '{"verified":"ran true","outcome":"passed"}' });
@@ -1731,24 +1762,24 @@ say('nothing lands over a known break, and a guard leaves a trace');
   const forced = drv(d, ['landed', 't1', '--sha', 'abc', '--force']);
   ok('--force lands it deliberately', forced.code === 0);
   ok('and says no guard was ever recorded', has(forced.out, 'no guard was ever recorded'), forced.out);
-}
+});
 
 // ------------------------------------------------------------- frontier, unproven
 // A landing with no CI checkpoint is reported as unproven drift.
 say('frontier reports landings beyond the last checkpoint');
-{
+sect(() => {
   const d = box('frontierunproven');
   drv(d, ['chip', 't1', '--id', 'chip-t1']);
   drv(d, ['done', 't1'], { stdin: '{"verified":"ran true","outcome":"passed"}' });
   drv(d, ['landed', 't1', '--sha', 'abc']);
   ok('frontier names the unproven landing', has(drv(d, ['frontier']).out, 'since the last CI checkpoint'));
-}
+});
 
 // Was: `unblocks N` counted every task naming this one in `needs`, whatever its
 // status — so work absorbed by `bundle` (which cancels rather than deletes) kept
 // inflating the count AND the sort that decides what to offer opening next.
 say('unblocks does not count work that has been absorbed');
-{
+sect(() => {
   const d = box('unblockdead');
   drv(d, ['task', 'add'], { stdin: JSON.stringify([
     { key: 'u1', title: 'the base', plan: 'docs/plans/p.md', needs: [], owns: ['src/u1.py'], verify: ['true'] },
@@ -1759,12 +1790,12 @@ say('unblocks does not count work that has been absorbed');
   drv(d, ['bundle', 'u1', 'u2', '--into', 'u1']);   // u2 is cancelled, absorbed into u1
   const after = drv(d, ['frontier']).out.split('\n').find((l) => l.trim().startsWith('u1'));
   ok('and stops once u2 is cancelled', after && !has(after, 'unblocks'), after);
-}
+});
 
 // ------------------------------------------------------------------ whoami here
 // whoami lists the sessions for this directory.
 say('whoami lists the sessions for this directory');
-{
+sect(() => {
   const d = bare('whoamihere');
   const sess = path.join(d, 'home/.claude/sessions');
   fs.mkdirSync(sess, { recursive: true });
@@ -1775,36 +1806,36 @@ say('whoami lists the sessions for this directory');
   const res = drv(d, ['whoami']);
   process.env.HOME = old;
   ok('whoami lists only the sessions in this directory', has(res.out, 'Live sessions in this directory') && has(res.out, 'boss-a') && !has(res.out, 'boss-b'));
-}
+});
 
 // --------------------------------------------------- brief with a context it owns
 // A brief says when a context path is also one of the files it may change.
 say('brief marks a context it also owns as enditable');
-{
+sect(() => {
   const d = box('briefcontext');
   drv(d, ['task', 'add'], { stdin: JSON.stringify([
     { key: 't1', context: [{ path: 'src/a.py', what: 'the helper' }], owns: ['src/a.py'] },
   ]) });
   ok('brief resolves a context path it also owns', drv(d, ['brief', 't1', '--stdout']).code === 0 &&
      !/\(read it, do not change it/.test(drv(d, ['brief', 't1', '--stdout']).out));
-}
+});
 
 // ---------------------------------------------------------------- doctor points
 // A serialisation point named by only one task gates nothing; doctor says so.
 say('doctor reports a serialisation point nobody shares');
-{
+sect(() => {
   const d = box('doctorlone');
   drv(d, ['task', 'add'], { stdin: JSON.stringify([{ key: 't1', serialises: ['alembic-head'] }]) });
   const out = drv(d, ['doctor']);
   ok('doctor names the lone serialisation point', has(out.out, 'only one task names') && has(out.out, 'alembic-head'));
-}
+});
 
 // Was: doctor computed exactly this and then reported only the lone case — the
 // inverse question. `chip` refuses to open a second task on a point somebody
 // holds, but `task add` can widen `serialises` on a task already in flight, and
 // nothing looked afterwards.
 say('two chips may not take one serialisation point, and doctor says when they have');
-{
+sect(() => {
   const d = box('doctorshared');
   drv(d, ['chip', 't1', '--id', 'chip-t1']);
   drv(d, ['chip', 't2', '--id', 'chip-t2']);
@@ -1825,14 +1856,14 @@ say('two chips may not take one serialisation point, and doctor says when they h
   ok('doctor names the contended point', has(out.out, 'more than one chip at once'), out.out.slice(0, 400));
   ok('and names both chips holding it, whichever way it is spelled',
      has(out.out, 't1') && has(out.out, 't2') && has(out.out, 'Alembic-Head'), out.out.slice(0, 400));
-}
+});
 
 // Was: every path the register holds was resolved against whatever directory the
 // command was run from, not against the project the register describes. Point
 // --register at a project and stand somewhere else and doctor invents a "does
 // not exist" failure for every plan and context path in a perfectly sound tree.
 say('doctor judges paths against the project, not the shell');
-{
+sect(() => {
   const d = box('doctorcwd');
   drv(d, ['task', 'add'], { stdin: JSON.stringify([
     { key: 't1', context: [{ path: 'docs/plans/p.md', what: 'the plan' }] },
@@ -1842,13 +1873,13 @@ say('doctor judges paths against the project, not the shell');
   const away = drv(os.tmpdir(), ['doctor', '--register', abs]).out;
   ok('from the project root it finds every cited path', !has(here, 'does not exist'), here.slice(0, 300));
   ok('and from anywhere else it says the same thing', !has(away, 'does not exist'), away.slice(0, 300));
-}
+});
 
 // Was: a pre-flight report is an ordinary file, and nothing but a person running
 // `preflight done` folds it in. That step is required nowhere, so a report could
 // be written and simply never acted on — 25 of 53 were, on a real run.
 say('doctor names a pre-flight report nobody folded in');
-{
+sect(() => {
   const d = box('doctororphan');
   const rep = path.join(d, '.claude/orchestration/preflight/t2.json');
   fs.mkdirSync(path.dirname(rep), { recursive: true });
@@ -1857,13 +1888,13 @@ say('doctor names a pre-flight report nobody folded in');
   ok('doctor names the unfolded report',
      has(out.out, 'never folded into the record') && has(out.out, 't2'), out.out.slice(0, 300));
   ok('and it counts as a problem', out.code !== 0);
-}
+});
 
 // Some of what doctor reports is damage a bug left behind, and saying so again
 // does not clear it. Repair mends what can be mended without guessing — and
 // refuses to mend anything into the one collision this all exists to prevent.
 say('doctor can mend what it reports, and will not mend it into a collision');
-{
+sect(() => {
   const d = box('repair');
   const rep = path.join(d, '.claude/orchestration/preflight/t2.json');
   fs.mkdirSync(path.dirname(rep), { recursive: true });
@@ -1898,14 +1929,14 @@ say('doctor can mend what it reports, and will not mend it into a collision');
   ok('it refuses to leave two open tasks on one path',
      clash.code !== 0 && has(clash.out, 'claiming one path'), clash.out.slice(-400));
   ok('and wrote nothing when it refused', !tasksOf(d2).find((t) => t.key === 't2')?.preflight?.at);
-}
+});
 
 // Was: `refined` was set both by an older driver that kept no report and by this
 // one, which does. Nothing told them apart, so "the evidence predates this log"
 // read exactly like "marked refined, never actually done" — half the plans on a
 // real run were in that state and nothing said so.
 say('doctor names a plan marked refined with nothing behind it');
-{
+sect(() => {
   const d = box('doctorrefined');
   const p = path.join(d, '.claude/orchestration/register.json');
   const r = JSON.parse(fs.readFileSync(p, 'utf8'));
@@ -1914,12 +1945,12 @@ say('doctor names a plan marked refined with nothing behind it');
   const out = drv(d, ['doctor']).out;
   ok('doctor names it', has(out, 'marked refined with no report on disk') && has(out, r.plans[0].path),
      out.slice(0, 300));
-}
+});
 
 // --------------------------------------------------------------- ci next round
 // Green with open owed items warns; a green close names the next round.
 say('ci green names the next round and flags open owed items');
-{
+sect(() => {
   const d = box('cinext');
   drv(d, ['owed', 'add', '--to', 't1', '--what', 'drop the shim', '--why', 'window']);
   drv(d, ['chip', 't1', '--id', 'chip-t1']);
@@ -1931,35 +1962,35 @@ say('ci green names the next round and flags open owed items');
   const green = drv(d, ['ci', '--status', 'green', '--ref', 'run-x']);
   ok('green warns about the still-open owed item', has(green.out, 'owed item(s) still open'));
   ok('green says the round that can open next', has(green.out, 'may now be opened'));
-}
+});
 
 // ------------------------------------------------------------- digest and outstanding
 // digest and outstanding both surface what is still waiting.
 say('digest and outstanding surface the waiting work');
-{
+sect(() => {
   const d = box('digestout');
   drv(d, ['heard', 't1', '--kind', 'question', '--text', 'which settings file did you mean']);
   ok('outstanding names the question', has(drv(d, ['outstanding']).out, 'asked you something'));
   ok('digest names it too', has(drv(d, ['digest']).out, 'Waiting on you'));
-}
+});
 
 // --------------------------------------------------------- board, in its cover
 // board shows a stuck-held task and a trespass in the main checkout.
 say('board flags both stale briefs and a main-checkout trespass');
-{
+sect(() => {
   const d = box('boardtres');
   // a dirty file that a task owns is a trespass
   fs.writeFileSync(path.join(d, 'src/a.py'), 'changed\n');
   const out = drv(d, ['board']).out;
   ok('board names the trespass', has(out, 'main checkout has changes') && has(out, 'src/a.py'));
-}
+});
 
 // Was: trespass matched a dirty file against tasks of any status, so every edit
 // to a file after its task had landed was reported as a violation — and the
 // remedy it printed, "let t1 do it in its own copy", named a copy that no
 // longer exists.
 say('a file edited after its task landed is not a trespass');
-{
+sect(() => {
   const d = box('trespassdone');
   drv(d, ['chip', 't1', '--id', 'chip-t1']);
   drv(d, ['done', 't1'], { stdin: '{"commit":"abc","verified":"ran true; it said true","outcome":"passed"}' });
@@ -1968,12 +1999,12 @@ say('a file edited after its task landed is not a trespass');
   const out = drv(d, ['board']).out;
   ok('board does not call it a trespass', !has(out, 'main checkout has changes'),
      out.split('\n').filter((l) => has(l, 'src/a.py')).join(' | '));
-}
+});
 
 // -------------------------------------------------------------- slot run, wait
 // slot run takes the slot, runs a command, and frees it; wait only waits.
 say('slot run executes behind the slot and a stale holder is taken over');
-{
+sect(() => {
   const d = box('slotrun');
   const run = drv(d, ['slot', 'run', 'ci', '--', 'true']);
   ok('slot run runs the command and frees the slot', run.code === 0);
@@ -1999,7 +2030,7 @@ say('slot run executes behind the slot and a stale holder is taken over');
   ok('and none of it went through the register',
      !has(drv(d, ['events', '--n', '40']).out, 'slot'), drv(d, ['events', '--n', '40']).out.slice(0, 200));
   ok('the record still agrees', has(drv(d, ['verify']).out, 'agree exactly'));
-}
+});
 
 // Was: SKILL.md and the README both promise a holder whose process is still
 // there is waited on however long it runs — a suite that legitimately outlasts
@@ -2007,7 +2038,7 @@ say('slot run executes behind the slot and a stale holder is taken over');
 // slot exists to prevent. The waiter applied its timeout regardless, so the
 // guarantee held everywhere except the case it was written for.
 say('a slot holder that is alive is waited on past the limit, as promised');
-{
+sect(() => {
   const d = box('slotpatient');
   const lock = path.join(d, '.claude/orchestration/slots/ci.lock');
   fs.mkdirSync(lock, { recursive: true });
@@ -2018,12 +2049,12 @@ say('a slot holder that is alive is waited on past the limit, as promised');
   const waited = drv(d, ['slot', 'wait', 'ci', '--timeout', '0.01'], { timeout: 20000 });
   ok('it says it is still waiting', has(waited.out, 'still waiting, as promised'), waited.out.slice(0, 300));
   ok('and does not declare it wedged', !has(waited.out, 'Something is wedged'), waited.out.slice(0, 300));
-}
+});
 
 // --------------------------------------------------------- bundle carries a preflight
 // Bundling absorbs a member's pre-flight into the host, and says what never flew.
 say('bundle carries a member pre-flight to the host');
-{
+sect(() => {
   const d = box('bundlecarry');
   const rep = path.join(d, '.claude/orchestration/preflight/t2.json');
   fs.mkdirSync(path.dirname(rep), { recursive: true });
@@ -2033,12 +2064,12 @@ say('bundle carries a member pre-flight to the host');
   const out = drv(d, ['bundle', 't1', 't2', '--into', 't1']);
   ok('the bundle carried the pre-flight gap', has(out.out, 'carried across: 1 pre-flight gap(s)'));
   ok('and said the never-flown member', has(out.out, 'never pre-flighted'));
-}
+});
 
 // ------------------------------------------------------------- render in detail
 // A full render writes rejected alternatives, conditions and reach-back notes.
 say('render writes the rejected, carried and reach-back detail');
-{
+sect(() => {
   const d = planBox('renderdetail', '# the plan\n\n## What is open\n\nThe retry limit is TBD.\n');
   drv(d, ['scan']);
   const g = gapsOf(d)[0].id;
@@ -2052,12 +2083,12 @@ say('render writes the rejected, carried and reach-back detail');
   ok('it records the turned-down option', has(doc, 'Compute it') && has(doc, 'slow'));
   ok('it records the conditions carried', has(doc, 'keep the cache warm'));
   ok('it records the reach-back', has(doc, 'cache layer is already there'));
-}
+});
 
 // ------------------------------------------------ owed assign to finished work
 // owed assign refuses a task whose window is already shut.
 say('owed assign refuses work that is already over');
-{
+sect(() => {
   const d = box('owedshut');
   drv(d, ['owed', 'add', '--to', 't1', '--what', 'drop the shim', '--why', 'window']);
   drv(d, ['chip', 't1', '--id', 'chip-t1']);
@@ -2066,22 +2097,22 @@ say('owed assign refuses work that is already over');
   const oid = (reg(d).owed || [])[0].id;
   const res = drv(d, ['owed', 'assign', oid, '--to', 't1']);
   ok('assign to landed work is refused', res.code !== 0 && has(res.out, 'window is already shut'));
-}
+});
 
 // ------------------------------------------ brief narrows a whole-tree check
 // A pathable verify command is narrowed to the files the task actually owns.
 say('brief narrows a whole-tree linter to the owned files');
-{
+sect(() => {
   const d = box('scopetool');
   drv(d, ['task', 'add'], { stdin: JSON.stringify([{ key: 't1', verify: ['ruff .'], owns: ['src/a.py'] }]) });
   const out = drv(d, ['brief', 't1', '--stdout']);
   ok('brief rewrites the whole-tree check', has(out.out, 'ruff src/a.py'));
-}
+});
 
 // ------------------------------------------------------------- render across plans
 // render reports which plans gained a decision and which were left alone.
 say('render names the plans it touched and those it left');
-{
+sect(() => {
   const d = planBox('rendertouch', '# p\n\n## What is open\n\nThe retry limit is TBD.\n\nThe upload cap is TBD too.\n');
   drv(d, ['scan']);
   const gs = gapsOf(d);
@@ -2091,12 +2122,12 @@ say('render names the plans it touched and those it left');
   for (const x of gs) { if (x.id === g0) continue; drv(d, ['set', x.id, 'status=dropped']); }
   const out = drv(d, ['render']);
   ok('render writes the decisions file', out.code === 0 && has(out.out, 'wrote'));
-}
+});
 
 // ------------------------------------------------------- re-refinding a live task
 // refine done on a task that already exists widens it rather than resetting it.
 say('refine done widens a task that is already on the record');
-{
+sect(() => {
   const d = planBox('refineupdate', '# p\n\n## What is open\n\nThe retry limit is TBD.\n');
   drv(d, ['scan']);
   const g = gapsOf(d)[0].id;
@@ -2109,12 +2140,12 @@ say('refine done widens a task that is already on the record');
     tasks: [{ key: '1.1', title: 'wiring, wider', owns: ['src/a.js', 'src/b.js'], needs: [], verify: ['true'] }], newGaps: [] }) });
   const r2 = tasksOf(d).find((t) => t.key === '1.1');
   ok('a re-refine widens owns instead of resetting it', (r2.owns || []).includes('src/b.js'));
-}
+});
 
 // ---------------------------------------------------- digest with owed and drift
 // digest reports an open owed item and unproven landings.
 say('digest reports owed work and unproven landings');
-{
+sect(() => {
   const d = box('digestdrift');
   drv(d, ['owed', 'add', '--to', 't1', '--what', 'drop the shim', '--why', 'window']);
   drv(d, ['chip', 't1', '--id', 'chip-t1']);
@@ -2123,22 +2154,22 @@ say('digest reports owed work and unproven landings');
   const out = drv(d, ['digest']).out;
   ok('digest names the open owed item', has(out, '**Owed**'));
   ok('digest reports unproven landings', has(out, 'landing(s) since the last CI checkpoint'));
-}
+});
 
 // ------------------------------------------------------ outstanding, a report
 // outstanding names work that has reported and is waiting on the check.
 say('outstanding names reported work awaiting the check');
-{
+sect(() => {
   const d = box('outreport');
   drv(d, ['chip', 't1', '--id', 'chip-t1']);
   drv(d, ['done', 't1'], { stdin: '{"verified":"ran true","outcome":"passed"}' });
   ok('outstanding puts the report on you', has(drv(d, ['outstanding']).out, 'waiting on your check'));
-}
+});
 
 // ----------------------------------------------------------- ingest wrapper note
 // ingest says when it re-derived an entry that had carried the wrapper.
 say('ingest says when an old entry still carries the wrapper');
-{
+sect(() => {
   const d = box('ingestwrap');
   const fx = fs.mkdtempSync(path.join(os.tmpdir(), 'orch-fx-wrap-'));
   const body = 't1 is done.\nTHE-CONCLUSION';
@@ -2152,47 +2183,47 @@ say('ingest says when an old entry still carries the wrapper');
   boxes.push(fx);
   const out = drv(d, ['ingest', '--from', fx]);
   ok('ingest dedupes the same message on a second pass', has(out.out, '0 new to the ledger'));
-}
+});
 
 // ------------------------------------------ graph's mid-edit and read-only notes
 // graph flags a task reading a file another task is rewriting in the same round.
 say('graph flags a task reading a file a sibling is rewriting');
-{
+sect(() => {
   const d = box('graphcontext');
   drv(d, ['task', 'add'], { stdin: JSON.stringify([
     { key: 't1', context: [{ path: 'src/b.py', what: 'the helper' }] },
   ]) });
   const out = drv(d, ['graph']);
   ok('graph names the mid-edit read', out.code !== 0 && has(out.out, 'mid-edit'));
-}
+});
 
 // --------------------------------------------------------- graph, read-only note
 // A task builds on a path it may not change, and the owner is also open.
 say('graph says when a build-on path is read-only');
-{
+sect(() => {
   const d = box('graphreadonly');
   drv(d, ['task', 'add'], { stdin: JSON.stringify([
     { key: 't1', context: [{ path: 'src/b.py', what: 'the helper' }], owns: ['src/a.py'] },
   ]) });
   const out = drv(d, ['graph']);
   ok('graph names the read-only build-on', has(out.out, 'read-only'));
-}
+});
 
 // ---------------------------------------------------------- tasks and their shape
 // task add validates a context field and refuses a malformed one.
 say('task add refuses a malformed context entry');
-{
+sect(() => {
   const d = box('taskcontext');
   const res = drv(d, ['task', 'add'], { stdin: JSON.stringify([
     { key: 'x1', title: 'x', plan: 'docs/plans/p.md', owns: ['src/z.py'], needs: [], context: ['not-an-object'] },
   ]) });
   ok('a context that is not {path, what} is refused', res.code !== 0 && has(res.out, 'context must be'));
-}
+});
 
 // --------------------------------------------------------- render, plan by plan
 // render wrote one plan's decisions and left the other alone.
 say('render touches one plan and names the other untouched');
-{
+sect(() => {
   const d = bare('rendertouch2');
   fs.mkdirSync(path.join(d, 'docs'), { recursive: true });
   fs.writeFileSync(path.join(d, 'docs/a.md'), '# a\n\n## What is open\n\nThe retry limit is TBD.\n');
@@ -2206,12 +2237,12 @@ say('render touches one plan and names the other untouched');
   const out = drv(d, ['render']);
   ok('render says the other plan was untouched', out.code === 0 && has(out.out, 'unchanged, nothing was decided for them: docs/b.md'));
   ok('render points at the touched plan', has(out.out, 'render --plan docs/a.md'));
-}
+});
 
 // ------------------------------------------------------- refine with no tasks
 // A refinement that proposes no task cannot be handed out.
 say('refine check refuses a refinement that produced no task');
-{
+sect(() => {
   const d = planBox('refinenotasks', '# p\n\n## What is open\n\nThe retry limit is TBD.\n');
   drv(d, ['scan']);
   const g = gapsOf(d)[0].id;
@@ -2220,22 +2251,22 @@ say('refine check refuses a refinement that produced no task');
   drv(d, ['refine', 'done', 'plan'], { stdin: JSON.stringify({ summary: 'ok', builtOn: [], tasks: [], newGaps: [] }) });
   const chk = drv(d, ['refine', 'check']);
   ok('refine check refuses with no task proposed', chk.code !== 0 && has(chk.out, 'no tasks proposed'));
-}
+});
 
 // ------------------------------------------- brief narrows a check in a subdir
 // A whole-tree check scoped to a subdirectory is rebased onto those paths.
 say('brief rebases a check that already runs in a subdirectory');
-{
+sect(() => {
   const d = box('scopecwd');
   drv(d, ['task', 'add'], { stdin: JSON.stringify([{ key: 't1', verify: ['ruff --directory apps/api .'], owns: ['apps/api/src/a.py'] }]) });
   const out = drv(d, ['brief', 't1', '--stdout']);
   ok('brief keeps the tool in its subdirectory', has(out.out, 'ruff --directory apps/api'));
-}
+});
 
 // -------------------------------------------------------------- defect list
 // defect list shows open defects and --all the settled ones.
 say('defect list separates open from fixed');
-{
+sect(() => {
   const d = box('defectlist');
   drv(d, ['defect', 'add', '--task', 't1', '--kind', 'bug', '--what', 'a wrong helper']);
   const did = (reg(d).defects || []).find((x) => x.task === 't1').id;
@@ -2243,20 +2274,20 @@ say('defect list separates open from fixed');
   drv(d, ['defect', 'fixed', did]);
   ok('defect list hides a fixed one', !has(drv(d, ['defect', 'list']).out, did));
   ok('defect list --all shows it again', has(drv(d, ['defect', 'list', '--all']).out, did));
-}
+});
 
 // ----------------------------------------------------------------- the real corpus
 // Everything else in this file was written to satisfy the check it feeds. This
 // was not: it is a real run's record and register, trimmed but not invented.
 say('verify is green on a recorded run nobody made up');
-{
+sect(() => {
   const d = corpusBox('corpus');
   const out = drv(d, ['verify']);
   ok('the record replays to the register exactly', out.code === 0 && has(out.out, 'agree exactly'),
      out.out.split('\n').slice(0, 3).join(' '));
   ok('and it is a run of some size', tasksOf(d).length >= 20 &&
      readIf(path.join(d, '.claude/orchestration/events.jsonl')).split('\n').filter(Boolean).length >= 400);
-}
+});
 
 
 // ============================================================================
@@ -2266,7 +2297,7 @@ say('verify is green on a recorded run nobody made up');
 // ============================================================================
 
 // ------------------------------------------------- ownership on the UPDATE path
-{
+sect(() => {
   say('task add re-checks ownership when an update widens owns');
   const d = box('ownupd');
   // was: `if (at >= 0) continue` skipped the check for every update, so an
@@ -2302,10 +2333,10 @@ say('verify is green on a recorded run nobody made up');
   ok('an unrelated edit on top of an existing collision is not blocked', r5.code === 0, r5.out);
   const r6 = drv(d, ['task', 'add'], { stdin: JSON.stringify({ key: 't1', owns: ['src/a.py', 'src/b.py'] }) });
   ok('and re-stating the same owns unchanged is not a new claim', r6.code === 0, r6.out);
-}
+});
 
 // ------------------------------------------- a path in a pre-flight is a path
-{
+sect(() => {
   say('preflight done refuses prose where a path belongs');
   const d = box('pfpath');
   const rep = path.join(d, '.claude/orchestration/preflight');
@@ -2338,9 +2369,9 @@ say('verify is green on a recorded run nobody made up');
 
   const b = drv(d, ['preflight', 'brief', 't1']);
   ok('and the generated brief says what a path is', has(b.out, 'bare') && has(b.out, 'repository-relative'), b.out);
-}
+});
 
-{
+sect(() => {
   say('doctor names an owns entry that is not a path');
   const d = box('docpath');
   // was: nothing anywhere reported prose sitting in owns. It matches itself, so
@@ -2351,10 +2382,10 @@ say('verify is green on a recorded run nobody made up');
   const r = drv(d, ['doctor']);
   ok('doctor reports it', has(r.out, 'not a path') && has(r.out, 'the verify list itself'), r.out);
   ok('and fails on it', r.code !== 0);
-}
+});
 
 // ----------------------------------------------- amending an owed item in place
-{
+sect(() => {
   say('owed edit amends a claim that turned out wrong');
   const d = box('owededit');
   drv(d, ['owed', 'add', '--what', 'six call sites', '--why', 'needs the window', '--to', 't1']);
@@ -2380,10 +2411,10 @@ say('verify is green on a recorded run nobody made up');
   ok('owed list shows the churn rather than hiding it', has(l.out, 'amended 2'), l.out);
   const r3 = drv(d, ['owed', 'edit', 'o01', '--what', 'twelve call sites', '--why-changed', 'again']);
   ok('an amendment that changes nothing says so', has(r3.out, 'already said that'), r3.out);
-}
+});
 
 // ------------------------------------------------------- repointing a moved plan
-{
+sect(() => {
   say('a renamed plan is repointed, not appended beside itself');
   const d = box('planmv');
   // A phrase the scanner will actually catch, so the "no gap still points at
@@ -2433,10 +2464,10 @@ say('verify is green on a recorded run nobody made up');
   const r4 = drv(d, ['plan', 'rm', 'docs/plans/p-FINAL.md']);
   ok('plan rm refuses while anything still points at it', r4.code !== 0, r4.out);
   ok('and it goes with --force', drv(d, ['plan', 'rm', 'docs/plans/p-FINAL.md', '--force']).code === 0);
-}
+});
 
 // --------------------------------------------- what a checkpoint actually proves
-{
+sect(() => {
   say('a checkpoint says which work it newly proves');
   const d = box('ckpt');
   const land = (k) => { drv(d, ['landed', k]); };
@@ -2468,10 +2499,10 @@ say('verify is green on a recorded run nobody made up');
   const d2 = box('ckpt2');
   const b = drv(d2, ['task', 'add'], { stdin: JSON.stringify({ key: 'early', title: 'e', owns: ['src/e.py'] }) });
   ok('and there is no warning when the round has nothing landed yet', !has(b.out, 'joins round 1'), b.out);
-}
+});
 
 // -------------------------------------------------- the two kind vocabularies
-{
+sect(() => {
   say('say and heard name both kind vocabularies');
   const d = box('kinds');
   // was: `heard --kind question` worked and `say --kind question` did not, and
@@ -2490,10 +2521,10 @@ say('verify is green on a recorded run nobody made up');
   ok('and the error prints both vocabularies', has(r2.out, 'checkin') && has(r2.out, 'release'), r2.out);
   const r3 = drv(d, ['heard', 't1', '--kind', 'hold', '--text', 'x']);
   ok('in both directions', r3.code !== 0 && has(r3.out, 'the other direction takes'), r3.out);
-}
+});
 
 // -------------------------------------------- brief --all under a running agent
-{
+sect(() => {
   say('brief --all can be asked what it would disturb');
   const d = box('briefall');
   drv(d, ['brief', 't1']);
@@ -2513,10 +2544,10 @@ say('verify is green on a recorded run nobody made up');
   const real = drv(d, ['brief', '--all']);
   ok('the real run names the agent to message', has(real.out, 'message holder-name'), real.out);
   ok('and the brief actually moved', tasksOf(d).find((t) => t.key === 't1').briefSha !== before.briefSha);
-}
+});
 
 // ------------------------------------------ the address, and who is really there
-{
+sect(() => {
   say('agent checks the address against the task\'s worktree');
   const d = box('addr');
   const home = path.join(d, 'fakehome');
@@ -2542,7 +2573,7 @@ say('verify is green on a recorded run nobody made up');
   const r4 = drv(d, ['agent', 't1', '--name', 'anything'], { env: { HOME: path.join(d, 'no-such-home') } });
   ok('a lookup that cannot run does not block the run', r4.code === 0, r4.out);
   ok('and says it could not check', has(r4.out, 'could not check'), r4.out);
-}
+});
 
 // --------------------------------------------- the model ladder, and its traps
 // The ladder is data, and the check against it is exact string equality against
@@ -2551,7 +2582,7 @@ say('verify is green on a recorded run nobody made up');
 // away for it. The short name is still a prefix of every other Grok 4.6 row; across the models one account can see
 // there are 197 such pairs. A prefix match would read a silent downgrade as a
 // correct run, which is the failure the check exists for.
-{
+sect(() => {
   say('the model ladder, and its traps');
   const SK = path.join(path.dirname(fileURLToPath(import.meta.url)), 'claude-cursor', 'scripts');
   const M = path.join(SK, 'models.mjs');
@@ -2655,12 +2686,12 @@ say('verify is green on a recorded run nobody made up');
   ok('showing what the CLI actually printed', has(unreadable.out, 'not logged in'), unreadable.out);
   ok('and never as a node stack trace',
     !has(unreadable.out, 'at Object.') && !has(unreadable.out, 'ERR_'), unreadable.out);
-}
+});
 
 // ------------------------------------------- the launcher, and the runs it lost
 // Each case here is a way a real run was lost. The stub stands in for `agent`,
 // so the guards are exercised without a login, a network call or a billed run.
-{
+sect(() => {
   say('the launcher, and the runs it lost');
   const SK = path.join(path.dirname(fileURLToPath(import.meta.url)), 'claude-cursor', 'scripts');
   const d = bare('launch');
@@ -2819,13 +2850,13 @@ say('verify is green on a recorded run nobody made up');
   const claude = run(base('--role', 'chip', '--runner', 'claude'));
   ok('the claude runner says it has no launcher', claude.code === 2, claude.out);
   ok('and names what to record the result with', has(claude.out, 'run record'), claude.out);
-}
+});
 
 // -------------------------------------------- reading a run back out of its log
 // The shapes here are the ones a real Cursor run emits. The one that matters
 // most is a log that simply stops: a hand-written `type=="result"` parser
 // reports that as silence, and a run that died then looks like a quiet one.
-{
+sect(() => {
   say('reading a run back out of its log');
   const SK = path.join(path.dirname(fileURLToPath(import.meta.url)), 'claude-cursor', 'scripts');
   const H = path.join(SK, 'harvest.mjs');
@@ -2890,10 +2921,10 @@ say('verify is green on a recorded run nobody made up');
   const brief = execFileSync('node', [H, good, '--brief'], { encoding: 'utf8' });
   ok('the brief is small enough to actually read', Buffer.byteLength(brief) < 2048, Buffer.byteLength(brief));
   ok('and still names the failing command', has(brief, 'npm run lint'), brief);
-}
+});
 
 // ------------------------------------------------ watching a run while it runs
-{
+sect(() => {
   say('watching a run while it runs');
   const SK = path.join(path.dirname(fileURLToPath(import.meta.url)), 'claude-cursor', 'scripts');
   const FMT = path.join(SK, 'stream.mjs');
@@ -2979,11 +3010,11 @@ say('verify is green on a recorded run nobody made up');
   ok('a log still being written is followed as it grows', has(liveOut, 'still going'), liveOut);
   ok('and the watcher stops when the run does', liveCode === 0, liveCode);
   ok('reporting the end it saw', has(liveOut, 'all done'), liveOut);
-}
+});
 
 // ------------------------------------------------------- the five stages, in order
 // load → assess → refine → check → run, driven end to end against a stub agent.
-{
+sect(() => {
   say('the five stages, in order');
   const ROOT = path.dirname(fileURLToPath(import.meta.url));
   const O = path.join(ROOT, 'claude-cursor', 'orchestrate.mjs');
@@ -3191,12 +3222,12 @@ say('verify is green on a recorded run nobody made up');
   ok('once the round is fully open it stops nagging',
     !has(run(['board']).out, 'can open right now'), run(['board']).out);
   ok('and how many runs each step took', has(board.out, 'run(s)'), board.out);
-}
+});
 
 // ------------------------------------------------ one shared slot for heavy checks
 // Twelve agents each deciding to run the suite at the same moment is how a box
 // goes down. The slot makes that impossible rather than unlikely.
-{
+sect(() => {
   say('one shared slot for heavy checks');
   const ROOT = path.dirname(fileURLToPath(import.meta.url));
   const O = path.join(ROOT, 'claude-cursor', 'orchestrate.mjs');
@@ -3238,12 +3269,12 @@ say('verify is green on a recorded run nobody made up');
   ok('a claim whose process is gone is evicted', stolen.code === 0, stolen.out);
   ok('and the eviction is recorded, not silent',
     has(run(['slot', 'status']).out, 'evicted'), run(['slot', 'status']).out);
-}
+});
 
 // -------------------------------------------- the sweep before work goes out
 // Everything a step cites that can be checked without running anything. Its
 // whole value is in being run at the moment work is about to be handed out.
-{
+sect(() => {
   say('the sweep before work goes out');
   const ROOT = path.dirname(fileURLToPath(import.meta.url));
   const O = path.join(ROOT, 'claude-cursor', 'orchestrate.mjs');
@@ -3356,12 +3387,12 @@ say('verify is green on a recorded run nobody made up');
   const stale = run(['doctor']);
   ok('a brief older than the step it describes is caught', has(stale.out, 'older than the step'), stale.out);
   ok('and says to tell the agent to re-read it', has(stale.out, 're-read'), stale.out);
-}
+});
 
 // ------------------------------------------ merging, and sending the work back
 // Two steps that shared a file finally meet here. Whichever goes second
 // reconciles, and the agent that should do it is the one that wrote the branch.
-{
+sect(() => {
   say('merging, and sending the work back');
   const ROOT = path.dirname(fileURLToPath(import.meta.url));
   const O = path.join(ROOT, 'claude-cursor', 'orchestrate.mjs');
@@ -3451,7 +3482,7 @@ say('verify is green on a recorded run nobody made up');
   fs.writeFileSync(path.join(d, 'untracked-build-output'), 'x\n');
   ok('but an untracked file does not block one — git refuses by itself if it would be overwritten',
     run(['join', 'B']).code === 1, run(['join', 'B']).out);
-}
+});
 
 // ------------------------------------------- what one 47-step round found
 // Twelve plans refined at once, 47 steps, and nine defects. The two that
@@ -3460,7 +3491,7 @@ say('verify is green on a recorded run nobody made up');
 // three green ticks; and six spellings of one migration head read as six
 // different things, so the gate that exists to stop two migration-writing steps
 // opening together would have opened them.
-{
+sect(() => {
   say('what one 47-step round found');
   const ROOT = path.dirname(fileURLToPath(import.meta.url));
   const O = path.join(ROOT, 'claude-cursor', 'orchestrate.mjs');
@@ -3671,14 +3702,14 @@ say('verify is green on a recorded run nobody made up');
   ok('a models failure comes back as its own message', badModels.code === 2, badModels.out);
   ok('and never as a node stack trace',
     !has(badModels.out, 'at Object.') && !has(badModels.out, 'genericNodeError'), badModels.out);
-}
+});
 
 // ------------------------------------------ widening the round: the seven levers
 // Each case guards a place the orchestrator lost wall-clock for nothing. The
 // two that cost most were invisible from the outside: a dependent queueing
 // behind a suite it does not consume, and a plan-level requirement recorded as
 // a cross-product of step-level ones.
-{
+sect(() => {
   say('widening the round');
   const ROOT = path.dirname(fileURLToPath(import.meta.url));
   const O = path.join(ROOT, 'claude-cursor', 'orchestrate.mjs');
@@ -3987,23 +4018,320 @@ say('verify is green on a recorded run nobody made up');
     ok('nor is a url', !has(m.out, 'x.dev'), m.out);
     ok('while a real path is found', has(m.out, '1 plan(s)'), m.out);
   }
-}
+});
+
+// -------------------------------------------------- a second runner: opencode
+// Steps can run on DeepSeek V4 Flash through opencode instead of on Cursor. The
+// two share the worktree, the brief, guard/join/land and the record's shape,
+// and share nothing else: opencode's log is a different vocabulary, its address
+// is a session that does not exist until the run does, and it never says which
+// model answered.
+sect(() => {
+  say('running a round on opencode');
+  const ROOT = path.dirname(fileURLToPath(import.meta.url));
+  const O = path.join(ROOT, 'claude-cursor', 'orchestrate.mjs');
+  const MODELS = path.join(ROOT, 'claude-cursor', 'scripts', 'models.mjs');
+  const SCRIPTS = path.join(ROOT, 'claude-cursor', 'scripts');
+
+  // A registry in the shape opencode keeps at ~/.cache/opencode/models.json,
+  // so the effort check has something to read that is not the real machine's.
+  const REG = path.join(bare('ocreg'), 'models.json');
+  fs.writeFileSync(REG, JSON.stringify({
+    'opencode-go': { models: { 'deepseek-v4-flash': {
+      id: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash', reasoning: true,
+      reasoning_options: [{ type: 'effort', values: ['low', 'high', 'max'] }] } } } }));
+
+  // A table pointing at that registry, and at a stub binary.
+  const tableFor = (dir, over = {}) => {
+    const real = JSON.parse(fs.readFileSync(path.join(ROOT, 'claude-cursor', 'models.json'), 'utf8'));
+    real.runners.opencode = { ...real.runners.opencode, registry: REG, search: [dir], ...over };
+    const f = path.join(dir, 'models.json');
+    fs.writeFileSync(f, JSON.stringify(real, null, 2));
+    return f;
+  };
+
+  function box(name, steps, tiers) {
+    const d = bare(name);
+    const stub = path.join(d, 'stub');
+    fs.mkdirSync(stub, { recursive: true });
+    // Cursor's chat minter, so a cursor round still works in here.
+    fs.writeFileSync(path.join(stub, 'agent'),
+      '#!/usr/bin/env bash\necho "Created chat 11111111-2222-3333-4444-555555555555"\n', { mode: 0o755 });
+    // A stub opencode that writes a plausible log and nothing else.
+    // It reports paths under the --dir it was given, because that is what the
+    // real one does: the run happens in the step's worktree and its log is
+    // absolute. A stub that echoed its own $PWD instead would make the
+    // harvester look right while `guard` could never match a single path.
+    fs.writeFileSync(path.join(stub, 'opencode'), `#!/usr/bin/env bash
+DIR=.
+while [ $# -gt 0 ]; do case "$1" in --dir) DIR=$2; shift 2 ;; *) shift ;; esac; done
+echo '{"type":"step_start","timestamp":1000,"sessionID":"ses_STUB","part":{"type":"step-start"}}'
+echo '{"type":"tool_use","timestamp":1500,"sessionID":"ses_STUB","part":{"type":"tool","tool":"write","state":{"status":"completed","input":{"filePath":"'"$DIR"'/src/a.ts","content":"one\\ntwo"},"metadata":{"filepath":"'"$DIR"'/src/a.ts"}}}}'
+echo '{"type":"tool_use","timestamp":1800,"sessionID":"ses_STUB","part":{"type":"tool","tool":"bash","state":{"status":"completed","input":{"command":"false"},"metadata":{"exit":3,"output":"nope"}}}}'
+echo '{"type":"text","timestamp":2000,"sessionID":"ses_STUB","part":{"type":"text","text":"done"}}'
+echo '{"type":"step_finish","timestamp":3000,"sessionID":"ses_STUB","part":{"type":"step-finish","reason":"stop","tokens":{"total":100,"input":80,"output":20,"reasoning":0,"cache":{"read":0,"write":0}},"cost":0.001}}'
+`, { mode: 0o755 });
+    const wts = path.join(d, 'wts');
+    fs.mkdirSync(wts, { recursive: true });
+    const table = tableFor(stub);
+    const env = { ...process.env, PATH: stub + path.delimiter + process.env.PATH,
+                  CURSOR_ORCH_WT: wts, CURSOR_ORCH_MODELS: table };
+    const run = (args, input) => {
+      try { return { code: 0, out: execFileSync('node', [O, ...args], { cwd: d, encoding: 'utf8', input, env, stdio: ['pipe', 'pipe', 'pipe'] }) }; }
+      catch (e) { return { code: e.status ?? -1, out: String(e.stdout || '') + String(e.stderr || '') }; }
+    };
+    const git = (args, cwd = d) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] });
+    git(['init', '-q', '-b', 'main']);
+    git(['config', 'user.email', 'ci@example.invalid']);
+    git(['config', 'user.name', 'ci']);
+    fs.mkdirSync(path.join(d, 'docs'), { recursive: true });
+    fs.mkdirSync(path.join(d, 'src'), { recursive: true });
+    fs.writeFileSync(path.join(d, 'docs', '1-a.md'), '# A\n');
+    for (const f of ['a', 'b']) fs.writeFileSync(path.join(d, 'src', f + '.ts'), 'orig\n');
+    git(['add', '-A']); git(['commit', '-qm', 'init']);
+    run(['load', 'docs']);
+    if (steps) run(['step', 'add'], JSON.stringify(steps));
+    if (tiers) run(['assess', 'propose'], JSON.stringify(tiers));
+    return { d, run, git, wts, env, table, stub };
+  }
+  const STEP = [{ key: 'S-1', title: 'one', plan: 'docs/1-a.md', owns: ['src/a.ts'], verify: ['true'] }];
+  const TIER = [{ key: 'S-1', tier: 'medium', why: 'test' }];
+
+  // --- the ladder: one model, and a tier is an effort ---------------------
+  {
+    const b = box('oc-ladder', STEP, TIER);
+    const mrun = (args) => {
+      try { return { code: 0, out: execFileSync('node', [MODELS, ...args], { cwd: b.d, encoding: 'utf8', env: b.env, stdio: ['pipe', 'pipe', 'pipe'] }) }; }
+      catch (e) { return { code: e.status ?? -1, out: String(e.stdout || '') + String(e.stderr || '') }; }
+    };
+    // Cursor's rows are untouched by any of this.
+    ok('the cursor ladder still resolves a tier to a model',
+      mrun(['resolve', 'high']).out.startsWith('cursor-grok-4.6-high'), mrun(['resolve', 'high']).out);
+    const low = mrun(['resolve', '--runner', 'opencode', 'composer']);
+    ok('an opencode tier resolves to the one model and an effort',
+      low.out.includes('opencode-go/deepseek-v4-flash') && low.out.trim().endsWith('low'), low.out);
+    // The flag's value is not the positional. Reading it as one resolved the
+    // tier "opencode", which is not a tier.
+    const xh = mrun(['resolve', '--runner', 'opencode', 'xhigh']);
+    ok('and the flag value is not mistaken for the tier', xh.out.trim().endsWith('max'), xh.out);
+    ok('a role resolves the same as the tier it names',
+      mrun(['resolve', '--runner', 'opencode', 'chip']).out.trim().endsWith('high'), mrun(['resolve', '--runner', 'opencode', 'chip']).out);
+    const eff = mrun(['efforts', '--runner', 'opencode']);
+    ok('efforts says what the model accepts', has(eff.out, 'low, high, max'), eff.out);
+    ok('and that a run cannot be verified afterwards', has(eff.out, 'the log does not name the model'), eff.out);
+    ok('and says which tiers collapse into one effort',
+      has(eff.out, 'composer and low are the same effort'), eff.out);
+  }
+
+  // --- an effort the model does not accept is refused before it is billed --
+  // `opencode run --variant nonsense` runs a normal turn and reports nothing,
+  // so a typo would cost the reasoning the tier was chosen for and nothing
+  // would say so. The registry is the only thing that can catch it.
+  {
+    const b = box('oc-badeffort', STEP, TIER);
+    const t = JSON.parse(fs.readFileSync(b.table, 'utf8'));
+    t.runners.opencode.efforts.xhigh = 'minimal';   // valid for other models, not this one
+    fs.writeFileSync(b.table, JSON.stringify(t, null, 2));
+    let out = '', code = 0;
+    try { out = execFileSync('node', [MODELS, 'resolve', '--runner', 'opencode', 'xhigh'], { cwd: b.d, encoding: 'utf8', env: b.env, stdio: ['pipe', 'pipe', 'pipe'] }); }
+    catch (e) { code = e.status; out = String(e.stdout || '') + String(e.stderr || ''); }
+    ok('an effort this model does not accept is refused', code === 2, String(code));
+    ok('and it says what the model does accept', has(out, 'low, high, max'), out);
+    ok('and why it is refused here rather than at run time',
+      has(out, 'accepted in silence'), out);
+  }
+
+  // --- choosing the runner ------------------------------------------------
+  {
+    const b = box('oc-choose', STEP, TIER);
+    ok('cursor is the default, and says nothing has chosen',
+      has(b.run(['runner']).out, 'nothing has chosen yet'), b.run(['runner']).out);
+    const used = b.run(['runner', 'use', 'opencode']);
+    ok('a runner can be chosen', used.code === 0 && has(used.out, 'runs on opencode'), used.out);
+    ok('and choosing it states that runs will be unverified',
+      has(used.out, 'marked unverified'), used.out);
+    ok('an unknown runner is refused', b.run(['runner', 'use', 'nonsense']).code === 2);
+    const show = b.run(['runner']);
+    ok('runner show names the one model', has(show.out, 'DeepSeek V4 Flash'), show.out);
+    ok('and prints the tier-to-effort table', has(show.out, 'xhigh') && has(show.out, 'max'), show.out);
+    // assess is where a user picks a tier, so the collapse belongs there too.
+    ok('the assess table says which tiers are the same effort',
+      has(b.run(['assess']).out, 'are the same effort'), b.run(['assess']).out);
+  }
+
+  // --- a runner whose binary is missing is refused, once ------------------
+  {
+    const b = box('oc-nobin', STEP, TIER);
+    fs.rmSync(path.join(b.stub, 'opencode'));
+    const used = b.run(['runner', 'use', 'opencode']);
+    ok('a runner that is not installed cannot be chosen', used.code === 2, used.out);
+    ok('and the reason is a sentence, not `command not found`',
+      has(used.out, 'not installed, or not where this expects it'), used.out);
+    ok('which says a terminal PATH is not this PATH',
+      has(used.out, 'non-interactive shell'), used.out);
+  }
+
+  // --- opening a step on opencode ----------------------------------------
+  {
+    const b = box('oc-open', STEP, TIER);
+    b.run(['runner', 'use', 'opencode']);
+    const open = b.run(['run', 'open', 'S-1']);
+    ok('a step opens on the one model at its tier\'s effort',
+      has(open.out, 'DeepSeek V4 Flash · high'), open.out);
+    ok('and says the record will be unverified', has(open.out, 'marked unverified'), open.out);
+    // Cursor mints a chat first because it needs an address before it has a
+    // conversation. opencode's address does not exist until the run does.
+    ok('no chat is minted, because the session comes out of the run',
+      has(open.out, 'opencode mints one'), open.out);
+    ok('and the launcher line names the runner', has(open.out, '--runner opencode'), open.out);
+    ok('and carries no --chat', !has(open.out, '--chat'), open.out);
+  }
+
+  // --- the launcher, end to end against the stub --------------------------
+  {
+    const b = box('oc-run', STEP, TIER);
+    b.run(['runner', 'use', 'opencode']);
+    b.run(['run', 'open', 'S-1']);
+    const wt = path.join(b.wts, path.basename(b.d) + '-wt-S-1');
+    let out = '', code = 0;
+    try {
+      out = execFileSync('bash', [path.join(SCRIPTS, 'run.sh'), '--runner', 'opencode', '--role', 'chip',
+        '--tier', 'medium', '--key', 'S-1', '--workspace', wt, '--prompt-file', '.claude/orch/briefs/S-1.md', '--quiet'],
+        { cwd: b.d, encoding: 'utf8', env: b.env, stdio: ['pipe', 'pipe', 'pipe'] });
+    } catch (e) { code = e.status; out = String(e.stdout || '') + String(e.stderr || ''); }
+    ok('run.sh hands an opencode run to its own launcher', code === 0, out);
+    ok('which reports the model asked for and the effort',
+      has(out, 'DeepSeek V4 Flash') && has(out, 'effort: high'), out);
+    ok('and says plainly that this is not a verified fact',
+      has(out, 'asked for rather than what was verified'), out);
+    ok('the session is reported, since nothing else knows it', has(out, 'ses_STUB'), out);
+    const status = readIf(path.join(b.d, '.claude', 'orch', 'runs', 'S-1.status'));
+    ok('the status file is written in the same shape as cursor\'s',
+      status.startsWith('exit 0\tpassed\tS-1\t'), status);
+    // The record, harvested by the right harvester.
+    const rec = b.run(['run', 'record', 'S-1', '--log', '.claude/orch/logs/S-1.jsonl']);
+    ok('run record routes to the opencode harvester', rec.code === 0, rec.out);
+    const filed = JSON.parse(readIf(path.join(b.d, '.claude', 'orch', 'runs', 'S-1', '1.json')));
+    ok('the record keeps the shape everything downstream reads',
+      filed.outcome === 'passed' && Array.isArray(filed.files) && Array.isArray(filed.commands), JSON.stringify(filed).slice(0, 200));
+    ok('and says the model was not verified', filed.modelVerified === false, String(filed.modelVerified));
+    ok('and records what was asked for, not what answered',
+      filed.model === 'opencode-go/deepseek-v4-flash' && filed.effort === 'high', JSON.stringify([filed.model, filed.effort]));
+    ok('the session is on the record, so a send-back can resume it',
+      filed.session === 'ses_STUB', String(filed.session));
+    // Paths in an opencode log are absolute and belong to the worktree.
+    // Relativised against anything else, `guard` cannot match them at all.
+    ok('a file it wrote is recorded relative to the worktree',
+      filed.files.length === 1 && filed.files[0].path === 'src/a.ts', JSON.stringify(filed.files));
+    ok('a failed command keeps its exit code',
+      filed.commands.some((c) => c.exitCode === 3), JSON.stringify(filed.commands));
+    ok('tokens and cost are kept, which cursor\'s log has no values for',
+      filed.usage.total === 100 && filed.usage.cost === 0.001, JSON.stringify(filed.usage));
+    // And the send-back resumes the session rather than a chat.
+    const sb = b.run(['sendback', 'S-1', '--why', 'try again']);
+    ok('sendback resumes the opencode session', has(sb.out, '--session ses_STUB'), sb.out);
+    ok('with the model and effort it ran on', has(sb.out, '--variant high'), sb.out);
+    ok('and not with cursor\'s resume flag', !has(sb.out, '--resume'), sb.out);
+  }
+
+  // --- a provider that never answers is stopped, not waited on ------------
+  // Seen for real: the service accepted a request and returned nothing at all
+  // — no events, no error, empty stderr, nothing in opencode's own log — for a
+  // prompt that had answered in about a second minutes earlier, on two models
+  // at once. Without a bound the status stays `running` and the round stalls
+  // with no error anywhere, which is worse than failing.
+  {
+    const b = box('oc-timeout', STEP, TIER);
+    fs.writeFileSync(path.join(b.stub, 'opencode'), '#!/usr/bin/env bash\nsleep 60\n', { mode: 0o755 });
+    b.run(['runner', 'use', 'opencode']);
+    b.run(['run', 'open', 'S-1']);
+    const started = Date.now();
+    let out = '', code = 0;
+    try {
+      out = execFileSync('bash', [path.join(SCRIPTS, 'run-opencode.sh'), '--role', 'chip', '--tier', 'medium',
+        '--key', 'S-1', '--workspace', b.d, '--prompt-file', '.claude/orch/briefs/S-1.md', '--quiet'],
+        { cwd: b.d, encoding: 'utf8', env: { ...b.env, OPENCODE_ORCH_TIMEOUT: '3' }, stdio: ['pipe', 'pipe', 'pipe'] });
+    } catch (e) { code = e.status; out = String(e.stdout || '') + String(e.stderr || ''); }
+    const took = Date.now() - started;
+    ok('a run that never answers is stopped', code === 1, String(code) + ' ' + out);
+    ok('and stopped at the limit rather than run to completion', took < 30_000, took + 'ms');
+    ok('it says how long it waited', has(out, 'after 3s'), out);
+    ok('and that an empty log means the provider never answered',
+      has(out, 'never answering'), out);
+    ok('and offers the one-line check before spending a round',
+      has(out, 'Reply with exactly: OK'), out);
+    ok('and says how to allow longer', has(out, 'OPENCODE_ORCH_TIMEOUT'), out);
+    const status = readIf(path.join(b.d, '.claude', 'orch', 'runs', 'S-1.status'));
+    ok('the status says timeout, which a detached exit code could not',
+      status.startsWith('exit 1\ttimeout\tS-1\t'), status);
+  }
+
+  // --- the formatter reads the other vocabulary ---------------------------
+  {
+    const b = box('oc-stream', STEP, TIER);
+    const log = path.join(b.d, 'x.jsonl');
+    fs.writeFileSync(log, [
+      JSON.stringify({ type: 'step_start', timestamp: 1000, sessionID: 'ses_ABC', part: { type: 'step-start' } }),
+      JSON.stringify({ type: 'tool_use', timestamp: 4000, sessionID: 'ses_ABC', part: { type: 'tool', tool: 'bash', state: { status: 'completed', input: { command: 'make' }, metadata: { exit: 2, output: 'boom' } } } }),
+      JSON.stringify({ type: 'step_finish', timestamp: 9000, sessionID: 'ses_ABC', part: { reason: 'stop', tokens: { total: 42 }, cost: 0.5 } }),
+    ].join('\n') + '\n');
+    const outp = execFileSync('node', [path.join(SCRIPTS, 'stream.mjs'), '--runner', 'opencode', '--key', 'S-1'],
+      { input: fs.readFileSync(log), encoding: 'utf8' });
+    ok('the formatter reads an opencode log', has(outp, 'ses_ABC'), outp);
+    ok('a failed command is marked as failed', has(outp, '✗') && has(outp, 'make'), outp);
+    ok('with its exit code and output', has(outp, 'exit 2') && has(outp, 'boom'), outp);
+    // opencode stamps `timestamp`, cursor `timestamp_ms`. Reading only the
+    // second made every line 00:00, which is what the column is for.
+    ok('elapsed time comes off opencode\'s own clock', has(outp, '00:08'), outp);
+  }
+
+  // --- and a cursor round is entirely unaffected --------------------------
+  {
+    const b = box('oc-cursor-intact', STEP, TIER);
+    const open = b.run(['run', 'open', 'S-1']);
+    ok('a cursor step still mints a chat', has(open.out, '11111111-2222-3333-4444-555555555555'), open.out);
+    ok('and still names a cursor model', has(open.out, 'Cursor Grok 4.6 Medium'), open.out);
+    ok('and its launcher line still carries --chat', has(open.out, '--chat'), open.out);
+  }
+});
 
 // ---------------------------------------------------------------------- report
+// Run the slice this process was given. A case that throws is one failure, not
+// the end of the sweep - the rest still run, and the count below still notices
+// the checks the dead case never reached.
+let ran = 0;
+for (let i = 0; i < cases.length; i++) {
+  if (SHARD && i % SHARD.n !== SHARD.i) continue;
+  if (ONLY && !cases[i].label.includes(ONLY)) continue;
+  ran++;
+  if (cases[i].label) console.log('\n· ' + cases[i].label);
+  try { cases[i].fn(); }
+  catch (e) { failures.push('the case "' + cases[i].label + '" threw\n      ' + String((e && e.stack) || e)); }
+}
+
 if (!KEEP) for (const d of boxes) { try { fs.rmSync(d, { recursive: true, force: true }); } catch { /* gone */ } }
 else console.log('\nsandboxes kept: ' + boxes.join('\n                '));
 
-// The count is an assertion too. Without it a whole block can stop executing —
-// an exception thrown before its first `ok`, a case quietly commented out — and
+// The count is an assertion too. Without it a whole block can stop executing -
+// an exception thrown before its first `ok`, a case quietly commented out - and
 // the suite still ends on "all green", because green is only ever measured
-// against however many checks happened to run.
-const EXPECTED = 780;   // every check above counts; raise it deliberately when you add one
+// against however many checks happened to run. Under a shard the total is the
+// runner's to check, since no one process sees them all.
+const EXPECTED = 835;   // every check above counts; raise it deliberately when you add one
+const total = pass + failures.length;
+const partial = Boolean(SHARD || ONLY);
+
+// One line the runner can parse, so a shard's counts survive its own output.
+if (REPORT_JSON) {
+  process.stdout.write('\n__SWEEP__' + JSON.stringify({ pass, ran, cases: cases.length, failures }) + '\n');
+  process.exit(failures.length ? 1 : 0);
+}
 
 console.log('\n' + '-'.repeat(60));
-if (pass + failures.length !== EXPECTED)
-  failures.push('the suite ran ' + (pass + failures.length) + ' checks, not ' + EXPECTED +
+if (!partial && total !== EXPECTED)
+  failures.push('the suite ran ' + total + ' checks, not ' + EXPECTED +
     '\n      A block stopped part way, or a check was added without updating EXPECTED.');
-if (!failures.length) { console.log(pass + ' checks, all green.'); process.exit(0); }
+if (!failures.length) { console.log(pass + ' checks, all green' + (partial ? ' (' + ran + ' of ' + cases.length + ' cases).' : '.')); process.exit(0); }
 console.log(pass + ' passed, ' + failures.length + ' FAILED:');
 for (const f of failures) console.log('  ✗ ' + f);
 process.exit(1);

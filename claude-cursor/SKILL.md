@@ -1,13 +1,13 @@
 ---
 name: claude-cursor
-description: Run an implementation end to end in six stages — load the plans, map which of them touch which files so the round can be made wide before anything runs, judge how hard each step is and pick a model for it, refine away the ambiguity, check that nothing collides, then run every step that can run at once. Every step that can run is launched in the same round on its own agent; only a dependency that is not yet on the main line or a serialisation point that open work is already moving holds one back. A dependency counts the moment it has merged, not once its suite is green. Two steps owning the same file run together and reconcile at the merge, because each builds in its own worktree. Agents execute on the Cursor CLI (`agent`) or as Claude Code subagents. Use when asked to orchestrate a plan, run an implementation, hand the building work to Cursor agents, run steps in parallel, drive work in parallel worktrees, pick models per step, or take a written plan through to merged code.
+description: Run an implementation end to end — ask whether to build on Cursor or on DeepSeek first, load the plans, map which of them touch which files so the round can be made wide before anything runs, judge how hard each step is and pick a model or an effort for it, refine away the ambiguity, check that nothing collides, then run every step that can run at once. Every step that can run is launched in the same round on its own agent; only a dependency that is not yet on the main line or a serialisation point that open work is already moving holds one back. A dependency counts the moment it has merged, not once its suite is green. Two steps owning the same file run together and reconcile at the merge, because each builds in its own worktree. Agents execute on the Cursor CLI (`agent`), on DeepSeek V4 Flash through opencode, or as Claude Code subagents. Use when asked to orchestrate a plan, run an implementation, hand the building work to Cursor or DeepSeek agents, choose which model or CLI builds a round, run steps in parallel, drive work in parallel worktrees, pick models per step, or take a written plan through to merged code.
 allowed-tools: Bash, Read, Write, Edit, Grep, Glob, AskUserQuestion, TodoWrite
 ---
 
-# Six stages
+# The stages
 
 ```
-load  →  map  →  assess  →  refine  →  check  →  run
+runner  →  load  →  map  →  assess  →  refine  →  check  →  run
 ```
 
 Everything is one command. Run them all from the project root.
@@ -74,7 +74,32 @@ Up to twelve agents in flight is verified clean; the ceiling is memory, not the
 API. Heavy checks inside those agents go through `slot`, so twelve suites queue
 instead of colliding.
 
-## Before anything
+## 0. Ask which runner, before anything else
+
+Steps run on one of two CLIs, and the choice is made once for the whole round —
+after that it is automated, so there is no later moment to ask.
+
+**Put this to the user before `load`:**
+
+> **Which should build this — Cursor, or DeepSeek?**
+>
+> · **Cursor** — five models, weakest to strongest. What actually answered is
+>   read out of each run and checked, so a silent downgrade is caught.
+> · **DeepSeek** — one model, and the tier sets how hard it thinks. Cheaper and
+>   faster. Nothing records which model answered, so a silent downgrade would
+>   not be caught.
+
+Then set it:
+
+```bash
+node $ORCH runner use cursor      # or: opencode
+node $ORCH runner                 # what this round is on, and what that means
+```
+
+`runner use` refuses a runner whose binary it cannot find, and says so before a
+round is built on it rather than once per step inside a backgrounded run.
+
+### Cursor
 
 ```bash
 agent status                    # not logged in → stop, ask the user to run `agent login`
@@ -86,6 +111,81 @@ If the ladder has drifted from what the account can actually run:
 ```bash
 node $ORCH models sync
 ```
+
+### DeepSeek, through opencode
+
+```bash
+node $ORCH runner use opencode
+node claude-cursor/scripts/models.mjs efforts --runner opencode
+```
+
+One model — **DeepSeek V4 Flash** (`opencode-go/deepseek-v4-flash`) — so a tier
+does not choose a model, it chooses the effort:
+
+| tier | effort | for |
+|---|---|---|
+| `composer` | `low` | mechanical work, no judgement |
+| `low` | `low` | small, well-specified |
+| `medium` | `high` | ordinary feature work |
+| `high` | `high` | the default |
+| `xhigh` | `max` | security, concurrency, wide blast radius |
+
+`composer` and `low` are the same effort, and so are `medium` and `high`. That
+collapse is real — moving a step between them changes nothing — and `assess`
+prints it rather than leaving it to be discovered.
+
+Two things are worth knowing before choosing this runner:
+
+- **Nothing says which model answered.** opencode's JSON names the model
+  nowhere, so a run is recorded as what was *asked for* and carries
+  `modelVerified: false`. With one model there is nothing to confuse it with,
+  but a silent downgrade would still not be caught. Cursor's runs are checked;
+  these are not.
+- **An effort the model does not accept is thrown away in silence.**
+  `opencode run --variant nonsense` runs a normal turn and reports nothing. So
+  the effort is checked against opencode's own registry *before* the run —
+  `deepseek-v4-flash` accepts `low`, `high`, `max`, and nothing else, and a
+  ladder naming anything else is refused rather than billed for.
+
+- **A run that never answers is stopped.** The provider has been seen accepting
+  a request and returning nothing at all — no events, no error, empty stderr,
+  nothing in opencode's own log — for a prompt that had answered in about a
+  second minutes earlier, on two models at once. Unbounded, that leaves the
+  status on `running` and stalls the round with no error anywhere, which is
+  worse than failing. Every run is capped at 30 minutes; raise it with
+  `OPENCODE_ORCH_TIMEOUT=<seconds>`, and a run that hits the cap is recorded as
+  `timeout` rather than as a run that died.
+
+`opencode` is not on a non-interactive `PATH` — the login profile puts it there
+— so the launcher resolves it rather than assuming. Being able to run it in a
+terminal is not the same as this being able to.
+
+**Before committing a round to this runner, check the provider answers at all:**
+
+```bash
+~/.opencode/bin/opencode run -m opencode-go/deepseek-v4-flash --format json "Reply with exactly: OK"
+```
+
+A second or two and three JSON events is healthy. Silence is the failure above,
+and it is worth finding before twelve agents are launched into it.
+
+### What is the same either way
+
+The worktree, the branch, the brief, `guard`, `join`, `land`, the slot, and the
+record's shape. A step does not know which runner it is on, and neither does
+anything downstream of `run record`.
+
+### What differs
+
+| | Cursor | opencode |
+|---|---|---|
+| the conversation's address | a chat, minted before the run | a session, read out of the run's own log |
+| resuming it | `agent --resume <uuid>` | `opencode run --session <id>` |
+| the model that answered | checked against the ladder | not recorded anywhere |
+| tokens and cost | not in the log | in every `step_finish` |
+
+`run open` prints the right launcher line for whichever is chosen, and
+`sendback` prints the right resume line. Neither is something to remember.
 
 ## 1. Load the plans
 

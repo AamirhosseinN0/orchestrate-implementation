@@ -33,5 +33,46 @@
     "refine": "high",
     "preflight": "composer",
     "chip": "high"
+  },
+
+  "_runners": [
+    "A second way to execute a step. The ladder above is Cursor's and is left",
+    "exactly as it was: the two are separate things that happen to share a tier",
+    "vocabulary, and a row here is never compared against a row there.",
+    "",
+    "opencode runs one model — DeepSeek V4 Flash — so a tier does not choose a",
+    "model, it chooses how hard the model thinks. `efforts` maps the five tiers",
+    "onto the three the model accepts, which means composer and low are one",
+    "effort and so are medium and high. That collapse is real and is printed",
+    "rather than implied.",
+    "",
+    "`verifiable: false` is the important field. Cursor's log names the model",
+    "that answered, so a silent downgrade is caught; opencode's names nothing,",
+    "so it cannot be. With one model there is nothing to confuse it with, and",
+    "the record says what was asked for and marks itself unverified rather than",
+    "claiming a check it did not make.",
+    "",
+    "What CAN be checked is that the effort is one this model accepts. opencode",
+    "keeps its own registry at `registry` below, and an effort outside that",
+    "model's `reasoning_options` is accepted in silence by `opencode run` — so",
+    "the launcher looks it up before spending anything."
+  ],
+  "runners": {
+    "opencode": {
+      "bin": "opencode",
+      "search": ["~/.opencode/bin", "~/.local/bin"],
+      "registry": "~/.cache/opencode/models.json",
+      "provider": "opencode-go",
+      "model": "opencode-go/deepseek-v4-flash",
+      "shown": "DeepSeek V4 Flash",
+      "verifiable": false,
+      "efforts": {
+        "composer": "low",
+        "low": "low",
+        "medium": "high",
+        "high": "high",
+        "xhigh": "max"
+      }
+    }
   }
 }

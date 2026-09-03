@@ -41,6 +41,49 @@ function resolve(m, name) {
   return row;
 }
 
+// ------------------------------------------------------------ other runners
+// The ladder above is Cursor's. A second runner has its own row in `runners`
+// and is never compared against it.
+const homeOf = (p) => String(p).replace(/^~(?=\/|$)/, process.env.HOME || process.env.USERPROFILE || '~');
+const runnerOf = (m, name) => {
+  if (!name || name === 'cursor') return null;
+  const r = (m.runners || {})[name];
+  if (!r) die(`unknown runner "${name}". Known: cursor, ${Object.keys(m.runners || {}).join(', ')}`);
+  return r;
+};
+// Where the binary is. It is not on a non-interactive PATH — the login profile
+// adds it — so the places it is normally installed are tried too, and the
+// failure is a sentence rather than `command not found` from inside a launcher.
+function binOf(r) {
+  try { return execFileSync('bash', ['-c', 'command -v -- ' + JSON.stringify(r.bin)], { encoding: 'utf8' }).trim(); }
+  catch { /* not on PATH, which is the usual case */ }
+  for (const d of r.search || []) {
+    const p = path.join(homeOf(d), r.bin);
+    if (fs.existsSync(p)) return p;
+  }
+  return null;
+}
+// The efforts this model actually accepts, out of opencode's own registry.
+//
+// `opencode run --variant <anything>` is accepted in silence: a bogus one runs
+// a normal turn and reports nothing, so a typo costs the reasoning the tier was
+// chosen for and nothing says so. The vocabulary is per model and varies a lot
+// — grok-4.6 takes low/medium/high/xhigh, deepseek-v4-flash takes low/high/max,
+// and `minimal` from the CLI's own help text is not valid for either. So the
+// only defence is to look it up before spending anything.
+function effortsOf(r) {
+  const f = homeOf(r.registry || '');
+  let reg;
+  try { reg = JSON.parse(fs.readFileSync(f, 'utf8')); } catch { return null; }
+  const prov = reg[r.provider];
+  const models = prov && (prov.models || prov);
+  const id = String(r.model).split('/').pop();
+  const entry = models && models[id];
+  if (!entry) return null;
+  const opt = (entry.reasoning_options || []).find((o) => o.type === 'effort');
+  return opt ? opt.values : null;
+}
+
 // Every spelling a row answers to. `shown` is the old single-string form and is
 // still read, so a table written before this change still works.
 export const namesOf = (row) => (row.accepts && row.accepts.length ? row.accepts : [row.shown]).filter(Boolean);
@@ -97,6 +140,19 @@ function listModels() {
 
 const [cmd, ...rest] = process.argv.slice(2);
 const flag = (n) => { const i = rest.indexOf(n); return i === -1 ? null : rest[i + 1]; };
+// Arguments that are not a flag and not a flag's value. Filtering on the `--`
+// prefix alone reads `--runner opencode high` as the positional "opencode",
+// which is the flag's value wearing a tier's clothes.
+const VALUE_FLAGS = ['--runner', '--want', '--got'];
+const positionals = (() => {
+  const out = [];
+  for (let i = 0; i < rest.length; i++) {
+    if (VALUE_FLAGS.includes(rest[i])) { i++; continue; }
+    if (rest[i].startsWith('--')) continue;
+    out.push(rest[i]);
+  }
+  return out;
+})();
 const m = load();
 
 switch (cmd) {
@@ -112,10 +168,65 @@ switch (cmd) {
   }
 
   case 'resolve': {
-    const name = rest[0];
+    const name = positionals[0];
     if (!name) die('resolve needs a role or tier — try `models.mjs list`');
-    const row = resolve(m, name);
-    process.stdout.write(row.id + '\t' + namesOf(row)[0] + '\n');
+    const r = runnerOf(m, flag('--runner'));
+    // Cursor: a tier picks a model, and the name it must report comes with it.
+    if (!r) {
+      const row = resolve(m, name);
+      process.stdout.write(row.id + '\t' + namesOf(row)[0] + '\n');
+      break;
+    }
+    // Another runner: one model, so a tier picks an effort instead. Same
+    // tab-separated shape, with the effort in the third field.
+    const tier = m.roles[name] || name;
+    const effort = (r.efforts || {})[tier];
+    if (!effort) die(`runner "${flag('--runner')}" has no effort for tier "${tier}".\n` +
+      `  tiers: ${Object.keys(r.efforts || {}).join(', ')}`);
+    const allowed = effortsOf(r);
+    if (allowed && !allowed.includes(effort)) die(
+      `the ladder maps tier "${tier}" to effort "${effort}", which ${r.model} does not accept.\n` +
+      `  it accepts: ${allowed.join(', ')}\n` +
+      `  An effort this model does not know is accepted in silence and thrown away,\n` +
+      `  so this is refused here rather than billed for.`);
+    process.stdout.write(r.model + '\t' + (r.shown || r.model) + '\t' + effort + '\n');
+    break;
+  }
+
+  // Where a runner's binary is, or a sentence saying it is not installed.
+  case 'which': {
+    const r = runnerOf(m, flag('--runner') || positionals[0]);
+    if (!r) { process.stdout.write('agent\n'); break; }
+    const p = binOf(r);
+    if (!p) die(`${r.bin} is not installed, or not where this expects it.\n` +
+      `  Looked on PATH and in: ${(r.search || []).join(', ')}\n` +
+      `  A non-interactive shell does not get the login profile's PATH, so being able\n` +
+      `  to run it in a terminal is not the same as this being able to.`);
+    process.stdout.write(p + '\n');
+    break;
+  }
+
+  // What the round would run, before it runs it.
+  case 'efforts': {
+    const r = runnerOf(m, flag('--runner') || positionals[0]);
+    if (!r) die('efforts is for a non-Cursor runner — try `models.mjs list`');
+    const allowed = effortsOf(r);
+    console.log(`${r.shown || r.model}  (${r.model})`);
+    console.log(`  accepts: ${allowed ? allowed.join(', ') : '(registry not readable — nothing to check against)'}`);
+    console.log(`  verified after the run: ${r.verifiable ? 'yes' : 'no — the log does not name the model'}`);
+    console.log('\n  tier      effort');
+    for (const [t, e] of Object.entries(r.efforts || {})) {
+      const bad = allowed && !allowed.includes(e);
+      console.log('  ' + t.padEnd(10) + e + (bad ? '   ✗ not accepted by this model' : ''));
+    }
+    // The collapse is real, so it is said rather than left to be noticed.
+    const byEffort = {};
+    for (const [t, e] of Object.entries(r.efforts || {})) (byEffort[e] ||= []).push(t);
+    const shared = Object.entries(byEffort).filter(([, ts]) => ts.length > 1);
+    if (shared.length) {
+      console.log('');
+      for (const [e, ts] of shared) console.log(`  ${ts.join(' and ')} are the same effort here (${e}).`);
+    }
     break;
   }
 

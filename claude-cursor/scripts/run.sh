@@ -22,6 +22,18 @@ die() { echo "✗ $*" >&2; exit 2; }
 # variable". Every other bad input gets a sentence, so this one does too.
 need() { [ "$2" -ge 2 ] || die "$1 needs a value"; }
 
+# Another runner is handed over before this file parses anything, because the
+# parse below rejects flags it does not know and the other runner has its own
+# — `--effort`, `--session`. Deciding after parsing would refuse the arguments
+# on the way to the script that wanted them.
+for i in $(seq 1 $#); do
+  eval "arg=\${$i}"
+  if [ "$arg" = "--runner" ]; then
+    eval "val=\${$((i + 1)):-}"
+    if [ "$val" = opencode ]; then exec bash "$SELF/run-opencode.sh" "$@"; fi
+  fi
+done
+
 while [ $# -gt 0 ]; do
   case "$1" in
     --key)          need "$1" $#; KEY=$2; shift 2 ;;
@@ -49,7 +61,7 @@ if [ "$RUNNER" = claude ]; then
   echo "    node claude-cursor/orchestrate.mjs run record $KEY --json <file>" >&2
   exit 2
 elif [ "$RUNNER" != cursor ]; then
-  die "unknown runner: $RUNNER — expected cursor or claude"
+  die "unknown runner: $RUNNER — expected cursor, opencode or claude"
 fi
 
 [ -n "$KEY" ] || die "--key <name> is required — it names the log"

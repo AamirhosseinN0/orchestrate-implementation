@@ -1,0 +1,25 @@
+{
+  "_": [
+    "The words a serialisation point is spelled with, handed to every refining",
+    "agent by `refine brief`. Two steps that move the same shared thing are only",
+    "held apart when they call it the same name, so the names are fixed here",
+    "rather than invented once per plan. One round produced six spellings of the",
+    "migration head across eleven steps; nothing caught it, and check would have",
+    "opened two migration-writing steps in the same round.",
+    "",
+    "Extend per project with CURSOR_ORCH_POINTS=<file>, same shape. The two",
+    "lists are unioned, so a project adds without losing these."
+  ],
+  "points": [
+    "migration head",
+    "lockfile",
+    "workspace list",
+    "schema registry",
+    "capability registry",
+    "route table",
+    "ci workflow",
+    "generated client",
+    "env schema",
+    "public exports"
+  ]
+}

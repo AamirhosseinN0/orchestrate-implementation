@@ -91,7 +91,7 @@ The ladder, weakest to strongest:
 | `composer` | Composer 2.5 | mechanical work, no judgement — a lockfile bump, a rename |
 | `low` | Cursor Grok 4.6 Low | small, well-specified, one or two files |
 | `medium` | Cursor Grok 4.6 Medium | ordinary feature work against a clear plan |
-| `high` | Cursor Grok 4.6 | the default — refining, and most steps |
+| `high` | Cursor Grok 4.6 High | the default — refining, and most steps |
 | `xhigh` | Cursor Grok 4.6 Extra High | security, concurrency, wide blast radius, anything subtle |
 
 Read the plans, then propose one row per step — the problem in a few words, the
@@ -134,8 +134,26 @@ in a 17-minute span. Starting them one at a time spends that for nothing.
 
 A refining agent writes its report to a file. `refine done` reads that file — not
 the agent's reply — because a reply goes through a context that gets compacted.
-It validates every step it finds: an `owns` entry that is prose rather than a
-path, or ownership of part of a file, is refused with the reason.
+It validates the report **whole and records it whole**: an `owns` entry that is
+prose rather than a path, ownership of part of a file, a `needs` naming something
+that is not a step, or a key another plan already holds, and nothing from that
+report is written at all.
+
+**Keys are unique across every plan in the round.** Twelve plans refined at once
+each reached for `S-1`, and a register that merged them on key alone lost eight
+steps without a word. The brief tells each agent to key from its own plan —
+`S-2.1.1`, `S-2.1.2` — and a report that reuses another plan's key is refused.
+`refine done` prints the register's total beside the report's count, which is the
+number that would have shown the loss.
+
+It also prints what the refining agent did to the plan, as a diffstat. Refining
+rewrites its plan in place, and a rewrite that breaks a repo-level lint is
+otherwise invisible.
+
+A plan that names `requires:` in its front matter has that read at `load` and put
+in front of the refining agent, along with the keys already recorded for those
+plans, so cross-plan ordering reaches `needs` instead of being derived by hand
+afterwards.
 
 `refine done` prints any question the agent could not settle from the code. **Put
 those to the user before building.** `refine check` exits 1 while one is open.
@@ -161,13 +179,21 @@ node $ORCH doctor
 ```
 
 It checks that each step's plan still exists, its dependencies are real steps,
-every `owns` entry is a path `guard` could match against a diff and sits in a
-directory that exists, every proof starts with something runnable, and every step
-has a model. It fails on the two things nothing else sees: two open steps
-claiming one path or holding one serialisation point. It also warns when a
-serialisation point is named by only one step — usually a spelling that missed
-its partner — and when a brief is older than the step it describes, because the
-agent holding it will not know.
+every `owns` entry is a path `guard` could match against a diff, every proof
+starts with something runnable, and every step has a model. It fails on the
+things nothing else sees: two open steps claiming one path or holding one
+serialisation point, and **two spellings of one serialisation point** — six names
+for one migration head across eleven steps is a round where `check` opens two
+migration-writing steps together and git merges them cleanly and wrongly. A pair
+that differs by only one word is said out loud without failing.
+
+A directory a step is about to create is a note, not a fault: on a build from
+nothing that is most of the round. What still fails is a first segment that does
+not exist beside something almost exactly like it — a typo, not a plan.
+
+It also warns when a brief is older than the step it describes, because the agent
+holding it will not know. `doctor --all` adds the quieter notes: every
+serialisation point only one step names, whether or not anything looks like it.
 
 Run it here, not earlier. With nothing open it says so rather than passing, and a
 tick over nothing checked is how a green report starts meaning nothing.
@@ -196,6 +222,19 @@ finishes.
 
 `run open` tells you when you have stopped short: it names how many more `check`
 would still allow and refuses to let that pass unnoticed.
+
+**Do not judge a backgrounded run by its exit code.** A detached process comes
+back as `-1  [process exited while detached; exit code unknown]` whether it
+passed, was rejected for its model, or died mid-stream. Every run writes how it
+ended to `.claude/orch/runs/<key>.status` instead:
+
+```
+exit 0	passed	S-1	.claude/orch/logs/S-1.jsonl
+exit 1	wrong-model	S-2	.claude/orch/logs/S-2.jsonl
+```
+
+Read that, then `run record <key> --log <log>`, which harvests the log whatever
+the status says.
 
 ### One step per agent, and never two
 
@@ -289,6 +328,25 @@ agent -p --force --trust --resume "$CID" "the answer is X — carry on"
 ```
 
 Same mechanism as a send-back.
+
+## Taking a step back out
+
+A round is editable. Cancelling is not deleting — `events.jsonl` is the record,
+and a step that once existed is not the same fact as one that never did:
+
+```bash
+node $ORCH step rm S-2.1.1 S-2.1.2      # cancel, and drop them from what needed them
+node $ORCH step reset 2.1               # every live step of one plan
+```
+
+Both refuse a step that has already gone out unless you say `--force`, because a
+worktree and a branch outlive the record; when you do force one, they print the
+`git worktree remove` line, which nothing here runs for you.
+
+Reach for `reset` when a plan is re-refined after its steps turn out wrong. The
+alternative — editing `state.json` and appending to `events.jsonl` by hand — is
+writing directly to the record this owns, and it is how a register ends up
+disagreeing with itself.
 
 ## Running on Claude Code instead
 

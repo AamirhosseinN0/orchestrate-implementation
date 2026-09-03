@@ -84,6 +84,22 @@ if ! mkdir -p "$(dirname "$LOG")" 2>/dev/null || ! : 2>/dev/null > "$LOG"; then
   die "cannot write the log at $LOG — fix that before spending a run on it"
 fi
 
+# How this run ended, written where it can be read afterwards. A run launched in
+# the background and detached comes back as exit code -1 whatever it did — a
+# passing run and a rejected one are indistinguishable from the outside — so the
+# ending is put on disk instead of being left in a status nobody receives.
+# Written on every exit path, including the ones that die early.
+STATUS_DIR=${CURSOR_ORCH_DIR:-.claude/orch}/runs
+STATUS="$STATUS_DIR/$KEY.status"
+OUTCOME=started
+mkdir -p "$STATUS_DIR" 2>/dev/null || true
+finish() {
+  local code=$?
+  printf 'exit %s\t%s\t%s\t%s\n' "$code" "$OUTCOME" "$KEY" "$LOG" > "$STATUS" 2>/dev/null || true
+}
+trap finish EXIT
+printf 'exit -\trunning\t%s\t%s\n' "$KEY" "$LOG" > "$STATUS" 2>/dev/null || true
+
 PROMPT=$(cat "$PROMPT_FILE")
 # PATH inside an agent is rebuilt from the login profile, so what this script
 # exports does not order it: bare `node` is whatever that profile defaults to.
@@ -123,8 +139,10 @@ report "$LOG"
 
 # What actually ran, read out of the agent's own opening event by a JSON parser
 # rather than a regex that assumed no space after the colon.
+OUTCOME=wrong-model
 node "$MODELS" verify --want "$SHOWN_WANT" --got "$MODEL_SHOWN" || {
   echo "  (role $ROLE asked for $MODEL. The whole stream is at $LOG)" >&2; exit 1; }
+OUTCOME=ran
 
 # A run with no result line ended outside the protocol — a transport error, a
 # loop detector. On a real build two of seven chip runs ended this way, 36% of
@@ -150,17 +168,22 @@ state of those files first and continue from exactly where you stopped."
   LOG=$LOG2
   report "$LOG"
   node "$MODELS" verify --want "$SHOWN_WANT" --got "$MODEL_SHOWN" >/dev/null || {
+    OUTCOME=wrong-model
     echo "✗ $KEY: the resume ran on the wrong model. Stream at $LOG" >&2; exit 1; }
 fi
 
 if [ "$HAS_RESULT" = 0 ]; then
+  OUTCOME=cut-off
   echo "✗ $KEY ended without answering. Stream at $LOG" >&2
   [ -n "$TAIL" ] && echo "  last line: $TAIL" >&2
   exit 1
 fi
 if [ "$IS_ERROR" = 1 ]; then
+  OUTCOME=error
   echo "✗ $KEY reported an error. Stream at $LOG" >&2
   exit 1
 fi
+OUTCOME=passed
 echo "✓ $KEY finished. Stream: $LOG"
+echo "  status: $STATUS"
 node "$HARVEST" "$LOG" --brief

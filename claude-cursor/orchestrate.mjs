@@ -168,17 +168,64 @@ function frontier(s) {
 // agent's steps in raw, which put a hole in the one invariant that matters on
 // the path that creates almost every step.
 const LIST_FIELDS = ['needs', 'owns', 'serialises', 'verify', 'context'];
+// The number a plan is known by: `docs/plans/2.1-flashcards.md` is 2.1. Steps
+// are keyed from it, which is the whole of what keeps two plans' keys apart.
+const planId = (p) => {
+  const base = path.basename(String(p)).replace(/\.(md|markdown|txt)$/i, '');
+  const m = /^(\d+(?:\.\d+)*)/.exec(base);
+  return m ? m[1] : (base.split(/[^A-Za-z0-9]+/)[0] || base);
+};
+const keyPrefix = (p) => 'S-' + planId(p);
+// One plan, however it was named: a path either way round the slashes, or the
+// id it is known by. A record written on Windows holds backslashes and every
+// caller types the other one.
+const slashes = (x) => String(x).split(path.win32.sep).join('/');
+// The same plan under either spelling. A step records the path it was handed;
+// the plan record holds the one `load` walked to, and on Windows those differ
+// by nothing but the slash.
+const samePlan = (a, b) => !!a && !!b && norm(slashes(a)) === norm(slashes(b));
+const findPlan = (s, name) => {
+  const want = norm(slashes(name));
+  return (s.plans || []).find((p) => {
+    const have = norm(slashes(p.path));
+    return have === want || have.endsWith('/' + want) || planId(p.path) === String(name);
+  });
+};
 function stepProblems(s, it, existing) {
   const p = [];
   if (!it || typeof it !== 'object' || Array.isArray(it)) return ['is not an object'];
   if (!it.key || typeof it.key !== 'string') p.push('needs a string key');
   if (!existing && !it.title) p.push('needs a title');
+  // A key is the address of one step. Two plans that both called something
+  // "S-1" used to merge into one record without a word: the second plan's
+  // title, owns and plan path overwrote the first's, and the count printed
+  // afterwards came from the report rather than from the register, so nothing
+  // said eight steps had gone. Three plans of five steps became five steps.
+  if (existing && existing.plan && it.plan && !samePlan(existing.plan, it.plan))
+    p.push(`key "${it.key}" already belongs to ${existing.plan} — keys are unique across every plan in the round, so key this one ${keyPrefix(it.plan)}.1, ${keyPrefix(it.plan)}.2 …`);
   for (const f of LIST_FIELDS) if (it[f] !== undefined && !Array.isArray(it[f])) p.push(`${f} must be a list`);
   for (const o of it.owns || []) {
     if (typeof o !== 'string' || !o.trim()) { p.push('owns has an empty entry'); continue; }
     if (/\s[—–]\s|\s--\s/.test(o)) p.push(`owns entry "${o}" is prose, not a path`);
     else if (/:\d+/.test(o)) p.push(`owns entry "${o}" carries a :line suffix — ownership is whole files`);
     else if (!/[/.]/.test(o) && o.split(/\s+/).length > 1) p.push(`owns entry "${o}" reads as a sentence, not a path`);
+  }
+  return p;
+}
+// `needs` names steps, not plans. An agent that has just read a plan with a
+// `requires:` header reaches for the plan's id, which is not a key and never
+// becomes one. Twenty-four such entries survived a whole round because the only
+// check for them ran in `doctor`, immediately before opening — long after the
+// report that caused them had been thrown away.
+function needsProblems(s, it, alsoKnown = new Set()) {
+  const p = [];
+  for (const n of it.needs || []) {
+    if (typeof n !== 'string' || !n.trim()) { p.push('needs has an empty entry'); continue; }
+    if (alsoKnown.has(n) || depOf(s, n)) continue;
+    const plan = (s.plans || []).find((x) => x.path === n || x.path.endsWith('/' + n) || planId(x.path) === n);
+    p.push(plan
+      ? `needs "${n}", which is a plan, not a step — name the keys of its steps instead`
+      : `needs "${n}", which is not a step in this round`);
   }
   return p;
 }
@@ -236,6 +283,9 @@ function reportOverlaps(s, keys) {
 function ladder() {
   return JSON.parse(fs.readFileSync(path.join(HERE, 'models.json'), 'utf8'));
 }
+// What a row's model calls itself. `accepts` is a list because the runtime is
+// not consistent about effort suffixes; the first entry is the canonical one.
+const modelName = (row) => (row.accepts && row.accepts[0]) || row.shown || row.id;
 function tierOf(name) {
   const m = ladder();
   const tier = m.roles[name] || name;
@@ -258,6 +308,41 @@ function signals(s, t) {
 }
 
 // ------------------------------------------------------------------- commands
+// What a plan says it comes after, out of its own front matter. A whole round
+// went out with no cross-plan ordering at all because this header was read by
+// nobody: not by `load`, and so never by the agent refining the plan.
+//
+//   ---
+//   requires: [1.6, 2.3]      or   requires: 1.6, 2.3
+//   ---                            or a "- 1.6" block under it
+function requiresOf(body) {
+  const fm = /^---\r?\n([\s\S]*?)\r?\n---/.exec(body);
+  if (!fm) return [];
+  const m = /^requires:[ \t]*(.*)$/m.exec(fm[1]);
+  if (!m) return [];
+  const inline = m[1].trim().replace(/^\[|\]$/g, '').trim();
+  if (inline) return inline.split(/[,\s]+/).map((x) => x.replace(/^["']|["']$/g, '')).filter(Boolean);
+  const after = fm[1].slice(m.index + m[0].length);
+  const out = [];
+  for (const line of after.split('\n')) {
+    const item = /^[ \t]*-[ \t]*(.+?)[ \t]*$/.exec(line);
+    if (!item) break;
+    out.push(item[1].replace(/^["']|["']$/g, ''));
+  }
+  return out;
+}
+
+// The words a serialisation point is spelled with. Data, like the ladder, and
+// for the same reason: six spellings of one migration head across eleven steps
+// is a merge git performs cleanly and gets wrong, and the only defence is that
+// two steps moving one thing say the same words about it.
+function vocabulary() {
+  const read = (f) => { try { return JSON.parse(fs.readFileSync(f, 'utf8')).points || []; } catch { return []; } };
+  const shipped = read(path.join(HERE, 'points.json'));
+  const local = process.env.CURSOR_ORCH_POINTS ? read(process.env.CURSOR_ORCH_POINTS) : [];
+  return [...new Set([...shipped, ...local])];
+}
+
 const CMDS = {};
 
 CMDS.load = (argv) => {
@@ -273,7 +358,8 @@ CMDS.load = (argv) => {
   if (!found.length) die('none of those paths held a plan file (.md, .markdown, .txt)');
   s.plans = found.map((f) => {
     const body = fs.readFileSync(f, 'utf8');
-    return { path: path.relative(CWD, f), lines: body.split('\n').length, bytes: Buffer.byteLength(body), sha: sha(body) };
+    return { path: path.relative(CWD, f), lines: body.split('\n').length, bytes: Buffer.byteLength(body),
+             sha: sha(body), requires: requiresOf(body) };
   });
   commit(s, 'load', argv);
   const total = s.plans.reduce((a, p) => a + p.bytes, 0);
@@ -282,19 +368,82 @@ CMDS.load = (argv) => {
   console.log('\nRead every one of them in full before anything else.');
 };
 
+// Every step in a batch is judged before any of it is written. Half a batch
+// recorded and the rest refused leaves a register nobody planned.
+function vetBatch(s, list) {
+  const bad = [];
+  const dry = JSON.parse(JSON.stringify(s));
+  const mine = new Set(list.map((it) => it && it.key).filter(Boolean));
+  const seen = new Set();
+  for (const it of list) {
+    const probs = [];
+    const k = it && it.key;
+    if (k && seen.has(k)) probs.push(`"${k}" appears twice in this batch`);
+    if (k) seen.add(k);
+    const p = putStep(dry, it);
+    if (p) probs.push(...p);
+    probs.push(...needsProblems(dry, it || {}, mine));
+    if (probs.length) bad.push([k || '(no key)', probs]);
+  }
+  return bad;
+}
+
 CMDS.step = (argv) => {
   const s = readState();
-  if (argv[0] !== 'add') die('step add < json   — a list of {key,title,plan,needs,owns,serialises,verify}');
+  const usage = 'step add < json | step rm <key>… [--force] | step reset <plan> [--force]';
+
+  if (argv[0] === 'rm' || argv[0] === 'reset') {
+    const force = argv.includes('--force');
+    const rest = argv.slice(1).filter((a) => a !== '--force');
+    if (!rest.length) die(usage);
+    let doomed;
+    if (argv[0] === 'reset') {
+      const rec = findPlan(s, rest[0]);
+      if (!rec) die(`"${rest[0]}" is not a loaded plan. Try one of:\n  ` + (s.plans || []).map((p) => p.path).join('\n  '));
+      doomed = tasks(s).filter((t) => samePlan(t.plan, rec.path) && t.status !== 'cancelled');
+      if (!doomed.length) die(`no live steps belong to ${rec.path}`, 1);
+    } else {
+      doomed = rest.map((k) => getTask(s, k)).filter((t) => t.status !== 'cancelled');
+      if (!doomed.length) die('every one of those is already cancelled', 1);
+    }
+    // Work that went out, or landed, is not undone by forgetting it here: a
+    // worktree and a branch outlive the record. So it takes saying so.
+    const live = doomed.filter((t) => t.status !== 'planned');
+    if (live.length && !force)
+      die(`${live.map((t) => `${t.key} is ${t.status}`).join(', ')}. Cancelling that leaves a worktree and a branch behind.\n  Say --force if that is what you mean.`);
+    // Cancelled, never deleted. events.jsonl is the record; a step that once
+    // existed and a step that never did are not the same fact.
+    for (const t of doomed) { t.status = 'cancelled'; t.cancelledAt = new Date().toISOString(); }
+    const gone = new Set(doomed.map((t) => t.key));
+    const orphaned = [];
+    for (const t of tasks(s)) {
+      if (gone.has(t.key) || !(t.needs || []).some((n) => gone.has(n))) continue;
+      t.needs = t.needs.filter((n) => !gone.has(n));
+      orphaned.push(t.key);
+    }
+    commit(s, 'step ' + argv[0], argv);
+    ok(`${doomed.length} step(s) cancelled: ${doomed.map((t) => t.key).join(' ')}`);
+    if (orphaned.length) console.log(`  dropped from the needs of: ${orphaned.join(' ')}`);
+    const leftovers = doomed.filter((t) => t.worktree);
+    if (leftovers.length) {
+      console.log(`\n${leftovers.length} of them had a worktree. Nothing here removes it — do it by hand:`);
+      for (const t of leftovers) console.log(`  git worktree remove ${t.worktree}  &&  git branch -D ${t.branch}`);
+    }
+    return;
+  }
+
+  if (argv[0] !== 'add') die(usage);
   const raw = fs.readFileSync(0, 'utf8').trim();
   if (!raw) die('step add reads JSON on stdin and got nothing');
   let list; try { list = JSON.parse(raw); } catch (e) { die('that is not valid JSON: ' + e.message); }
   if (!Array.isArray(list)) list = [list];
-  const bad = [];
-  for (const it of list) { const p = putStep(s, it); if (p) bad.push([it.key || '(no key)', p]); }
+  const bad = vetBatch(s, list);
   if (bad.length) {
     for (const [k, ps] of bad) { console.error(`✗ ${k}:`); for (const x of ps) console.error('    ' + x); }
+    console.error(`\nNothing was recorded — ${bad.length} of ${list.length} step(s) could not be.`);
     process.exit(1);
   }
+  for (const it of list) putStep(s, it);
   commit(s, 'step add', argv);
   ok(`${list.length} step(s) recorded. ${tasks(s).length} in the register.`);
   reportOverlaps(s, list.map((it) => it.key));
@@ -385,9 +534,16 @@ CMDS.check = () => {
 // The ladder lives in models.json and models.mjs owns it; this is only a way to
 // see it without knowing where the scripts are.
 CMDS.models = (argv) => {
-  const r = execFileSync('node', [path.join(HERE, 'scripts', 'models.mjs'), ...(argv.length ? argv : ['list'])],
-    { encoding: 'utf8', stdio: ['inherit', 'pipe', 'inherit'] });
-  process.stdout.write(r);
+  // Its complaints are already written for a person to read. Letting the
+  // failure out as an exception buried a clean ✗ under a Node stack trace.
+  try {
+    process.stdout.write(execFileSync('node', [path.join(HERE, 'scripts', 'models.mjs'), ...(argv.length ? argv : ['list'])],
+      { encoding: 'utf8', stdio: ['inherit', 'pipe', 'inherit'] }));
+  } catch (e) {
+    if (e.stdout) process.stdout.write(e.stdout);
+    if (e.status === undefined) die(`could not run models.mjs: ${e.message}`);
+    process.exit(e.status);
+  }
 };
 
 CMDS.board = () => {
@@ -420,14 +576,19 @@ CMDS.refine = (argv) => {
   const s = readState();
   if (what === 'brief') {
     if (!plan) die('refine brief <plan>');
-    const rec = (s.plans || []).find((p) => p.path === plan || p.path.endsWith('/' + plan));
+    const rec = findPlan(s, plan);
     if (!rec) die(`"${plan}" is not a loaded plan. Try \`load\` first, or one of:\n  ` + (s.plans || []).map((p) => p.path).join('\n  '));
     const out = refineReport(rec.path);
+    const req = (rec.requires || []);
+    const pre = req.length
+      ? `\nIt says it comes after: ${req.join(', ')}. Steps of those plans must land\nbefore this plan's work can start — name their keys in \`needs\`. Steps already\nrecorded, to name from:\n${(tasks(s).filter((t) => req.some((r) => t.plan && (t.plan.includes(r) || planId(t.plan) === r)))
+          .map((t) => `  ${t.key.padEnd(12)} ${t.plan}  ${String(t.title || '').slice(0, 40)}`).join('\n') || '  (none recorded yet — refine those plans first)')}\n`
+      : '';
     console.log(`Refine one implementation plan so it can be built from, without anyone
 having to guess.
 
 The plan: ${rec.path}  (${rec.lines} lines)
-
+${pre}
 Read it in full, then read the code it talks about. Your job is to make the plan
 match the repository as it actually is — not to design anything new, and not to
 decide anything the plan deliberately left open.
@@ -438,6 +599,11 @@ Do two things:
    literally: a path that does not exist, a function that was renamed, a command
    that would not run, an order that is impossible. Leave the intent alone.
 
+   The repository's own checks may grep your prose, not just its code. A plan
+   that spells out a forbidden call verbatim has been read by a lint as the
+   forbidden call itself. If you must write one, quote it and say it is
+   forbidden in the same line.
+
 2. Write your report to ${path.relative(CWD, out)} as JSON:
 
    {
@@ -445,7 +611,7 @@ Do two things:
      "builtOn": [{"path": "src/x.ts", "what": "what you read there"}],
      "openQuestions": ["anything you could not settle from the code"],
      "steps": [{
-       "key": "S-1",
+       "key": "${keyPrefix(rec.path)}.1",
        "title": "one line",
        "owns": ["every file this step may write, whole paths only"],
        "serialises": ["shared invariants it moves: a lockfile, a migration head"],
@@ -460,17 +626,33 @@ Do two things:
    same time. A plan this size is usually a single step - do not carve it up to
    look thorough; a report with more steps than that is refused.
 
+   Key every step from this plan: ${keyPrefix(rec.path)}.1, ${keyPrefix(rec.path)}.2. Other plans in this
+   round are being refined at the same time, keys are unique across all of them,
+   and a report that reuses one another plan already holds is refused whole.
+
+   \`needs\` names step keys, never plan ids. A key that is not a step in this
+   round is refused.
+
    \`owns\` is the important one. Two steps that own the same file cannot run at
    the same time, so a list that is too narrow causes a collision nobody sees
    until the merge. List what the step will actually write, including tests and
    generated files.
+
+   \`serialises\` is the one that gets spelled six different ways. Use these
+   exact words for anything on this list:
+
+${vocabulary().map((v) => '     · ' + v).join('\n')}
+
+   Invent a name only for something genuinely not on it, and then spell it the
+   way the plan spells it. Two steps moving one shared thing are only held apart
+   when they call it the same name.
 
 Report the file written, not a summary in your reply.`);
     return;
   }
   if (what === 'done') {
     if (!plan) die('refine done <plan>');
-    const rec = (s.plans || []).find((p) => p.path === plan || p.path.endsWith('/' + plan)) || die(`"${plan}" is not a loaded plan`);
+    const rec = findPlan(s, plan) || die(`"${plan}" is not a loaded plan`);
     const f = refineReport(rec.path);
     if (!fs.existsSync(f)) die(`no report at ${path.relative(CWD, f)} — the agent did not write one.\n  Its own reply is not a substitute: that route goes through a context that gets compacted.`);
     let rep; try { rep = JSON.parse(fs.readFileSync(f, 'utf8')); } catch (e) { die(`the report at ${f} is not valid JSON: ${e.message}`); }
@@ -482,18 +664,30 @@ Report the file written, not a summary in your reply.`);
   Have the agent merge them and rewrite ${path.relative(CWD, f)}.`);
     // Every step goes through the same gate as a hand-written one. The old
     // driver merged refined steps in raw, which put a hole in the one invariant
-    // that matters on the path that creates almost every step.
-    const bad = [];
-    for (const it of steps) { const p = putStep(s, { ...it, plan: rec.path }); if (p) bad.push([it.key || '(no key)', p]); }
+    // that matters on the path that creates almost every step. It is judged
+    // entire and written entire: a report half-recorded and half-refused is a
+    // register nobody planned, and the half that landed is the harder half to
+    // see.
+    const stamped = steps.map((it) => ({ ...it, plan: rec.path }));
+    const bad = vetBatch(s, stamped);
     if (bad.length) {
       console.error('✗ the report has steps that cannot be recorded as written:');
       for (const [k, ps] of bad) { console.error(`  ${k}:`); for (const x of ps) console.error('    ' + x); }
+      console.error(`\nNothing from ${rec.path} was recorded. Have the agent fix ${path.relative(CWD, f)} and run this again.`);
       process.exit(1);
     }
+    for (const it of stamped) putStep(s, it);
     rec.refined = new Date().toISOString();
     rec.openQuestions = rep.openQuestions || [];
     commit(s, 'refine done', argv);
-    ok(`${steps.length} step(s) from ${rec.path}: ${steps.map((t) => t.key).join(' ')}`);
+    // The count that would have caught three plans overwriting each other is
+    // the register's, not the report's. The report's number was always right.
+    ok(`${steps.length} step(s) from ${rec.path}: ${steps.map((t) => t.key).join(' ')}  (${tasks(s).filter((t) => t.status !== 'cancelled').length} in the register)`);
+    // Refining rewrites its plan, and nothing used to say what it changed.
+    try {
+      const stat = shq('git', ['diff', '--stat', '--', rec.path]);
+      if (stat) console.log('\nWhat it did to the plan:\n' + stat.split('\n').map((l) => '  ' + l.trim()).join('\n'));
+    } catch { /* not a repo, or the plan is untracked — the steps still stand */ }
     reportOverlaps(s, steps.map((t) => t.key));
     if (rec.openQuestions.length) {
       console.log(`\n${rec.openQuestions.length} thing(s) it could not settle from the code — put these to the user before building:`);
@@ -561,7 +755,7 @@ CMDS.run = (argv) => {
     t.briefSha = sha(JSON.stringify([t.owns, t.serialises, t.verify, t.needs, t.title, t.plan]));
     t.status = 'open'; t.openedAt = new Date().toISOString();
     commit(s, 'run open', argv);
-    ok(`${key} is open on ${row.shown}`);
+    ok(`${key} is open on ${modelName(row)}`);
     if (willReconcile.length) {
       console.log(`  shares files with open work — whichever lands second reconciles:`);
       for (const { o, m } of willReconcile) console.log(`    ↔ ${o.key}: ${m.files.join('; ')}`);
@@ -868,90 +1062,83 @@ function resolves(bin) {
   try { shq('sh', ['-c', `command -v ${JSON.stringify(bin)}`]); return true; } catch { return false; }
 }
 
-CMDS.doctor = () => {
-  const s = readState();
-  const bad = [], warn = [];
-
-  for (const p of s.plans || []) {
-    if (!fs.existsSync(path.resolve(CWD, p.path))) { bad.push(`the plan ${p.path} is gone — \`load\` again, or the steps built on it cite nothing`); continue; }
-    const now = sha(fs.readFileSync(path.resolve(CWD, p.path), 'utf8'));
-    // Refining rewrites its plan, so drift is expected there and only worth
-    // saying for a plan nobody has refined.
-    if (now !== p.sha && !p.refined) warn.push(`${p.path} changed since it was loaded, and has not been refined`);
+// The first segment of a path that is not on disk, and the directory it would
+// have gone in. Both are needed: the name to judge, and somewhere to look for
+// something almost exactly like it.
+function firstMissing(rel) {
+  const parts = norm(rel).split('/').filter((x) => x && x !== '.');
+  let at = CWD;
+  for (let i = 0; i < parts.length - 1; i++) {
+    const next = path.join(at, parts[i]);
+    if (!fs.existsSync(next)) return { parent: at, name: parts[i] };
+    at = next;
   }
-
-  const live = tasks(s).filter((t) => t.status !== 'cancelled');
-  const keys = new Set(live.map((t) => t.key));
-
-  // Every owned path, and who claims it. Landed work counts: a path two steps
-  // both wrote is how one of them quietly undid the other.
-  const claims = new Map();
-  for (const t of live) for (const o of t.owns || []) {
-    const k = norm(o);
-    (claims.get(k) || claims.set(k, []).get(k)).push(t.key);
+  return null;
+}
+function editDistance(a, b) {
+  const m = a.length, n = b.length;
+  let prev = Array.from({ length: n + 1 }, (_, j) => j);
+  for (let i = 1; i <= m; i++) {
+    const cur = [i];
+    for (let j = 1; j <= n; j++)
+      cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+    prev = cur;
   }
-  const dup = [...claims.entries()].filter(([, who]) => who.length > 1);
-  if (dup.length) {
-    bad.push(`${dup.length} path(s) claimed by more than one step:`);
-    for (const [p2, who] of dup.slice(0, 20)) bad.push(`    ${p2}  ←  ${who.join(', ')}`);
-    if (dup.length > 20) bad.push(`    … ${dup.length - 20} more`);
-  }
+  return prev[n];
+}
+// Names in `dir` that are one or two keystrokes from `name`. Two is where
+// `pakcages` sits beside `packages`; three starts matching real neighbours.
+function nearNames(dir, name) {
+  let entries; try { entries = fs.readdirSync(dir); } catch { return []; }
+  const lim = name.length >= 5 ? 2 : 1;
+  return entries.filter((e) => e !== name && Math.abs(e.length - name.length) <= lim &&
+    editDistance(e.toLowerCase(), name.toLowerCase()) <= lim).slice(0, 3);
+}
 
-  for (const t of live) {
-    for (const n of t.needs || []) if (!keys.has(n)) bad.push(`${t.key} needs ${n}, which is not a step`);
-    if (!(t.owns || []).length) warn.push(`${t.key} owns nothing — guard cannot judge it`);
-    if (!DEAD_STATUS.includes(t.status) && !t.tier) warn.push(`${t.key} has no model yet`);
-    for (const o of t.owns || []) {
-      // A file it is about to create will not exist; the directory it goes in
-      // has to, or the agent cannot write it.
-      const abs = path.resolve(CWD, o);
-      if (!fs.existsSync(abs) && !fs.existsSync(path.dirname(abs)))
-        warn.push(`${t.key} owns ${o}, and neither it nor its directory exists`);
-    }
-    for (const v of t.verify || []) {
-      const bin = firstBinary(v);
-      if (bin && !/[|&;<>(){}$`]/.test(bin) && !resolves(bin))
-        bad.push(`${t.key} verifies with \`${bin}\`, which does not resolve here`);
-    }
-    // A record corrected after the brief was written does not correct the brief,
-    // and the agent holding it will never know.
-    if (t.briefFile && fs.existsSync(path.resolve(CWD, t.briefFile))) {
-      const at = fs.statSync(path.resolve(CWD, t.briefFile)).mtimeMs;
-      if (t.openedAt && Date.parse(t.openedAt) > at + 1000)
-        warn.push(`${t.key}'s brief is older than its record — rewrite it and tell the agent to re-read`);
-    }
-  }
-
-  // A step that cannot be placed is either in a dependency loop or waiting on a
-  // key that does not exist. The second is already named above, so say which.
-  const stuck = waves(s).find((w) => w.wave === -1);
-  if (stuck) {
-    const missing = stuck.tasks.filter((t) => (t.needs || []).some((n) => !keys.has(n)));
-    const looped = stuck.tasks.filter((t) => !missing.includes(t));
-    if (looped.length) bad.push('these steps depend on each other in a loop: ' + looped.map((t) => t.key).join(' '));
-    if (missing.length && !looped.length)
-      bad.push('and so ' + missing.map((t) => t.key).join(' ') + ' can never be placed until that is fixed');
-  }
-
-  for (const w of warn) console.log('· ' + w);
-  for (const b of bad) console.log((b.startsWith('    ') ? '' : '✗ ') + b);
-  if (!bad.length && !warn.length) ok('nothing to say — every path, command and plan a step cites checks out');
-  else if (!bad.length) ok(`${warn.length} thing(s) worth a look, nothing broken`);
-  else {
-    // The indented lines are detail on the problem above them, not problems.
-    const n = bad.filter((b) => !b.startsWith('    ')).length;
-    console.log(`\n${n} problem(s). Fix them before opening anything.`);
-    process.exit(1);
-  }
-};
+// A serialisation point is only a gate when two steps spell it the same way.
+// One round produced six spellings of one migration head across eleven steps —
+// drizzle-journal, drizzle-migrations-head, drizzle-migration-journal — and
+// every one of them read as a different thing, so `check` would have opened two
+// migration-writing steps in the same round. git merges those cleanly.
+const POINT_NOISE = new Set(['the', 'a', 'an', 'of', 'and', 'to', 'for', 'head', 'heads', 'file', 'files', 'point', 'shared', 'main']);
+function pointTokens(x) {
+  return new Set(String(x).toLowerCase().split(/[^a-z0-9]+/)
+    .filter(Boolean)
+    .map((w) => (w.length > 3 && w.endsWith('s') && !w.endsWith('ss') ? w.slice(0, -1) : w))
+    .filter((w) => !POINT_NOISE.has(w)));
+}
+// Two spellings are the same thing when what is left of them is the same, or
+// when one says everything the other does and more. Differing by one token is
+// weaker evidence — "ci workflow" and "ci cache" are two things — so that one
+// is said out loud and not treated as a fault.
+function pointKinship(a, b) {
+  const A = pointTokens(a), B = pointTokens(b);
+  if (!A.size || !B.size) return null;
+  const shared = [...A].filter((x) => B.has(x));
+  if (shared.length === A.size && shared.length === B.size) return 'same';
+  if (shared.length === A.size || shared.length === B.size) return 'same';
+  if (shared.length && A.size === B.size && A.size - shared.length === 1) return 'maybe';
+  return null;
+}
 
 // ------------------------------------------------------------------- the doctor
 // Everything a step cites that can be checked without running anything. It is
 // the sweep before work goes out, and its value is entirely in being run then.
 CMDS.doctor = () => {
   const s = readState();
+  const all = process.argv.includes('--all');
   const live = tasks(s).filter((t) => !DEAD_STATUS.includes(t.status));
   let bad = 0;
+  const soft = [];
+  // A plan rewritten after its steps were cut from it leaves steps citing text
+  // that no longer says what they were built on. Refining rewrites its own
+  // plan, so drift there is expected and only worth saying for a plan nobody
+  // has refined.
+  for (const p of s.plans || []) {
+    if (!fs.existsSync(path.resolve(CWD, p.path))) { bad++; console.log(`✗ the plan ${p.path} is gone — \`load\` again, or the steps built on it cite nothing`); continue; }
+    if (sha(fs.readFileSync(path.resolve(CWD, p.path), 'utf8')) !== p.sha && !p.refined)
+      soft.push(`${p.path} changed since it was loaded, and has not been refined`);
+  }
   const binCache = {};
   const binOk = (b) => {
     if (!(b in binCache)) {
@@ -969,12 +1156,26 @@ CMDS.doctor = () => {
     // A backstop for prose that reached owns before the gate existed. An entry
     // that is not a path can never be matched by a diff, so `guard` cannot judge
     // the step at all and says nothing while letting anything through.
+    if (!(t.owns || []).length) soft.push(`${t.key} owns nothing — guard cannot judge it`);
     for (const o of t.owns || []) {
       if (/\s[—–]\s|\s--\s/.test(o) || /:\d+$/.test(o) || (!/[/.]/.test(o) && o.split(/\s+/).length > 1))
         probs.push(`owns "${o}", which guard can never match against a diff`);
       else {
-        const dir = path.dirname(path.resolve(CWD, o));
-        if (!fs.existsSync(dir)) probs.push(`owns "${o}", whose directory does not exist`);
+        // A directory a step is about to create does not exist yet, and on a
+        // build from nothing that is most of the round: 31 of 47 steps failed
+        // here once, and the answer was twenty .gitkeep commits made only to
+        // get a green report. A doctor that has to be lied to is not run.
+        //
+        // What is still worth stopping is a typo, and a typo is visible: the
+        // first segment that does not exist has a near-identical neighbour
+        // that does. `pakcages/server/...` beside `packages/` is caught;
+        // `packages/server/src/features/base/` on an empty repo is not.
+        const miss = firstMissing(o);
+        if (miss) {
+          const near = nearNames(miss.parent, miss.name);
+          if (near.length) probs.push(`owns "${o}", and "${miss.name}" does not exist beside ${near.map((n) => `"${n}"`).join(', ')} — a typo?`);
+          else soft.push(`${t.key} owns "${o}", whose directory does not exist yet — it has to create it`);
+        }
       }
     }
     for (const v of t.verify || []) {
@@ -1017,18 +1218,50 @@ CMDS.doctor = () => {
     const k = normPoint(x);
     (pts.get(k) || pts.set(k, []).get(k)).push({ key: t.key, spelling: x, status: t.status });
   }
-  const lone = [...pts.values()].filter((v) => v.length === 1);
+  // Spellings that are probably one thing. The confident kind is a fault: two
+  // steps that both move the migration head and call it two names are two steps
+  // nothing will hold apart. The weaker kind is said and not counted.
+  const spellings = [...pts.entries()].map(([k, v]) => ({ k, spelling: v[0].spelling, who: v.map((x) => x.key) }));
+  const same = [], maybe = [];
+  for (let i = 0; i < spellings.length; i++) for (let j = i + 1; j < spellings.length; j++) {
+    const kin = pointKinship(spellings[i].spelling, spellings[j].spelling);
+    if (kin === 'same') same.push([spellings[i], spellings[j]]);
+    else if (kin === 'maybe') maybe.push([spellings[i], spellings[j]]);
+  }
+  const twinned = new Set(same.concat(maybe).flat().map((x) => x.k));
+  if (same.length) {
+    bad += same.length;
+    console.log(`✗ ${same.length} serialisation point(s) look like the same thing spelled two ways:`);
+    for (const [a, b] of same) console.log(`    "${a.spelling}" (${a.who.join(', ')})  ≈  "${b.spelling}" (${b.who.join(', ')})`);
+    console.log('    Pick one spelling and correct the others, or say why they are different things.');
+    console.log('    Two names for one shared thing is two steps nothing holds apart.');
+  }
+  if (maybe.length) {
+    console.log(`· ${maybe.length} pair(s) of serialisation points differ by one word — worth a look:`);
+    for (const [a, b] of maybe) console.log(`    "${a.spelling}" (${a.who.join(', ')})  ~  "${b.spelling}" (${b.who.join(', ')})`);
+  }
+  // A point only one step names is either the spelling that missed its partner
+  // or a step that genuinely moves something alone. It fired on 24 honest
+  // singletons in one round and buried the pairs above, so it is now told only
+  // where there is a partner to have missed — or under --all.
+  const lone = [...pts.values()].filter((v) => v.length === 1 && (all || twinned.has(normPoint(v[0].spelling))));
   if (lone.length) {
     console.log(`· ${lone.length} serialisation point(s) only one step names:`);
     for (const v of lone) console.log(`    ${v[0].key}: "${v[0].spelling}"`);
     console.log('    If another step moves the same thing and spelled it differently, nothing will catch it.');
   }
+  const quiet = [...pts.values()].filter((v) => v.length === 1).length - lone.length;
+  if (quiet && !all) console.log(`· ${quiet} further point(s) named by one step only, and by nothing like it — \`doctor --all\` lists them.`);
   const contended = [...pts.values()].filter((v) => v.filter((x) => OPEN_STATUSES.includes(x.status)).length > 1);
   if (contended.length) {
     bad += contended.length;
     console.log(`✗ ${contended.length} serialisation point(s) held by more than one open step:`);
     for (const v of contended) console.log(`    ${v.map((x) => x.key).join(' ↔ ')}: "${v[0].spelling}"`);
   }
+
+  // Things worth knowing that are nobody's fault: a directory a step will
+  // create, a plan edited by hand, a step that owns nothing yet.
+  for (const w of soft) console.log('· ' + w);
 
   // A tick over nothing checked is how a green report starts meaning nothing.
   if (!live.length) {
@@ -1037,7 +1270,8 @@ CMDS.doctor = () => {
     return;
   }
   if (bad) { console.log(`\n✗ ${bad} problem(s) across ${live.length} step(s)`); process.exit(1); }
-  ok(`${live.length} step(s) check out — paths, proofs, briefs and ownership`);
+  ok(`${live.length} step(s) check out — paths, proofs, briefs and ownership` +
+    (soft.length ? `, with ${soft.length} thing(s) worth a look above` : ''));
 };
 
 // ------------------------------------------------------- joining, and sending back
@@ -1144,6 +1378,9 @@ const HELP = `orchestrate — five stages, on Cursor or Claude Code
   assess [propose|set|check]  how hard each step is, and which model it gets
   refine brief <plan>       the prompt for a refining agent
   refine done <plan>        read its report; records the steps it found
+  step add < json           record steps by hand, in one batch or not at all
+  step rm <key>…            cancel a step, and drop it from what needed it
+  step reset <plan>         cancel every live step of one plan
   check                     which steps can open together, and what blocks the rest
   run open <key>            worktree, chat, brief — everything a step needs to start
   run record <key> --log L  harvest a finished run into the record
@@ -1152,7 +1389,7 @@ const HELP = `orchestrate — five stages, on Cursor or Claude Code
   sendback <key> --why W    resume the agent that wrote it, with what to fix
   land <key> [--sha S]      record the merge
   board                     every step and its state
-  doctor                    everything the steps cite that can be checked without running
+  doctor [--all]            everything the steps cite that can be checked without running
   slot run <n> -- <cmd>     one shared machine slot, so parallel heavy checks queue
   models [list|sync]        the ladder, and regenerating it from the CLI
 

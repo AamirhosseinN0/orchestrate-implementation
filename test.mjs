@@ -2545,9 +2545,10 @@ say('verify is green on a recorded run nobody made up');
 }
 
 // --------------------------------------------- the model ladder, and its traps
-// The ladder is data, and the check against it is exact string equality. Rank 4
-// reports itself as "Cursor Grok 4.6" with no effort word in it, and that is a
-// prefix of every other Grok 4.6 row; across the models one account can see
+// The ladder is data, and the check against it is exact string equality against
+// a set: a row accepts every spelling it has been seen to answer with, because
+// rank 4 answered two ways inside one round and two finished runs were thrown
+// away for it. The short name is still a prefix of every other Grok 4.6 row; across the models one account can see
 // there are 197 such pairs. A prefix match would read a silent downgrade as a
 // correct run, which is the failure the check exists for.
 {
@@ -2569,18 +2570,29 @@ say('verify is green on a recorded run nobody made up');
   ok('pre-flight defaults to composer', r('preflight')[0] === 'composer-2.5', r('preflight'));
   ok('chips default to grok 4.6 high', r('chip')[0] === 'cursor-grok-4.6-high', r('chip'));
   ok('a tier resolves as well as a role', r('xhigh')[0] === 'cursor-grok-4.6-xhigh', r('xhigh'));
-  ok('rank 4 reports itself with no effort word', r('high')[1] === 'Cursor Grok 4.6', r('high'));
+  ok('rank 4 resolves to its canonical name', r('high')[1] === 'Cursor Grok 4.6 High', r('high'));
+  ok('and the table shows every spelling it answers to',
+    has(list.out, 'Cursor Grok 4.6 High / Cursor Grok 4.6'), list.out);
   const bad = run(['resolve', 'enormous']);
   ok('an unknown tier is refused', bad.code === 2, bad.out);
   ok('and the real ones are named', has(bad.out, 'composer, low, medium'), bad.out);
 
   const v = (want, got) => run(['verify', '--want', want, '--got', got]).code;
-  ok('an exact match passes', v('Cursor Grok 4.6', 'Cursor Grok 4.6') === 0);
+  ok('an exact match passes', v('Cursor Grok 4.6 High', 'Cursor Grok 4.6 High') === 0);
+  // The one that cost two finished runs: the same model, answering the other
+  // way it answers, read as some other model and its work discarded.
+  ok('rank 4 answering without its effort word is the same model, and passes',
+    v('Cursor Grok 4.6 High', 'Cursor Grok 4.6') === 0);
+  ok('and it is the same check whichever spelling was asked for',
+    v('Cursor Grok 4.6', 'Cursor Grok 4.6 High') === 0);
   ok('rank 4 does not accept extra high, which it is a prefix of',
     v('Cursor Grok 4.6', 'Cursor Grok 4.6 Extra High') === 1);
   ok('nor low, nor medium',
     v('Cursor Grok 4.6', 'Cursor Grok 4.6 Low') === 1 && v('Cursor Grok 4.6', 'Cursor Grok 4.6 Medium') === 1);
   ok('a dropped effort suffix is caught', v('Cursor Grok 4.6 Extra High', 'Cursor Grok 4.6') === 1);
+  const wrongRank = run(['verify', '--want', 'Cursor Grok 4.6 High', '--got', 'Cursor Grok 4.6 Low']);
+  ok('and a mismatch lists every spelling that would have passed',
+    has(wrongRank.out, 'Cursor Grok 4.6 High') && has(wrongRank.out, 'Cursor Grok 4.6\"'), wrongRank.out);
   ok('the fast twin of every rank is refused',
     v('Cursor Grok 4.6', 'Cursor Grok 4.6 Fast') === 1 && v('Composer 2.5', 'Composer 2.5 Fast') === 1);
   const fastWhy = run(['verify', '--want', 'Composer 2.5', '--got', 'Composer 2.5 Fast']);
@@ -2600,23 +2612,49 @@ say('verify is green on a recorded run nobody made up');
   const base = JSON.parse(fs.readFileSync(path.join(SK, '..', 'models.json'), 'utf8'));
   fs.writeFileSync(table, JSON.stringify(base, null, 2));
   const listing = path.join(d, 'list.txt');
+  const canon = (x) => (x.accepts ? x.accepts[0] : x.shown);
   const env = { PATH: stub + path.delimiter + process.env.PATH, STUB_LIST: listing, CURSOR_ORCH_MODELS: table };
 
-  fs.writeFileSync(listing, 'Available models\n\n' + base.ladder.map((x) => `${x.id} - ${x.shown}`).join('\n') + '\n');
+  fs.writeFileSync(listing, 'Available models\n\n' + base.ladder.map((x) => `${x.id} - ${canon(x)}`).join('\n') + '\n');
   const clean = run(['sync'], env);
-  ok('sync is quiet when the table still matches', clean.code === 0 && has(clean.out, 'still report'), clean.out);
+  ok('sync is quiet when the table already accepts what the CLI reports',
+    clean.code === 0 && has(clean.out, 'already accepts'), clean.out);
+
+  // The listing is colour-coded and the escape sits before the first character
+  // of the id, which is where the anchored match starts. A coloured listing
+  // parsed as no models at all, so the one documented remedy for a drifting
+  // table could not be run.
+  const E = String.fromCharCode(27);
+  fs.writeFileSync(listing, E + '[1mAvailable models' + E + '[0m' + os.EOL + os.EOL +
+    base.ladder.map((x) => E + '[32m' + x.id + E + '[0m - ' + canon(x)).join(os.EOL) + os.EOL);
+  const coloured = run(['sync'], env);
+  ok('a colour-coded listing is read, not mistaken for an empty one',
+    coloured.code === 0 && has(coloured.out, 'already accepts'), coloured.out);
 
   fs.writeFileSync(listing, 'Available models\n\n' +
-    base.ladder.map((x) => `${x.id} - ${x.id === 'cursor-grok-4.6-high' ? 'Cursor Grok 4.7' : x.shown}`).join('\n') + '\n');
+    base.ladder.map((x) => `${x.id} - ${x.id === 'cursor-grok-4.6-high' ? 'Cursor Grok 4.7' : canon(x)}`).join('\n') + '\n');
   const drift = run(['sync'], env);
-  ok('a renamed model is written through', drift.code === 0 && has(drift.out, 'Cursor Grok 4.7'), drift.out);
+  ok('a spelling the table has never seen is written through',
+    drift.code === 0 && has(drift.out, 'Cursor Grok 4.7'), drift.out);
   ok('and the table on disk now says so',
     has(fs.readFileSync(table, 'utf8'), 'Cursor Grok 4.7'), readIf(table));
+  // Added, never swapped. A runtime that answers two ways would otherwise
+  // fail every run made on the spelling sync happened not to see.
+  ok('and it still accepts the spellings it accepted before',
+    run(['verify', '--want', 'Cursor Grok 4.7', '--got', 'Cursor Grok 4.6 High'], env).code === 0 &&
+    run(['verify', '--want', 'Cursor Grok 4.7', '--got', 'Cursor Grok 4.6'], env).code === 0);
 
   fs.writeFileSync(listing, 'Available models\n\ncomposer-2.5 - Composer 2.5\n');
   const gone = run(['sync'], env);
   ok('an id that no longer exists stops the sync', gone.code === 1, gone.out);
   ok('and every missing one is named', has(gone.out, 'cursor-grok-4.6-xhigh'), gone.out);
+
+  fs.writeFileSync(listing, 'not logged in' + os.EOL + 'run `agent login`' + os.EOL);
+  const unreadable = run(['sync'], env);
+  ok('a listing with nothing model-shaped in it is refused', unreadable.code === 2, unreadable.out);
+  ok('showing what the CLI actually printed', has(unreadable.out, 'not logged in'), unreadable.out);
+  ok('and never as a node stack trace',
+    !has(unreadable.out, 'at Object.') && !has(unreadable.out, 'ERR_'), unreadable.out);
 }
 
 // ------------------------------------------- the launcher, and the runs it lost
@@ -2749,6 +2787,27 @@ say('verify is green on a recorded run nobody made up');
 
   const isErr = run(base('--role', 'chip'), { STUB_MODE: 'iserror' });
   ok('a result marked is_error fails', isErr.code === 1, isErr.out);
+
+  // --- how it ended, on disk, because a detached run's exit code is not
+  // received. Every backgrounded launch came back as -1 whatever happened, so a
+  // pass and a rejection were told apart only by reading the log by hand.
+  const status = (key) => readIf(path.join(d, '.claude', 'orch', 'runs', key + '.status'));
+  fresh();
+  const passed = run(['--key', 'st-ok', '--role', 'chip', '--prompt-file', PROMPT, '--quiet']);
+  ok('a run that passes says so in its status file',
+    passed.code === 0 && has(status('st-ok'), 'exit 0') && has(status('st-ok'), 'passed'), status('st-ok'));
+  ok('and the status file names the log to read', has(status('st-ok'), 'st-ok.jsonl'), status('st-ok'));
+  fresh();
+  run(['--key', 'st-model', '--role', 'chip', '--prompt-file', PROMPT, '--quiet'],
+    { STUB_SHOWN: 'Cursor Grok 4.6 Extra High' });
+  ok('a run rejected for its model is distinguishable from one that passed',
+    has(status('st-model'), 'wrong-model'), status('st-model'));
+  fresh();
+  run(['--key', 'st-cut', '--role', 'chip', '--prompt-file', PROMPT, '--quiet'], { STUB_MODE: 'die' });
+  ok('and one that stopped mid-stream says that', has(status('st-cut'), 'cut-off'), status('st-cut'));
+  fresh();
+  run(['--key', 'st-err', '--role', 'chip', '--prompt-file', PROMPT, '--quiet'], { STUB_MODE: 'iserror' });
+  ok('and one that reported an error says that', has(status('st-err'), 'error'), status('st-err'));
 
   // --- the runtime instruction, only when asked for ---
   fresh(); run(base('--role', 'chip'));
@@ -3226,23 +3285,36 @@ say('verify is green on a recorded run nobody made up');
   ok('a sound step passes', clean.code === 0, clean.out);
   ok('and says how many it looked at', has(clean.out, '1 step(s) check out'), clean.out);
 
-  run(['step', 'add'], JSON.stringify([
+  // A dependency on a step that does not exist is refused where it is written
+  // now, rather than surviving until the sweep. Twenty-four of them lived a
+  // whole round because this was only ever checked here.
+  const ghostDep = run(['step', 'add'], JSON.stringify([
     { key: 'S-2', title: 'b', plan: 'docs/gone.md', owns: ['nowhere/deep/b.ts'],
       needs: ['S-9'], verify: ['definitelynotarealbinary --go'] }]));
+  ok('a step needing something that is not a step is refused at the gate',
+    ghostDep.code === 1 && has(ghostDep.out, 'not a step in this round'), ghostDep.out);
+  run(['step', 'add'], JSON.stringify([
+    { key: 'S-2', title: 'b', plan: 'docs/gone.md', owns: ['nowhere/deep/b.ts'],
+      verify: ['definitelynotarealbinary --go'] }]));
   run(['assess', 'set', 'S-2=low']);
+  const st = path.join(d, '.claude', 'orch', 'state.json');
+  const poison = (fn) => { const j = JSON.parse(fs.readFileSync(st, 'utf8')); fn(j); fs.writeFileSync(st, JSON.stringify(j, null, 2)); };
+  // A record written before that gate existed still has to be caught here.
+  poison((j) => { j.tasks.find((t) => t.key === 'S-2').needs = ['S-9']; });
   const bad = run(['doctor']);
   ok('a plan that does not exist is caught', has(bad.out, 'plan does not exist'), bad.out);
   ok('a dependency on a step that does not exist is caught', has(bad.out, 'not a step'), bad.out);
-  ok('owning a path in a directory that does not exist is caught',
-    has(bad.out, 'whose directory does not exist'), bad.out);
+  // A directory a step will create is now a note: on a build from nothing that
+  // was 31 of 47 steps, and the report was only made green by committing empty
+  // directories. What still fails is a name sitting beside a near-identical one.
+  ok('owning a path in a directory that does not exist is said, not failed',
+    has(bad.out, 'does not exist yet'), bad.out);
   ok('a proof whose command does not resolve is caught',
     has(bad.out, 'does not resolve to anything runnable'), bad.out);
   ok('and it exits non-zero', bad.code === 1, bad.out);
 
   // An owns entry that is not a path can never be matched against a diff, so
   // guard cannot judge the step at all — it says nothing and lets anything past.
-  const st = path.join(d, '.claude', 'orch', 'state.json');
-  const poison = (fn) => { const j = JSON.parse(fs.readFileSync(st, 'utf8')); fn(j); fs.writeFileSync(st, JSON.stringify(j, null, 2)); };
   poison((j) => { j.tasks.find((t) => t.key === 'S-2').owns = ['the config file — wherever it lives']; });
   ok('prose that reached owns before the gate existed is still caught',
     has(run(['doctor']).out, 'guard can never match'), run(['doctor']).out);
@@ -3255,8 +3327,14 @@ say('verify is green on a recorded run nobody made up');
                   j.tasks.find((t) => t.key === 'S-2').needs = [];
                   j.tasks.find((t) => t.key === 'S-2').verify = ['node --version']; });
   const lone = run(['doctor']);
-  ok('a serialisation point only one step names is reported', has(lone.out, 'only one step names'), lone.out);
+  // It fired on 24 honest singletons in one round and buried the pairs that
+  // mattered, so the list is now told where there is a partner to have missed,
+  // and counted otherwise.
+  ok('a point only one step names, with nothing like it, is counted not listed',
+    has(lone.out, 'named by one step only'), lone.out);
   ok('and it is a note, not a failure', lone.code === 0, lone.out);
+  const loneAll = run(['doctor', '--all']);
+  ok('--all names it', has(loneAll.out, 'only one step names') && has(loneAll.out, 'docker-compose.yml'), loneAll.out);
 
   // Two open steps holding one path, or one point, is the breach.
   poison((j) => { for (const k of ['S-1', 'S-2']) { const t = j.tasks.find((x) => x.key === k);
@@ -3375,6 +3453,158 @@ say('verify is green on a recorded run nobody made up');
     run(['join', 'B']).code === 1, run(['join', 'B']).out);
 }
 
+// ------------------------------------------- what one 47-step round found
+// Twelve plans refined at once, 47 steps, and nine defects. The two that
+// mattered destroyed work and said nothing: three plans each keyed their steps
+// S-1..S-5 and the register merged them on key alone, losing eight steps behind
+// three green ticks; and six spellings of one migration head read as six
+// different things, so the gate that exists to stop two migration-writing steps
+// opening together would have opened them.
+{
+  say('what one 47-step round found');
+  const ROOT = path.dirname(fileURLToPath(import.meta.url));
+  const O = path.join(ROOT, 'claude-cursor', 'orchestrate.mjs');
+  const d = bare('round');
+  const run = (args, input) => {
+    try { return { code: 0, out: execFileSync('node', [O, ...args], { cwd: d, encoding: 'utf8', input, stdio: ['pipe', 'pipe', 'pipe'] }) }; }
+    catch (e) { return { code: e.status ?? -1, out: String(e.stdout || '') + String(e.stderr || '') }; }
+  };
+  const git = (args) => execFileSync('git', args, { cwd: d, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] });
+  const write = (rel, body) => {
+    fs.mkdirSync(path.dirname(path.join(d, rel)), { recursive: true });
+    fs.writeFileSync(path.join(d, rel), body);
+  };
+  const report = (plan, obj) => write(path.join('.claude', 'orch', 'refine',
+    plan.replace(/[^A-Za-z0-9]+/g, '-').replace(/^-|-$/g, '') + '.json'), JSON.stringify(obj));
+  const NL = '\n';
+
+  git(['init', '-q', '-b', 'main']); git(['config', 'user.email', 'ci@example.invalid']); git(['config', 'user.name', 'ci']);
+  write('docs/plans/1.1-first.md', '# first' + NL + NL + 'do a thing.' + NL);
+  write('docs/plans/1.2-second.md', '---' + NL + 'requires: [1.1]' + NL + '---' + NL + '# second' + NL);
+  write('src/a.ts', 'export const a = 1' + NL);
+  write('src/b.ts', 'export const b = 1' + NL);
+  write('packages/keep', 'x' + NL);
+  git(['add', '-A']); git(['commit', '-qm', 'init']);
+  run(['load', 'docs/plans']);
+
+  // --- the brief teaches keys that cannot collide, and hands over a vocabulary
+  const brief = run(['refine', 'brief', 'docs/plans/1.2-second.md']);
+  ok('the refine brief keys steps from the plan they came out of',
+    has(brief.out, 'S-1.2.1'), brief.out);
+  ok('and says a key another plan holds is refused', has(brief.out, 'unique across all of them'), brief.out);
+  ok('and hands the agent the words a serialisation point is spelled with',
+    has(brief.out, 'migration head') && has(brief.out, 'lockfile'), brief.out);
+  ok('and warns that repo lints read prose too', has(brief.out, 'grep your prose'), brief.out);
+  // The requires: header was read by nobody, so cross-plan ordering was absent
+  // from a whole round and had to be derived by hand from the yaml afterwards.
+  ok('a plan that says what it comes after has that put in front of the agent',
+    has(brief.out, 'comes after: 1.1'), brief.out);
+
+  // --- the silent loss: one key, two plans
+  report('docs/plans/1.1-first.md', { summary: 's', steps: [
+    { key: 'S-1', title: 'first plan step', owns: ['src/a.ts'], serialises: ['drizzle-migration-head'], verify: ['true'] }] });
+  const first = run(['refine', 'done', 'docs/plans/1.1-first.md']);
+  ok('a first report is recorded', first.code === 0, first.out);
+  ok('and the count comes from the register, not from the report',
+    has(first.out, 'in the register'), first.out);
+  report('docs/plans/1.2-second.md', { summary: 's', steps: [
+    { key: 'S-1', title: 'second plan step', owns: ['src/b.ts'], verify: ['true'] },
+    { key: 'S-9', title: 'fine on its own', owns: ['src/c.ts'], verify: ['true'] }] });
+  const clash = run(['refine', 'done', 'docs/plans/1.2-second.md']);
+  ok('a report reusing another plan key is refused', clash.code === 1, clash.out);
+  ok('naming the plan that already holds it', has(clash.out, '1.1-first.md'), clash.out);
+  ok('and the step of the plan that got there first is untouched',
+    has(run(['board']).out, 'first plan step'), run(['board']).out);
+  // Half a report recorded is the harder half to see: the good step must not
+  // land on its own while its sibling is refused.
+  ok('and nothing else from that report is recorded either',
+    !has(run(['board']).out, 'S-9'), run(['board']).out);
+
+  // --- needs, judged while the report is still in hand
+  report('docs/plans/1.2-second.md', { summary: 's', steps: [
+    { key: 'S-1.2.1', title: 'second', owns: ['src/b.ts'], needs: ['1.1'], verify: ['true'] }] });
+  const planDep = run(['refine', 'done', 'docs/plans/1.2-second.md']);
+  ok('a needs entry naming a plan is refused at record time', planDep.code === 1, planDep.out);
+  ok('and told it is a plan, not a step', has(planDep.out, 'a plan, not a step'), planDep.out);
+  report('docs/plans/1.2-second.md', { summary: 's', steps: [
+    { key: 'S-1.2.1', title: 'second', owns: ['src/b.ts'], needs: ['S-1'], verify: ['true'] }] });
+  ok('and the same report with a real key is recorded',
+    run(['refine', 'done', 'docs/plans/1.2-second.md']).code === 0);
+
+  // --- refining rewrites its plan, and now says what it did to it
+  write('docs/plans/1.1-first.md', '# first' + NL + NL + 'rewritten.' + NL + 'and longer.' + NL);
+  report('docs/plans/1.1-first.md', { summary: 's', steps: [
+    { key: 'S-1', title: 'first plan step', owns: ['src/a.ts'], serialises: ['drizzle-migration-head'], verify: ['true'] }] });
+  const again = run(['refine', 'done', 'docs/plans/1.1-first.md']);
+  ok('a refined plan is reported as a diffstat, not left invisible',
+    has(again.out, 'What it did to the plan') && has(again.out, 'insertion'), again.out);
+
+  // --- steps by hand: a batch is recorded whole or not at all
+  const half = run(['step', 'add'], JSON.stringify([
+    { key: 'G-1', title: 'good', owns: ['src/g.ts'] },
+    { key: 'G-2', title: 'bad', owns: ['the config file — wherever it lives'] }]));
+  ok('a batch with one bad step in it is refused', half.code === 1, half.out);
+  ok('and says nothing was recorded', has(half.out, 'Nothing was recorded'), half.out);
+  ok('and the good step in it did not land on its own', !has(run(['board']).out, 'G-1'), run(['board']).out);
+
+  // --- the synonyms: six names for one migration head
+  run(['step', 'add'], JSON.stringify([
+    { key: 'M-1', title: 'writes a migration', owns: ['src/m1.ts'], serialises: ['drizzle-migrations-head'], verify: ['true'] },
+    { key: 'M-2', title: 'writes another', owns: ['src/m2.ts'], serialises: ['drizzle-journal'], verify: ['true'] },
+    { key: 'W-1', title: 'ci', owns: ['src/w1.ts'], serialises: ['ci workflow'], verify: ['true'] },
+    { key: 'W-2', title: 'cache', owns: ['src/w2.ts'], serialises: ['ci cache'], verify: ['true'] },
+    { key: 'D-1', title: 'greenfield', owns: ['packages/server/src/features/base/x.ts'], verify: ['true'] },
+    { key: 'T-1', title: 'typo', owns: ['pakcages/thing.ts'], verify: ['true'] }]));
+  run(['assess', 'set', 'S-1=low', 'S-1.2.1=low', 'M-1=low', 'M-2=low', 'W-1=low', 'W-2=low', 'D-1=low', 'T-1=low']);
+  const doc = run(['doctor']);
+  ok('two spellings of one serialisation point are a fault, not a hint',
+    doc.code === 1 && has(doc.out, 'same thing spelled two ways'), doc.out);
+  ok('naming both spellings and the steps on them',
+    has(doc.out, 'drizzle-migration-head') && has(doc.out, 'drizzle-migrations-head') && has(doc.out, 'M-1'), doc.out);
+  ok('and saying what it costs', has(doc.out, 'nothing holds apart'), doc.out);
+  // Weaker evidence is said out loud and not treated as a fault: two points
+  // that differ by one word are often two things.
+  ok('a pair differing by one word is raised without failing',
+    has(doc.out, 'differ by one word') && has(doc.out, 'ci cache'), doc.out);
+  // 31 of 47 steps failed on this alone, and the answer was twenty .gitkeep
+  // commits made only to get a green report. A doctor that has to be lied to
+  // does not get run.
+  ok('a directory a step will create is a note, not a fault',
+    has(doc.out, 'does not exist yet') && has(doc.out, 'features/base'), doc.out);
+  ok('but a first segment beside something almost identical is a typo',
+    has(doc.out, 'pakcages') && has(doc.out, 'a typo?'), doc.out);
+  const quiet = run(['doctor', '--all']);
+  ok('--all adds the points only one step names', has(quiet.out, 'only one step names'), quiet.out);
+
+  // --- removing a step, which used to mean editing state.json by hand
+  const rmPlanned = run(['step', 'rm', 'M-1']);
+  ok('a planned step can be cancelled', rmPlanned.code === 0, rmPlanned.out);
+  ok('and it stays in the record, cancelled rather than deleted',
+    has(run(['board']).out, 'cancelled'), run(['board']).out);
+  const stFile = path.join(d, '.claude', 'orch', 'state.json');
+  const st = JSON.parse(readIf(stFile));
+  const w1 = st.tasks.find((t) => t.key === 'W-1');
+  w1.status = 'open'; w1.worktree = path.join(d, 'wt-W-1'); w1.branch = 'step/W-1';
+  fs.writeFileSync(stFile, JSON.stringify(st, null, 2));
+  const rmLive = run(['step', 'rm', 'W-1']);
+  ok('a step that has gone out is not cancelled by accident', rmLive.code === 2, rmLive.out);
+  ok('and says what would be left behind', has(rmLive.out, 'worktree and a branch'), rmLive.out);
+  const forced = run(['step', 'rm', 'W-1', '--force']);
+  ok('--force cancels it', forced.code === 0, forced.out);
+  ok('and prints the worktree nothing here removes', has(forced.out, 'git worktree remove'), forced.out);
+  const reset = run(['step', 'reset', '1.2']);
+  ok('a whole plan can be reset by its id', reset.code === 0, reset.out);
+  ok('and only that plan is touched', has(run(['board']).out, 'first plan step'), run(['board']).out);
+  ok('and what needed a cancelled step no longer waits on a ghost',
+    !has(run(['check']).out, 'S-1.2.1'), run(['check']).out);
+
+  // --- the model command, whose failure used to arrive as a stack trace
+  const badModels = run(['models', 'resolve', 'enormous']);
+  ok('a models failure comes back as its own message', badModels.code === 2, badModels.out);
+  ok('and never as a node stack trace',
+    !has(badModels.out, 'at Object.') && !has(badModels.out, 'genericNodeError'), badModels.out);
+}
+
 // ---------------------------------------------------------------------- report
 if (!KEEP) for (const d of boxes) { try { fs.rmSync(d, { recursive: true, force: true }); } catch { /* gone */ } }
 else console.log('\nsandboxes kept: ' + boxes.join('\n                '));
@@ -3383,7 +3613,7 @@ else console.log('\nsandboxes kept: ' + boxes.join('\n                '));
 // an exception thrown before its first `ok`, a case quietly commented out — and
 // the suite still ends on "all green", because green is only ever measured
 // against however many checks happened to run.
-const EXPECTED = 653;   // every check above counts; raise it deliberately when you add one
+const EXPECTED = 705;   // every check above counts; raise it deliberately when you add one
 
 console.log('\n' + '-'.repeat(60));
 if (pass + failures.length !== EXPECTED)

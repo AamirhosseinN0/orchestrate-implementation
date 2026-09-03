@@ -150,10 +150,25 @@ It also prints what the refining agent did to the plan, as a diffstat. Refining
 rewrites its plan in place, and a rewrite that breaks a repo-level lint is
 otherwise invisible.
 
-A plan that names `requires:` in its front matter has that read at `load` and put
-in front of the refining agent, along with the keys already recorded for those
-plans, so cross-plan ordering reaches `needs` instead of being derived by hand
-afterwards.
+A plan that names `requires:` in its front matter has that read at `load` — from
+`---` lines or from a ```yaml fence, both are read — and put in front of the
+refining agent along with whatever keys are already recorded for those plans.
+
+Refining runs all at once, so those keys usually do not exist yet and no report
+can name them. Once every report is in, turn the headers into dependencies:
+
+```bash
+node $ORCH step link          # --dry-run first if you want to see it
+```
+
+Plan B requires plan A, so every step of B needs every step of A. It is
+idempotent, it refuses a `requires:` chain that loops, and it says which plans
+it could not link because they have no steps yet. Without it an integration
+plan opens in the same round as the five plans it integrates.
+
+Keys come from the plan's own name: `S-013-capabilities.md` gives `S-013.1`,
+`2.1-flashcards.md` gives `S-2.1.1`. Name plans so that first token is distinct
+and the keys cannot collide.
 
 `refine done` prints any question the agent could not settle from the code. **Put
 those to the user before building.** `refine check` exits 1 while one is open.

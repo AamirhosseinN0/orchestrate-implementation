@@ -3598,6 +3598,74 @@ say('verify is green on a recorded run nobody made up');
   ok('and what needed a cancelled step no longer waits on a ghost',
     !has(run(['check']).out, 'S-1.2.1'), run(['check']).out);
 
+  // --- plans named for the step they become, and front matter in a fence
+  // Two bugs found on a real 12-plan round, both worked around by hand at the
+  // time. `S-013-capabilities.md` read as the bare letter S, so every plan told
+  // its agent to key from `S-S` — one prefix for twelve plans, which is the
+  // collision the whole key scheme exists to stop. And front matter written in
+  // a ```yaml fence rather than between --- lines parsed as no requires: at
+  // all, so twelve plans loaded with an empty dependency graph and the
+  // integration step could have opened beside the five steps it integrates.
+  {
+    const e = bare('plan-names');
+    const erun = (args, input) => {
+      try { return { code: 0, out: execFileSync('node', [O, ...args], { cwd: e, encoding: 'utf8', input, stdio: ['pipe', 'pipe', 'pipe'] }) }; }
+      catch (x) { return { code: x.status ?? -1, out: String(x.stdout || '') + String(x.stderr || '') }; }
+    };
+    const egit = (args) => execFileSync('git', args, { cwd: e, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] });
+    const plan = (name, requires) => {
+      fs.mkdirSync(path.join(e, 'docs', 'plans'), { recursive: true });
+      fs.writeFileSync(path.join(e, 'docs', 'plans', name + '-x.md'),
+        ['# ' + name, '', '```yaml', 'id: ' + name, 'requires: ' + requires, '```', ''].join('\n'));
+    };
+    egit(['init', '-q', '-b', 'main']); egit(['config', 'user.email', 'ci@example.invalid']); egit(['config', 'user.name', 'ci']);
+    fs.mkdirSync(path.join(e, 'src'), { recursive: true });
+    for (const f of ['a', 'b', 'c']) fs.writeFileSync(path.join(e, 'src', f + '.ts'), 'export const x = 1\n');
+    plan('S-011', '[]');
+    plan('S-013', '[S-011]');
+    plan('S-016', '[S-011, S-013]   # everything it integrates');
+    fs.writeFileSync(path.join(e, 'docs', 'plans', '2.1-numbered.md'), '---\nrequires: [S-011]\n---\n# numbered\n');
+    egit(['add', '-A']); egit(['commit', '-qm', 'init']);
+    erun(['load', 'docs/plans']);
+
+    const b11 = erun(['refine', 'brief', 'docs/plans/S-011-x.md']);
+    ok('a plan named for the step it becomes keys from that step, not from "S"',
+      has(b11.out, 'S-011.1, S-011.2') && !has(b11.out, 'S-S'), b11.out);
+    const b21 = erun(['refine', 'brief', 'docs/plans/2.1-numbered.md']);
+    ok('and a plan numbered like a section still keys from its number',
+      has(b21.out, 'S-2.1.1'), b21.out);
+    const b16 = erun(['refine', 'brief', 'docs/plans/S-016-x.md']);
+    ok('front matter in a yaml fence is read, not only the --- kind',
+      has(b16.out, 'comes after: S-011, S-013'), b16.out);
+    ok('and a trailing comment does not become part of the last id',
+      !has(b16.out, 'S-013]'), b16.out);
+    ok('the --- kind still works', has(b21.out, 'comes after: S-011'), b21.out);
+
+    // Every plan is refined at once, so a report cannot name keys that do not
+    // exist yet. The ordering is in the requires: headers, and turning it into
+    // needs was being done by hand once the reports were all in.
+    const report = (name, key) => {
+      const dir = path.join(e, '.claude', 'orch', 'refine');
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, ('docs-plans-' + name + '-x-md') + '.json'), JSON.stringify({
+        summary: 's', steps: [{ key, title: name, owns: ['src/' + key + '.ts'], verify: ['true'] }] }));
+      erun(['refine', 'done', 'docs/plans/' + name + '-x.md']);
+    };
+    report('S-011', 'S-011.1'); report('S-013', 'S-013.1'); report('S-016', 'S-016.1');
+    ok('with no links, an integration step would open beside what it integrates',
+      has(erun(['check']).out, 'S-016.1'), erun(['check']).out);
+    const dry = erun(['step', 'link', '--dry-run']);
+    ok('step link says what it would add', has(dry.out, 'S-016.1 needs S-013.1'), dry.out);
+    ok('and does not record it', !has(erun(['check']).out, 'Waiting on work'), erun(['check']).out);
+    const linked = erun(['step', 'link']);
+    ok('step link turns requires: into needs between real keys',
+      linked.code === 0 && has(linked.out, 'S-013.1 needs S-011.1'), linked.out);
+    const after = erun(['check']);
+    ok('and the integration step now waits', has(after.out, 'Waiting on work to land') && has(after.out, 'S-016.1'), after.out);
+    ok('while what it comes after can open', has(after.out, 'S-011.1'), after.out);
+    ok('running it again adds nothing', has(erun(['step', 'link']).out, 'nothing to add'), erun(['step', 'link']).out);
+  }
+
   // --- the model command, whose failure used to arrive as a stack trace
   const badModels = run(['models', 'resolve', 'enormous']);
   ok('a models failure comes back as its own message', badModels.code === 2, badModels.out);
@@ -3613,7 +3681,7 @@ else console.log('\nsandboxes kept: ' + boxes.join('\n                '));
 // an exception thrown before its first `ok`, a case quietly commented out — and
 // the suite still ends on "all green", because green is only ever measured
 // against however many checks happened to run.
-const EXPECTED = 705;   // every check above counts; raise it deliberately when you add one
+const EXPECTED = 717;   // every check above counts; raise it deliberately when you add one
 
 console.log('\n' + '-'.repeat(60));
 if (pass + failures.length !== EXPECTED)

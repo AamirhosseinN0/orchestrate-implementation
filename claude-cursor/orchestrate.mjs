@@ -168,11 +168,21 @@ function frontier(s) {
 // agent's steps in raw, which put a hole in the one invariant that matters on
 // the path that creates almost every step.
 const LIST_FIELDS = ['needs', 'owns', 'serialises', 'verify', 'context'];
-// The number a plan is known by: `docs/plans/2.1-flashcards.md` is 2.1. Steps
-// are keyed from it, which is the whole of what keeps two plans' keys apart.
+// The number a plan is known by. Steps are keyed from it, which is the whole of
+// what keeps two plans' keys apart, so a plan whose name this cannot read is a
+// round of colliding keys:
+//
+//   2.1-flashcards.md      → 2.1      numbered like a section
+//   S-013-capabilities.md  → 013      named for the step it becomes
+//   S-018a-retry.md        → 018a     and its follow-on
+//
+// The second shape used to fall through to the first alphanumeric token, which
+// is the bare letter "S" — so twelve differently-named plans all told their
+// agents to key from `S-S`, which is one prefix, which is the collision this id
+// exists to prevent. It was caught by hand, once, in briefs already written.
 const planId = (p) => {
   const base = path.basename(String(p)).replace(/\.(md|markdown|txt)$/i, '');
-  const m = /^(\d+(?:\.\d+)*)/.exec(base);
+  const m = /^(?:[A-Za-z]+[-_])?(\d+(?:\.\d+)*[a-z]?)(?![\w.])/.exec(base);
   return m ? m[1] : (base.split(/[^A-Za-z0-9]+/)[0] || base);
 };
 const keyPrefix = (p) => 'S-' + planId(p);
@@ -188,7 +198,8 @@ const findPlan = (s, name) => {
   const want = norm(slashes(name));
   return (s.plans || []).find((p) => {
     const have = norm(slashes(p.path));
-    return have === want || have.endsWith('/' + want) || planId(p.path) === String(name);
+    return have === want || have.endsWith('/' + want) ||
+      planId(p.path) === String(name) || keyPrefix(p.path) === String(name);
   });
 };
 function stepProblems(s, it, existing) {
@@ -316,18 +327,38 @@ function signals(s, t) {
 //   requires: [1.6, 2.3]      or   requires: 1.6, 2.3
 //   ---                            or a "- 1.6" block under it
 function requiresOf(body) {
-  const fm = /^---\r?\n([\s\S]*?)\r?\n---/.exec(body);
-  if (!fm) return [];
-  const m = /^requires:[ \t]*(.*)$/m.exec(fm[1]);
+  // Front matter is written two ways and both are common: fenced between --- at
+  // the very top, or in a ```yaml block under the title. Reading only the first
+  // spelling loaded twelve plans with no dependencies at all, and an empty graph
+  // is not a safe default — it lets `check` open an integration step beside the
+  // five steps it integrates.
+  const head = body.split('\n').slice(0, 60).join('\n');
+  const blocks = [];
+  const front = /^---\r?\n([\s\S]*?)\r?\n---/.exec(body);
+  if (front) blocks.push(front[1]);
+  for (const m of head.matchAll(/^[ \t]*```[ \t]*(?:ya?ml)?[ \t]*\r?\n([\s\S]*?)^[ \t]*```/gm)) blocks.push(m[1]);
+  for (const block of blocks) {
+    const found = requiresIn(block);
+    if (found.length) return found;
+  }
+  return [];
+}
+// One `requires:` key, however its list is written: inline, bracketed, or a
+// block of "- " items under it.
+function requiresIn(block) {
+  const m = /^[ \t]*requires:[ \t]*(.*)$/m.exec(block);
   if (!m) return [];
-  const inline = m[1].trim().replace(/^\[|\]$/g, '').trim();
-  if (inline) return inline.split(/[,\s]+/).map((x) => x.replace(/^["']|["']$/g, '')).filter(Boolean);
-  const after = fm[1].slice(m.index + m[0].length);
+  const clean = (x) => String(x).replace(/^["']|["']$/g, '').replace(/[,]$/, '').trim();
+  // The comment goes before the brackets do, or `[a, b] # why` keeps the ]
+  // and the last id is recorded as "b]" — a dependency on nothing.
+  const inline = m[1].replace(/#.*$/, '').trim().replace(/^\[|\]$/g, '').trim();
+  if (inline) return inline.split(/[,\s]+/).map(clean).filter(Boolean);
   const out = [];
-  for (const line of after.split('\n')) {
+  for (const line of block.slice(m.index + m[0].length).split('\n')) {
+    if (!line.trim()) continue;
     const item = /^[ \t]*-[ \t]*(.+?)[ \t]*$/.exec(line);
     if (!item) break;
-    out.push(item[1].replace(/^["']|["']$/g, ''));
+    out.push(clean(item[1]));
   }
   return out;
 }
@@ -390,7 +421,48 @@ function vetBatch(s, list) {
 
 CMDS.step = (argv) => {
   const s = readState();
-  const usage = 'step add < json | step rm <key>… [--force] | step reset <plan> [--force]';
+  const usage = 'step add < json | step link [--dry-run] | step rm <key>… [--force] | step reset <plan> [--force]';
+
+  // Plans are refined all at once, so when an agent writes its report the steps
+  // of the plans it comes after usually do not exist yet and it cannot name
+  // their keys. The ordering is not lost — it is in each plan's `requires:` —
+  // but somebody had to turn it into needs by hand once every report was in.
+  // This does that: plan B requires plan A, so every step of B needs every step
+  // of A. It is safe to run more than once and says what it changed.
+  if (argv[0] === 'link') {
+    const dry = argv.includes('--dry-run');
+    const live = tasks(s).filter((t) => !DEAD_STATUS.includes(t.status));
+    const stepsOf = (rec) => live.filter((t) => samePlan(t.plan, rec.path));
+    const added = [], missing = [], unknown = [];
+    for (const rec of s.plans || []) {
+      const mine = stepsOf(rec);
+      if (!mine.length) continue;
+      for (const req of rec.requires || []) {
+        const dep = findPlan(s, req);
+        if (!dep) { unknown.push(`${rec.path} requires "${req}", which is not a loaded plan`); continue; }
+        const theirs = stepsOf(dep);
+        if (!theirs.length) { missing.push(`${rec.path} requires ${dep.path}, which has no steps recorded yet`); continue; }
+        for (const t of mine) for (const d of theirs) {
+          if (t.key === d.key || (t.needs || []).includes(d.key)) continue;
+          (t.needs ||= []).push(d.key);
+          added.push(`${t.key} needs ${d.key}`);
+        }
+      }
+    }
+    for (const u of unknown) console.log('✗ ' + u);
+    for (const m of missing) console.log('· ' + m + ' — refine it, then run this again');
+    if (!added.length) { ok('nothing to add — every plan already waits on what it says it comes after'); return; }
+    for (const a of added) console.log('  ' + a);
+    if (dry) { console.log(`\n${added.length} link(s) — not recorded (--dry-run)`); return; }
+    // A requires: chain that loops is a mistake in the plans, and recording it
+    // would leave a register no wave can be built from.
+    const loop = waves(s).find((w) => w.wave === -1);
+    if (loop) die(`those requires: headers put ${loop.tasks.map((t) => t.key).join(' ')} in a loop. Nothing was recorded.`);
+    commit(s, 'step link', argv);
+    ok(`${added.length} dependency(ies) recorded from the plans' requires: headers`);
+    if (unknown.length) process.exit(1);
+    return;
+  }
 
   if (argv[0] === 'rm' || argv[0] === 'reset') {
     const force = argv.includes('--force');
@@ -1380,6 +1452,7 @@ const HELP = `orchestrate — five stages, on Cursor or Claude Code
   refine done <plan>        read its report; records the steps it found
   step add < json           record steps by hand, in one batch or not at all
   step rm <key>…            cancel a step, and drop it from what needed it
+  step link                 turn each plan's requires: into needs between steps
   step reset <plan>         cancel every live step of one plan
   check                     which steps can open together, and what blocks the rest
   run open <key>            worktree, chat, brief — everything a step needs to start

@@ -452,6 +452,11 @@ Do two things:
      }]
    }
 
+   One plan is one step unless it genuinely has to be more than one. Split it
+   only when a part must land before another can start, or when two parts write
+   disjoint files and are worth running at the same time. A plan this size is
+   usually a single step - do not carve it up to look thorough.
+
    \`owns\` is the important one. Two steps that own the same file cannot run at
    the same time, so a list that is too narrow causes a collision nobody sees
    until the merge. List what the step will actually write, including tests and

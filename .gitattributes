@@ -1,0 +1,6 @@
+# Every file here is read by bash or by node, and both of them are usually
+# running under WSL or Linux even when the checkout is on Windows. A CRLF
+# working copy makes `bash scripts/run.sh` fail with `set: pipefail\r: invalid
+# option name` and takes the whole suite down with it, so line endings are the
+# repository's business rather than the machine's autocrlf setting.
+* text=lf eol=lf

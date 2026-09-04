@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 #
 # NOTE: needs a real recorded run at ./replay/.claude/orchestration/ — copy one
-# from a project that has used this skill. Without it every case skips.
+# from a project that has used this skill. Without it, every corpus-based case
+# below is SKIPPED (not run against an empty path) — see HAVE_CORPUS below.
 # Independent acceptance harness for the bug-hunt fixes.
 #
 # Written against the AUDIT, not against the fixes — every case here is a bug
@@ -12,6 +13,7 @@
 #
 # Each case prints PASS (the bug is gone), FAIL (still there), or SKIP.
 # Exit 0 only when nothing failed.
+set -uo pipefail
 
 DRV="${1:?usage: acceptance.sh /path/to/driver.mjs}"
 DRV="$(cd "$(dirname "$DRV")" && pwd)/$(basename "$DRV")"
@@ -27,113 +29,159 @@ ok()   { PASS=$((PASS+1)); printf '  \033[32mPASS\033[0m  %s\n' "$1"; }
 bad()  { FAIL=$((FAIL+1)); FAILED+=("$1"); printf '  \033[31mFAIL\033[0m  %s\n     → %s\n' "$1" "$2"; }
 skip() { SKIP=$((SKIP+1)); printf '  \033[33mSKIP\033[0m  %s (%s)\n' "$1" "$2"; }
 head_() { printf '\n\033[1m%s\033[0m\n' "$1"; }
+die()  { printf '✗ %s\n' "$*" >&2; exit 2; }
 
+# corpus()/fresh() must never let a failure fall through as an empty path: an
+# empty $d silently turns every "$d/..." into a path rooted at / (or at the
+# cwd), and the assertions below would then read the unrelated failure of that
+# bogus path as the CLI correctly refusing bad input. Both either print exactly
+# one directory or they abort the whole run — they never echo nothing.
 corpus() {
   local d="$WORK/c$RANDOM$RANDOM"
-  cp -r "$CORPUS" "$d" && chmod -R u+w "$d" && echo "$d"
+  cp -r "$CORPUS" "$d" || die "corpus(): could not copy $CORPUS to $d"
+  chmod -R u+w "$d" || die "corpus(): could not chmod $d writable"
+  printf '%s\n' "$d"
 }
 fresh() {
-  local d="$WORK/f$RANDOM$RANDOM"; mkdir -p "$d/docs/plans"
-  printf '# a plan\n\nSomething is TBD here.\n' > "$d/docs/plans/p1.md"
+  local d="$WORK/f$RANDOM$RANDOM"
+  mkdir -p "$d/docs/plans" || die "fresh(): could not create $d/docs/plans"
+  printf '# a plan\n\nSomething is TBD here.\n' > "$d/docs/plans/p1.md" \
+    || die "fresh(): could not write fixture plan in $d"
   ( cd "$d" && node "$DRV" load docs/plans/p1.md >/dev/null 2>&1 )
-  echo "$d"
+  printf '%s\n' "$d"
 }
+
+# Every case below that calls corpus() is gated on this. Without a real
+# recorded run at $CORPUS there is nothing to copy, so those cases are SKIPPED
+# outright rather than run against a directory that was never created.
+if [ -d "$CORPUS" ]; then
+  HAVE_CORPUS=1
+else
+  HAVE_CORPUS=0
+  printf 'note: no corpus fixture at %s — corpus-based cases below are SKIPPED.\n' "$CORPUS" >&2
+fi
+
 # how big the real corpus actually is, so nothing is hardcoded to a stale number
-REF=$(corpus)
-REF_TASKS=$(cd "$REF" && node -e 'const r=require("./.claude/orchestration/register.json");console.log((r.tasks||[]).length)')
-REF_BYTES=$(cd "$REF" && wc -c < .claude/orchestration/register.json)
-printf 'corpus: %s tasks, %s-byte register, %s events\n' \
-  "$REF_TASKS" "$REF_BYTES" "$(wc -l < "$REF/.claude/orchestration/events.jsonl")"
+if [ "$HAVE_CORPUS" = 1 ]; then
+  REF=$(corpus)
+  REF_TASKS=$(cd "$REF" && node -e 'const r=require("./.claude/orchestration/register.json");console.log((r.tasks||[]).length)')
+  REF_BYTES=$(cd "$REF" && wc -c < .claude/orchestration/register.json)
+  printf 'corpus: %s tasks, %s-byte register, %s events\n' \
+    "$REF_TASKS" "$REF_BYTES" "$(wc -l < "$REF/.claude/orchestration/events.jsonl")"
+else
+  REF_TASKS=0; REF_BYTES=0
+  printf 'corpus: SKIPPED — no fixture at %s\n' "$CORPUS"
+fi
 
 # ─────────────────────────────────────────────────────────── wave 1: parser
 
 head_ "Wave 1 — the argument parser"
 
-d=$(corpus)
-K=$(cd "$d" && node -e 'const r=require("./.claude/orchestration/register.json");console.log(r.tasks[0].key)')
-out=$(cd "$d" && node "$DRV" heard "$K" --kind note --text "--force was what I ran" 2>&1)
-got=$(cd "$d" && tail -1 .claude/orchestration/messages.jsonl \
-      | node -e 'let s="";process.stdin.on("data",c=>s+=c).on("end",()=>{try{console.log(JSON.parse(s).text)}catch{console.log("<unparseable>")}})')
-[ "$got" = "--force was what I ran" ] \
-  && ok "a --text value beginning with -- is kept verbatim" \
-  || bad "a --text value beginning with -- is kept verbatim" "stored: $got"
+if [ "$HAVE_CORPUS" = 1 ]; then
+  d=$(corpus)
+  K=$(cd "$d" && node -e 'const r=require("./.claude/orchestration/register.json");console.log(r.tasks[0].key)')
+  out=$(cd "$d" && node "$DRV" heard "$K" --kind note --text "--force was what I ran" 2>&1)
+  got=$(cd "$d" && tail -1 .claude/orchestration/messages.jsonl \
+        | node -e 'let s="";process.stdin.on("data",c=>s+=c).on("end",()=>{try{console.log(JSON.parse(s).text)}catch{console.log("<unparseable>")}})')
+  [ "$got" = "--force was what I ran" ] \
+    && ok "a --text value beginning with -- is kept verbatim" \
+    || bad "a --text value beginning with -- is kept verbatim" "stored: $got"
 
-out=$(cd "$d" && node "$DRV" heard "$K" --kind note --text 2>&1); c=$?
-[ $c -ne 0 ] && ok "a bare --text is refused, not recorded as true" \
-             || bad "a bare --text is refused, not recorded as true" "exit $c: $out"
+  out=$(cd "$d" && node "$DRV" heard "$K" --kind note --text 2>&1); c=$?
+  [ $c -ne 0 ] && ok "a bare --text is refused, not recorded as true" \
+               || bad "a bare --text is refused, not recorded as true" "exit $c: $out"
 
-out=$(cd "$d" && node "$DRV" defect add --task "$K" --kind bug --what w --evidence="--force" 2>&1)
-got=$(cd "$d" && node -e 'const r=require("./.claude/orchestration/register.json");console.log(r.defects[r.defects.length-1].evidence)')
-[ "$got" = "--force" ] && ok "--evidence=--value survives instead of becoming empty" \
-                       || bad "--evidence=--value survives instead of becoming empty" "stored: '$got'"
+  out=$(cd "$d" && node "$DRV" defect add --task "$K" --kind bug --what w --evidence="--force" 2>&1)
+  got=$(cd "$d" && node -e 'const r=require("./.claude/orchestration/register.json");console.log(r.defects[r.defects.length-1].evidence)')
+  [ "$got" = "--force" ] && ok "--evidence=--value survives instead of becoming empty" \
+                         || bad "--evidence=--value survives instead of becoming empty" "stored: '$got'"
 
-out=$(cd "$d" && node "$DRV" defect list --alll 2>&1); c=$?
-[ $c -ne 0 ] && ok "a misspelled flag is reported, not ignored" \
-             || bad "a misspelled flag is reported, not ignored" "exit $c"
+  out=$(cd "$d" && node "$DRV" defect list --alll 2>&1); c=$?
+  [ $c -ne 0 ] && ok "a misspelled flag is reported, not ignored" \
+               || bad "a misspelled flag is reported, not ignored" "exit $c"
 
-out=$(cd "$d" && node "$DRV" board --register 2>&1); c=$?
-case "$out" in
-  *"    at "*) bad "--register with no value gives an error, not a stack trace" "stack trace" ;;
-  *) [ $c -ne 0 ] && ok "--register with no value gives an error, not a stack trace" \
-                  || bad "--register with no value gives an error, not a stack trace" "exit 0" ;;
-esac
+  out=$(cd "$d" && node "$DRV" board --register 2>&1); c=$?
+  case "$out" in
+    *"    at "*) bad "--register with no value gives an error, not a stack trace" "stack trace" ;;
+    *) [ $c -ne 0 ] && ok "--register with no value gives an error, not a stack trace" \
+                    || bad "--register with no value gives an error, not a stack trace" "exit 0" ;;
+  esac
 
-allbad=1
-for v in bogus 0 -5 999999; do
-  out=$(cd "$d" && node "$DRV" rebuild --to "$v" 2>&1); c=$?
-  [ $c -eq 0 ] && allbad=0
-done
-[ $allbad -eq 1 ] && ok "rebuild --to refuses every out-of-range value" \
-                  || bad "rebuild --to refuses every out-of-range value" "one of bogus/0/-5/999999 exited 0"
+  allbad=1
+  for v in bogus 0 -5 999999; do
+    out=$(cd "$d" && node "$DRV" rebuild --to "$v" 2>&1); c=$?
+    [ $c -eq 0 ] && allbad=0
+  done
+  [ $allbad -eq 1 ] && ok "rebuild --to refuses every out-of-range value" \
+                    || bad "rebuild --to refuses every out-of-range value" "one of bogus/0/-5/999999 exited 0"
+else
+  skip "a --text value beginning with -- is kept verbatim" "no corpus fixture at $CORPUS"
+  skip "a bare --text is refused, not recorded as true" "no corpus fixture at $CORPUS"
+  skip "--evidence=--value survives instead of becoming empty" "no corpus fixture at $CORPUS"
+  skip "a misspelled flag is reported, not ignored" "no corpus fixture at $CORPUS"
+  skip "--register with no value gives an error, not a stack trace" "no corpus fixture at $CORPUS"
+  skip "rebuild --to refuses every out-of-range value" "no corpus fixture at $CORPUS"
+fi
 
 # ──────────────────────────────────────────────────────────── wave 2: record
 
 head_ "Wave 2 — the record"
 
-d=$(corpus)
-( cd "$d" && rm -f .claude/orchestration/events.jsonl && node "$DRV" iam zed >/dev/null 2>&1 )
-( cd "$d" && node "$DRV" rebuild >/dev/null 2>&1 )
-after=$(cd "$d" && wc -c < .claude/orchestration/register.json)
-tasks=$(cd "$d" && node -e 'try{const r=require("./.claude/orchestration/register.json");console.log((r.tasks||[]).length)}catch{console.log(0)}')
-if [ "$tasks" -ge "$REF_TASKS" ] && [ "$after" -gt $((REF_BYTES / 2)) ]; then
-  ok "losing events.jsonl no longer lets rebuild destroy the register"
+if [ "$HAVE_CORPUS" = 1 ]; then
+  d=$(corpus)
+  ( cd "$d" && rm -f .claude/orchestration/events.jsonl && node "$DRV" iam zed >/dev/null 2>&1 )
+  ( cd "$d" && node "$DRV" rebuild >/dev/null 2>&1 )
+  after=$(cd "$d" && wc -c < .claude/orchestration/register.json)
+  tasks=$(cd "$d" && node -e 'try{const r=require("./.claude/orchestration/register.json");console.log((r.tasks||[]).length)}catch{console.log(0)}')
+  if [ "$tasks" -ge "$REF_TASKS" ] && [ "$after" -gt $((REF_BYTES / 2)) ]; then
+    ok "losing events.jsonl no longer lets rebuild destroy the register"
+  else
+    bad "losing events.jsonl no longer lets rebuild destroy the register" \
+        "register $REF_BYTES → $after bytes, tasks $REF_TASKS → $tasks"
+  fi
+
+  d=$(corpus)
+  : "${d:?}"
+  mkdir -p "$d/.claude/orchestration/register.json.lock"
+  node -e 'const fs=require("fs");fs.writeFileSync(process.argv[1],JSON.stringify({pid:process.ppid,host:require("os").hostname(),since:new Date().toISOString()}))' \
+    "$d/.claude/orchestration/register.json.lock/holder.json"
+  out=$(cd "$d" && timeout 25 node "$DRV" rebuild 2>&1); c=$?
+  [ $c -ne 0 ] && ok "rebuild respects a lock held by a live process" \
+               || bad "rebuild respects a lock held by a live process" "wrote anyway (exit 0)"
+  : "${d:?}"
+  rm -rf "$d/.claude/orchestration/register.json.lock"
+
+  d=$(corpus)
+  HALF=$(( $(wc -l < "$d/.claude/orchestration/events.jsonl") * 3 / 4 ))
+  ( cd "$d" && node "$DRV" rebuild --to "$HALF" >/dev/null 2>&1 )
+  out=$(cd "$d" && node "$DRV" verify 2>&1); c=$?
+  [ $c -eq 0 ] && ok "a partial rebuild does not leave the record and register drifted" \
+               || bad "a partial rebuild does not leave the record and register drifted" \
+                      "verify exit $c — $(echo "$out"|head -1)"
+
+  d=$(corpus)
+  ( cd "$d" && node "$DRV" --register "$d/.claude/orchestration/register.json" iam probe-name >/dev/null 2>&1 )
+  out=$(cd "$d" && node "$DRV" events --n 1 2>&1 | sed -n 1p)
+  case "$out" in
+    *iam*) ok "the record names the command even when --register comes first" ;;
+    *)     bad "the record names the command even when --register comes first" "shows: $(echo "$out"|cut -c1-64)" ;;
+  esac
+
+  d=$(corpus)
+  : "${d:?}"
+  rm -f "$d/.claude/orchestration/events.jsonl"; mkdir -p "$d/.claude/orchestration/events.jsonl"
+  out=$(cd "$d" && node "$DRV" verify 2>&1)
+  case "$out" in
+    *"    at "*) bad "a directory-shaped events.jsonl gives an error, not a stack trace" "stack trace" ;;
+    *)          ok "a directory-shaped events.jsonl gives an error, not a stack trace" ;;
+  esac
 else
-  bad "losing events.jsonl no longer lets rebuild destroy the register" \
-      "register $REF_BYTES → $after bytes, tasks $REF_TASKS → $tasks"
+  skip "losing events.jsonl no longer lets rebuild destroy the register" "no corpus fixture at $CORPUS"
+  skip "rebuild respects a lock held by a live process" "no corpus fixture at $CORPUS"
+  skip "a partial rebuild does not leave the record and register drifted" "no corpus fixture at $CORPUS"
+  skip "the record names the command even when --register comes first" "no corpus fixture at $CORPUS"
+  skip "a directory-shaped events.jsonl gives an error, not a stack trace" "no corpus fixture at $CORPUS"
 fi
-
-d=$(corpus)
-mkdir -p "$d/.claude/orchestration/register.json.lock"
-node -e 'const fs=require("fs");fs.writeFileSync(process.argv[1],JSON.stringify({pid:process.ppid,host:require("os").hostname(),since:new Date().toISOString()}))' \
-  "$d/.claude/orchestration/register.json.lock/holder.json"
-out=$(cd "$d" && timeout 25 node "$DRV" rebuild 2>&1); c=$?
-[ $c -ne 0 ] && ok "rebuild respects a lock held by a live process" \
-             || bad "rebuild respects a lock held by a live process" "wrote anyway (exit 0)"
-rm -rf "$d/.claude/orchestration/register.json.lock"
-
-d=$(corpus)
-HALF=$(( $(wc -l < "$d/.claude/orchestration/events.jsonl") * 3 / 4 ))
-( cd "$d" && node "$DRV" rebuild --to "$HALF" >/dev/null 2>&1 )
-out=$(cd "$d" && node "$DRV" verify 2>&1); c=$?
-[ $c -eq 0 ] && ok "a partial rebuild does not leave the record and register drifted" \
-             || bad "a partial rebuild does not leave the record and register drifted" \
-                    "verify exit $c — $(echo "$out"|head -1)"
-
-d=$(corpus)
-( cd "$d" && node "$DRV" --register "$d/.claude/orchestration/register.json" iam probe-name >/dev/null 2>&1 )
-out=$(cd "$d" && node "$DRV" events --n 1 2>&1 | sed -n 1p)
-case "$out" in
-  *iam*) ok "the record names the command even when --register comes first" ;;
-  *)     bad "the record names the command even when --register comes first" "shows: $(echo "$out"|cut -c1-64)" ;;
-esac
-
-d=$(corpus)
-rm -f "$d/.claude/orchestration/events.jsonl"; mkdir -p "$d/.claude/orchestration/events.jsonl"
-out=$(cd "$d" && node "$DRV" verify 2>&1)
-case "$out" in
-  *"    at "*) bad "a directory-shaped events.jsonl gives an error, not a stack trace" "stack trace" ;;
-  *)          ok "a directory-shaped events.jsonl gives an error, not a stack trace" ;;
-esac
 
 # ────────────────────────────────────────────────────── wave 3: dispatch/guard
 
@@ -211,53 +259,60 @@ branch:"main; touch /tmp/claude-1000/PWNED_ACCEPT",worktree:process.argv[2],chip
   || ok "a branch name cannot run a shell command"
 rm -f /tmp/claude-1000/PWNED_ACCEPT
 
-d=$(corpus)
-L=$(cd "$d" && node -e 'const r=require("./.claude/orchestration/register.json");const t=r.tasks.find(x=>x.status==="landed");console.log(t?t.key:"")')
-if [ -n "$L" ]; then
-  out=$(cd "$d" && echo '{"verified":"nothing","outcome":"failed"}' | node "$DRV" done "$L" 2>&1); c=$?
-  st=$(cd "$d" && node -e 'const r=require("./.claude/orchestration/register.json");console.log(r.tasks.find(x=>x.key===process.argv[1]).status)' "$L")
-  { [ $c -ne 0 ] && [ "$st" = "landed" ]; } \
-    && ok "done on a landed task is refused and does not un-land it" \
-    || bad "done on a landed task is refused and does not un-land it" "exit $c, status now $st"
-else
-  skip "done on a landed task is refused" "no landed task in the corpus"
-fi
-
-P=$(cd "$d" && node -e 'const r=require("./.claude/orchestration/register.json");const t=r.tasks.find(x=>x.status==="planned"&&!x.chip);console.log(t?t.key:"")')
-if [ -n "$P" ]; then
-  out=$(cd "$d" && echo '{"verified":"v","outcome":"passed"}' | node "$DRV" done "$P" 2>&1); c=$?
-  [ $c -ne 0 ] && ok "done on a task that was never handed out is refused" \
-               || bad "done on a task that was never handed out is refused" "accepted"
-else
-  skip "done on a never-dispatched task is refused" "no planned task"
-fi
-
-d=$(corpus)
-out=$(cd "$d" && node "$DRV" graph 2>&1)
-case "$out" in
-  *"Nothing clashes. Every round above can run side by side."*)
-    bad "graph no longer claims an all-clear it did not check" "still prints the absolute wording" ;;
-  *) ok "graph no longer claims an all-clear it did not check" ;;
-esac
-
-d=$(corpus)
-sug=$(cd "$d" && node "$DRV" bundle suggest 2>&1 | grep -oE 'bundle [0-9A-Za-z.\-]+( [0-9A-Za-z.\-]+)* --into [0-9A-Za-z.\-]+' | head -1)
-if [ -n "$sug" ]; then
-  before=$(cd "$d" && node "$DRV" graph >/dev/null 2>&1; echo $?)
-  bout=$(cd "$d" && node "$DRV" $sug 2>&1); bc=$?
-  out=$(cd "$d" && node "$DRV" graph 2>&1); c=$?
-  cancelled=$(cd "$d" && node -e 'const r=require("./.claude/orchestration/register.json");console.log(r.tasks.filter(t=>t.status==="cancelled").length)')
-  if [ "$bc" -ne 0 ]; then
-    bad "the bundle command that suggest prints actually runs" "exit $bc: $(echo "$bout"|head -1)"
-  elif [ "$cancelled" -eq 0 ]; then
-    bad "the bundle command that suggest prints absorbs its members" "nothing was cancelled"
-  elif echo "$out" | grep -q "Cannot be ordered" || { [ "$before" -eq 0 ] && [ "$c" -ne 0 ]; }; then
-    bad "bundling does not wedge the graph" "graph went $before → $c"
+if [ "$HAVE_CORPUS" = 1 ]; then
+  d=$(corpus)
+  L=$(cd "$d" && node -e 'const r=require("./.claude/orchestration/register.json");const t=r.tasks.find(x=>x.status==="landed");console.log(t?t.key:"")')
+  if [ -n "$L" ]; then
+    out=$(cd "$d" && echo '{"verified":"nothing","outcome":"failed"}' | node "$DRV" done "$L" 2>&1); c=$?
+    st=$(cd "$d" && node -e 'const r=require("./.claude/orchestration/register.json");console.log(r.tasks.find(x=>x.key===process.argv[1]).status)' "$L")
+    { [ $c -ne 0 ] && [ "$st" = "landed" ]; } \
+      && ok "done on a landed task is refused and does not un-land it" \
+      || bad "done on a landed task is refused and does not un-land it" "exit $c, status now $st"
   else
-    ok "bundling repoints dependents and leaves the graph orderable"
+    skip "done on a landed task is refused" "no landed task in the corpus"
+  fi
+
+  P=$(cd "$d" && node -e 'const r=require("./.claude/orchestration/register.json");const t=r.tasks.find(x=>x.status==="planned"&&!x.chip);console.log(t?t.key:"")')
+  if [ -n "$P" ]; then
+    out=$(cd "$d" && echo '{"verified":"v","outcome":"passed"}' | node "$DRV" done "$P" 2>&1); c=$?
+    [ $c -ne 0 ] && ok "done on a task that was never handed out is refused" \
+                 || bad "done on a task that was never handed out is refused" "accepted"
+  else
+    skip "done on a never-dispatched task is refused" "no planned task"
+  fi
+
+  d=$(corpus)
+  out=$(cd "$d" && node "$DRV" graph 2>&1)
+  case "$out" in
+    *"Nothing clashes. Every round above can run side by side."*)
+      bad "graph no longer claims an all-clear it did not check" "still prints the absolute wording" ;;
+    *) ok "graph no longer claims an all-clear it did not check" ;;
+  esac
+
+  d=$(corpus)
+  sug=$(cd "$d" && node "$DRV" bundle suggest 2>&1 | grep -oE 'bundle [0-9A-Za-z.\-]+( [0-9A-Za-z.\-]+)* --into [0-9A-Za-z.\-]+' | head -1)
+  if [ -n "$sug" ]; then
+    before=$(cd "$d" && node "$DRV" graph >/dev/null 2>&1; echo $?)
+    bout=$(cd "$d" && node "$DRV" $sug 2>&1); bc=$?
+    out=$(cd "$d" && node "$DRV" graph 2>&1); c=$?
+    cancelled=$(cd "$d" && node -e 'const r=require("./.claude/orchestration/register.json");console.log(r.tasks.filter(t=>t.status==="cancelled").length)')
+    if [ "$bc" -ne 0 ]; then
+      bad "the bundle command that suggest prints actually runs" "exit $bc: $(echo "$bout"|head -1)"
+    elif [ "$cancelled" -eq 0 ]; then
+      bad "the bundle command that suggest prints absorbs its members" "nothing was cancelled"
+    elif echo "$out" | grep -q "Cannot be ordered" || { [ "$before" -eq 0 ] && [ "$c" -ne 0 ]; }; then
+      bad "bundling does not wedge the graph" "graph went $before → $c"
+    else
+      ok "bundling repoints dependents and leaves the graph orderable"
+    fi
+  else
+    skip "bundling leaves the graph orderable" "nothing suggested"
   fi
 else
-  skip "bundling leaves the graph orderable" "nothing suggested"
+  skip "done on a landed task is refused" "no corpus fixture at $CORPUS"
+  skip "done on a never-dispatched task is refused" "no corpus fixture at $CORPUS"
+  skip "graph no longer claims an all-clear it did not check" "no corpus fixture at $CORPUS"
+  skip "bundling leaves the graph orderable" "no corpus fixture at $CORPUS"
 fi
 
 # found while reconciling the prose: the gates sat behind `if (!t.chip)`, so a
@@ -290,20 +345,24 @@ out=$(cd "$d4" && node "$DRV" landed A --sha abc 2>&1 | awk '/landing\(s\) now s
               || bad "landed counts one landing as one, not two" "$out"
 
 # board ran the address straight into the title on every row of a real run
-d5=$(corpus)
-collide=$(cd "$d5" && node "$DRV" board 2>&1 | node -e '
-let s="";process.stdin.on("data",c=>s+=c).on("end",()=>{
-  const rows=s.split("\n").filter(l=>/^\S+\s+[●○◐?]/.test(l));
-  const hdr=s.split("\n").find(l=>l.startsWith("key"));
-  if(!hdr||!rows.length){console.log("no-rows");return}
-  const at=hdr.indexOf("title");
-  const bad=rows.filter(l=>l.length>at && l[at-1]!==" ").length;
-  console.log(bad?("collide:"+bad):"clear");});')
-case "$collide" in
-  clear) ok "board keeps the address out of the title column" ;;
-  no-rows) skip "board column alignment" "no rows to measure" ;;
-  *) bad "board keeps the address out of the title column" "${collide#collide:} row(s) run together" ;;
-esac
+if [ "$HAVE_CORPUS" = 1 ]; then
+  d5=$(corpus)
+  collide=$(cd "$d5" && node "$DRV" board 2>&1 | node -e '
+  let s="";process.stdin.on("data",c=>s+=c).on("end",()=>{
+    const rows=s.split("\n").filter(l=>/^\S+\s+[●○◐?]/.test(l));
+    const hdr=s.split("\n").find(l=>l.startsWith("key"));
+    if(!hdr||!rows.length){console.log("no-rows");return}
+    const at=hdr.indexOf("title");
+    const bad=rows.filter(l=>l.length>at && l[at-1]!==" ").length;
+    console.log(bad?("collide:"+bad):"clear");});')
+  case "$collide" in
+    clear) ok "board keeps the address out of the title column" ;;
+    no-rows) skip "board column alignment" "no rows to measure" ;;
+    *) bad "board keeps the address out of the title column" "${collide#collide:} row(s) run together" ;;
+  esac
+else
+  skip "board keeps the address out of the title column" "no corpus fixture at $CORPUS"
+fi
 
 # ─────────────────────────────────────────────────── wave 4: grill and ledger
 
@@ -360,76 +419,88 @@ else
   ok "the dead message subsystem is gone from the source"
 fi
 
-d=$(corpus)
-K=$(cd "$d" && node -e 'const r=require("./.claude/orchestration/register.json");const t=r.tasks.find(x=>!["landed","cancelled"].includes(x.status));console.log(t?t.key:r.tasks[0].key)')
-LONG=$(node -e 'console.log("I finished the work. "+"and then a further consideration that runs on and on ".repeat(80)+"but do not merge until the migration lands.")')
-( cd "$d" && node "$DRV" heard "$K" --kind report --text "$LONG" >/dev/null 2>&1 )
-# The property that matters is that UNBOUNDED agent text cannot bloat the digest.
-# Some lines are long by the driver's own fixed wording ("reassign it (`owed
-# assign …`) or settle it (…)"); those are bounded and are not the bug.
-( cd "$d" && node "$DRV" digest > "$d/dg.txt" 2>&1 )
-verdict=$(node -e '
-const fs=require("fs");
-const t=fs.readFileSync(process.argv[1],"utf8");
-const tailLeaked = t.includes("but do not merge until the migration lands");
-const agentLines = t.split("\n").filter(l=>l.includes("finished the work"));
-const worst = agentLines.reduce((m,l)=>Math.max(m,l.length),0);
-if (tailLeaked) console.log("FAIL:the 4000-char message reached the digest whole");
-else if (worst > 200) console.log("FAIL:an agent line ran to "+worst+" chars");
-else if (t.length > 20000) console.log("FAIL:the digest is "+t.length+" bytes");
-else console.log("OK:"+t.length+" bytes, agent line clipped to "+worst);
-' "$d/dg.txt")
-case "$verdict" in
-  OK:*)  ok "digest clips agent text rather than letting it bloat the list (${verdict#OK:})" ;;
-  *)     bad "digest clips agent text rather than letting it bloat the list" "${verdict#FAIL:}" ;;
-esac
+if [ "$HAVE_CORPUS" = 1 ]; then
+  d=$(corpus)
+  K=$(cd "$d" && node -e 'const r=require("./.claude/orchestration/register.json");const t=r.tasks.find(x=>!["landed","cancelled"].includes(x.status));console.log(t?t.key:r.tasks[0].key)')
+  LONG=$(node -e 'console.log("I finished the work. "+"and then a further consideration that runs on and on ".repeat(80)+"but do not merge until the migration lands.")')
+  ( cd "$d" && node "$DRV" heard "$K" --kind report --text "$LONG" >/dev/null 2>&1 )
+  # The property that matters is that UNBOUNDED agent text cannot bloat the digest.
+  # Some lines are long by the driver's own fixed wording ("reassign it (`owed
+  # assign …`) or settle it (…)"); those are bounded and are not the bug.
+  ( cd "$d" && node "$DRV" digest > "$d/dg.txt" 2>&1 )
+  verdict=$(node -e '
+  const fs=require("fs");
+  const t=fs.readFileSync(process.argv[1],"utf8");
+  const tailLeaked = t.includes("but do not merge until the migration lands");
+  const agentLines = t.split("\n").filter(l=>l.includes("finished the work"));
+  const worst = agentLines.reduce((m,l)=>Math.max(m,l.length),0);
+  if (tailLeaked) console.log("FAIL:the 4000-char message reached the digest whole");
+  else if (worst > 200) console.log("FAIL:an agent line ran to "+worst+" chars");
+  else if (t.length > 20000) console.log("FAIL:the digest is "+t.length+" bytes");
+  else console.log("OK:"+t.length+" bytes, agent line clipped to "+worst);
+  ' "$d/dg.txt")
+  case "$verdict" in
+    OK:*)  ok "digest clips agent text rather than letting it bloat the list (${verdict#OK:})" ;;
+    *)     bad "digest clips agent text rather than letting it bloat the list" "${verdict#FAIL:}" ;;
+  esac
 
-# a release must not clear an unanswered question — only a reply does
-d=$(corpus)
-K=$(cd "$d" && node -e 'const r=require("./.claude/orchestration/register.json");const t=r.tasks.find(x=>!["landed","cancelled"].includes(x.status));console.log(t?t.key:"")')
-if [ -n "$K" ]; then
-  ( cd "$d" && node "$DRV" heard "$K" --kind question --text "which settings file did you mean" >/dev/null 2>&1 )
-  ( cd "$d" && node "$DRV" say "$K" --kind release --text "released, rebase now" >/dev/null 2>&1 )
-  out=$(cd "$d" && node "$DRV" outstanding 2>&1)
-  echo "$out" | grep -q "asked you something" \
-    && ok "a release does not clear an unanswered question" \
-    || bad "a release does not clear an unanswered question" "the question vanished from outstanding"
+  # a release must not clear an unanswered question — only a reply does
+  d=$(corpus)
+  K=$(cd "$d" && node -e 'const r=require("./.claude/orchestration/register.json");const t=r.tasks.find(x=>!["landed","cancelled"].includes(x.status));console.log(t?t.key:"")')
+  if [ -n "$K" ]; then
+    ( cd "$d" && node "$DRV" heard "$K" --kind question --text "which settings file did you mean" >/dev/null 2>&1 )
+    ( cd "$d" && node "$DRV" say "$K" --kind release --text "released, rebase now" >/dev/null 2>&1 )
+    out=$(cd "$d" && node "$DRV" outstanding 2>&1)
+    echo "$out" | grep -q "asked you something" \
+      && ok "a release does not clear an unanswered question" \
+      || bad "a release does not clear an unanswered question" "the question vanished from outstanding"
+  else
+    skip "a release does not clear an unanswered question" "no open task"
+  fi
 else
-  skip "a release does not clear an unanswered question" "no open task"
+  skip "digest clips agent text rather than letting it bloat the list" "no corpus fixture at $CORPUS"
+  skip "a release does not clear an unanswered question" "no corpus fixture at $CORPUS"
 fi
 
 # ────────────────────────────────────────────────────────────── wave 5: slot
 
 head_ "Wave 5 — the shared machine slot"
 
-d=$(corpus)
-( cd "$d" && node "$DRV" slot take ci --task probe >/dev/null 2>&1 )
-out=$(cd "$d" && timeout 20 node "$DRV" slot run ci --timeout 1 -- /bin/echo BARGED 2>&1)
-echo "$out" | grep -q BARGED \
-  && bad "a slot taken by hand actually holds against slot run" "the second command barged in" \
-  || ok "a slot taken by hand actually holds against slot run"
-( cd "$d" && node "$DRV" slot free ci --force >/dev/null 2>&1 )
+if [ "$HAVE_CORPUS" = 1 ]; then
+  d=$(corpus)
+  ( cd "$d" && node "$DRV" slot take ci --task probe >/dev/null 2>&1 )
+  out=$(cd "$d" && timeout 20 node "$DRV" slot run ci --timeout 1 -- /bin/echo BARGED 2>&1)
+  echo "$out" | grep -q BARGED \
+    && bad "a slot taken by hand actually holds against slot run" "the second command barged in" \
+    || ok "a slot taken by hand actually holds against slot run"
+  ( cd "$d" && node "$DRV" slot free ci --force >/dev/null 2>&1 )
 
-d=$(corpus)
-out=$(cd "$d" && timeout 30 node "$DRV" slot run ci -- FOO=1 /bin/echo hi 2>&1); c=$?
-echo "$out" | grep -q '^hi$' \
-  && ok "slot run handles a command with a leading VAR=value" \
-  || bad "slot run handles a command with a leading VAR=value" "exit $c: $(echo "$out"|grep -i 'not found'|head -1)"
+  d=$(corpus)
+  out=$(cd "$d" && timeout 30 node "$DRV" slot run ci -- FOO=1 /bin/echo hi 2>&1); c=$?
+  echo "$out" | grep -q '^hi$' \
+    && ok "slot run handles a command with a leading VAR=value" \
+    || bad "slot run handles a command with a leading VAR=value" "exit $c: $(echo "$out"|grep -i 'not found'|head -1)"
 
-d=$(corpus)
-: > "$d/serial.log"
-( cd "$d" && timeout 60 node "$DRV" slot run ci -- /bin/bash -c 'echo START >> serial.log; sleep 3; echo END >> serial.log' >/dev/null 2>&1 ) &
-sleep 1
-( cd "$d" && timeout 60 node "$DRV" slot run ci -- /bin/bash -c 'echo START >> serial.log; sleep 1; echo END >> serial.log' >/dev/null 2>&1 ) &
-wait
-seq=$(tr '\n' ' ' < "$d/serial.log")
-[ "$seq" = "START END START END " ] \
-  && ok "two concurrent slot runs serialise" \
-  || bad "two concurrent slot runs serialise" "interleaved: $seq"
+  d=$(corpus)
+  : "${d:?}"
+  : > "$d/serial.log"
+  ( cd "$d" && timeout 60 node "$DRV" slot run ci -- /bin/bash -c 'echo START >> serial.log; sleep 3; echo END >> serial.log' >/dev/null 2>&1 ) &
+  sleep 1
+  ( cd "$d" && timeout 60 node "$DRV" slot run ci -- /bin/bash -c 'echo START >> serial.log; sleep 1; echo END >> serial.log' >/dev/null 2>&1 ) &
+  wait
+  seq=$(tr '\n' ' ' < "$d/serial.log")
+  [ "$seq" = "START END START END " ] \
+    && ok "two concurrent slot runs serialise" \
+    || bad "two concurrent slot runs serialise" "interleaved: $seq"
+else
+  skip "a slot taken by hand actually holds against slot run" "no corpus fixture at $CORPUS"
+  skip "slot run handles a command with a leading VAR=value" "no corpus fixture at $CORPUS"
+  skip "two concurrent slot runs serialise" "no corpus fixture at $CORPUS"
+fi
 
-# installs are heavy, so they go through the slot rather than all at once
-d=$(corpus)
-out=$(cd "$d" && node -e '
+# installs are heavy, so they go through the slot rather than all at once —
+# this one only reads the driver's own source, so it does not need a corpus.
+out=$(node -e '
 const src=require("fs").readFileSync(process.argv[1],"utf8");
 const m=src.match(/const INSTALL = [^\n]*\n/);
 console.log(m?"has-install-rule":"no-install-rule");' "$DRV")
@@ -442,15 +513,19 @@ console.log(m?"has-install-rule":"no-install-rule");' "$DRV")
 head_ "Standing gates"
 
 repo="$(dirname "$DRV")"
-out=$(cd "$repo" && node test.mjs 2>&1)
+out=$(cd "$repo" && node scripts/sweep.mjs 2>&1)
 echo "$out" | tail -1 | grep -q "all green" \
   && ok "the driver's own suite: $(echo "$out"|tail -1)" \
   || bad "the driver's own suite is green" "$(echo "$out"|tail -3|tr '\n' ' ')"
 
-d=$(corpus)
-out=$(cd "$d" && node "$DRV" verify 2>&1); c=$?
-[ $c -eq 0 ] && ok "verify is green on the untouched recorded run — $(echo "$out"|head -1|cut -c1-58)" \
-             || bad "verify is green on the untouched recorded run" "$(echo "$out"|head -2|tr '\n' ' ')"
+if [ "$HAVE_CORPUS" = 1 ]; then
+  d=$(corpus)
+  out=$(cd "$d" && node "$DRV" verify 2>&1); c=$?
+  [ $c -eq 0 ] && ok "verify is green on the untouched recorded run — $(echo "$out"|head -1|cut -c1-58)" \
+               || bad "verify is green on the untouched recorded run" "$(echo "$out"|head -2|tr '\n' ' ')"
+else
+  skip "verify is green on the untouched recorded run" "no corpus fixture at $CORPUS"
+fi
 
 # ───────────────────────────────────────────────────────────────── summary
 

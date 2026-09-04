@@ -346,6 +346,7 @@ Only then is it joined in a staging copy, run in full, and merged.
 | `driver.mjs` | the bookkeeping: scanning, the question linter, the task graph, the board |
 | `reference/plain-words.md` | the vocabulary to reach for instead of jargon |
 | `test.mjs` | the driver's own sweep, run in a throwaway git repo |
+| `scripts/sweep.mjs` | runs that sweep sharded across the machine's cores |
 | `acceptance.sh` | 32 end-to-end cases, each one a bug reproduced before it was fixed |
 
 The driver does the parts a model does badly — remembering every gap it found,
@@ -392,8 +393,12 @@ record (`owed`) — a round refuses to close silently on top of one, and when th
 task carrying one finishes, the shut window is reported rather than left for
 somebody to notice.
 
-`node test.mjs` runs the sweep: the whole lifecycle plus a case for every
-defect fixed so far, in a throwaway git repo.
+`npm test` runs the sweep: the whole lifecycle plus a case for every defect
+fixed so far, each in a throwaway git repo. The cases share nothing but the
+machine, so it runs them as one process per shard across every core — a couple
+of minutes' worth of work in something closer to twenty seconds. `node test.mjs`
+still runs all of them in one process, in order, when that is easier to read;
+`node test.mjs --only <words>` runs the cases whose label matches.
 
 `bash acceptance.sh /path/to/driver.mjs` runs the second harness — 32 cases
 written against the audit rather than against the fixes, each one reproduced on

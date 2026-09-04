@@ -4,7 +4,8 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "test": "node test.mjs",
+    "test": "node scripts/sweep.mjs",
+    "test:serial": "node test.mjs",
     "test:coverage": "node scripts/coverage.mjs"
   }
 }

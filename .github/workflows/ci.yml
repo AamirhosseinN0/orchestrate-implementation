@@ -8,17 +8,36 @@ on:
   pull_request:
   workflow_dispatch:
 
+# A second push to the same branch makes the first one's answer worthless, so
+# stop paying for it. The main branch is left alone: its history is the record.
+concurrency:
+  group: checks-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  # The sweep starts the driver several hundred times. Keeping the compiled form
+  # on disk between those starts is most of a cold start saved each time, and the
+  # cache below carries it between runs as well.
+  NODE_COMPILE_CACHE: ${{ github.workspace }}/.node-compile-cache
+
 jobs:
   suite:
     name: the sweep
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
         with:
           node-version: '24'
+
+      - name: keep the compiled form between runs
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.node-compile-cache
+          key: node-compile-${{ runner.os }}-${{ hashFiles('driver.mjs', 'test.mjs', 'claude-cursor/orchestrate.mjs') }}
+          restore-keys: node-compile-${{ runner.os }}-
 
       # Several checks build throwaway repositories and commit in them.
       - name: give git an identity to commit with
@@ -27,13 +46,57 @@ jobs:
           git config --global user.name "ci"
           git config --global init.defaultBranch main
 
+      # One process per shard. The cases share nothing but the machine, so the
+      # runner hands each shard an interleaved slice and adds the counts back up.
       - name: run the sweep
-        run: node test.mjs
+        run: node scripts/sweep.mjs
+
+  windows:
+    name: the sweep on Windows
+    runs-on: windows-latest
+    timeout-minutes: 20
+    # Nine defects lived in this repository because every job ran on Linux:
+    # path separators stored native, a drive letter fed to a POSIX glob walker,
+    # `npm.cmd` that execFileSync cannot spawn, a hardcoded /bin/bash, and
+    # `git worktree list` printing forward slashes at a path.join() built with
+    # backslashes. None of them can fail a Linux runner. This job is the only
+    # thing that sees them.
+    #
+    # Not blocking yet, on purpose: a handful of cases still fail here for
+    # reasons that are the test's technique rather than the product's
+    # behaviour -- `fs.chmodSync(dir, 0o500)` does not make a directory
+    # unwritable on Windows, and the Cursor CLI is not installed on the runner.
+    # Make this job required the moment those cases skip cleanly instead of
+    # failing; leaving it advisory for longer than that turns it back into
+    # decoration.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      # Deliberately NOT `init.defaultBranch main`, which the Linux jobs set.
+      # Git for Windows ships `master` in its own system gitconfig, and that is
+      # what broke `guard`: the base-branch guess preferred the config default
+      # over the branch the repository actually had. Setting `main` here would
+      # configure the bug away and this job would never see it again.
+      - name: give git an identity, and the default Git for Windows ships with
+        shell: bash
+        run: |
+          git config --global user.email "ci@example.invalid"
+          git config --global user.name "ci"
+          git config --global init.defaultBranch master
+
+      - name: run the sweep
+        shell: bash
+        run: node scripts/sweep.mjs
 
   coverage:
     name: the coverage floor
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -47,7 +110,9 @@ jobs:
           git config --global user.name "ci"
           git config --global init.defaultBranch main
 
-      # Runs the sweep again under V8 coverage and fails if driver-function
-      # coverage drops below the floor in scripts/coverage.mjs.
+      # Runs the sweep again — sharded, same as above — under V8 coverage, and
+      # fails if driver-function coverage drops below the floor in
+      # scripts/coverage.mjs. Node turns the compile cache off by itself when
+      # NODE_V8_COVERAGE is set, so this job does not use one.
       - name: run the sweep under coverage
         run: node scripts/coverage.mjs

@@ -1,7 +1,7 @@
 ---
 name: claude-cursor
 description: Run an implementation end to end — ask whether to build on Cursor or on DeepSeek first, load the plans, map which of them touch which files so the round can be made wide before anything runs, judge how hard each step is and pick a model or an effort for it, refine away the ambiguity, check that nothing collides, then run every step that can run at once. Every step that can run is launched in the same round on its own agent; only a dependency that is not yet on the main line or a serialisation point that open work is already moving holds one back. A dependency counts the moment it has merged, not once its suite is green. Two steps owning the same file run together and reconcile at the merge, because each builds in its own worktree. Agents execute on the Cursor CLI (`agent`), on DeepSeek V4 Flash through opencode, or as Claude Code subagents. Use when asked to orchestrate a plan, run an implementation, hand the building work to Cursor or DeepSeek agents, choose which model or CLI builds a round, run steps in parallel, drive work in parallel worktrees, pick models per step, or take a written plan through to merged code.
-allowed-tools: Bash, Read, Write, Edit, Grep, Glob, AskUserQuestion, TodoWrite
+allowed-tools: Agent, Bash, Read, Write, Edit, Grep, Glob, AskUserQuestion, TodoWrite
 ---
 
 # The stages
@@ -143,9 +143,11 @@ Two things are worth knowing before choosing this runner:
   these are not.
 - **An effort the model does not accept is thrown away in silence.**
   `opencode run --variant nonsense` runs a normal turn and reports nothing. So
-  the effort is checked against opencode's own registry *before* the run —
-  `deepseek-v4-flash` accepts `low`, `high`, `max`, and nothing else, and a
-  ladder naming anything else is refused rather than billed for.
+  the effort is checked against opencode's own registry *before* the run, and a
+  ladder naming an effort that model does not list is refused rather than billed
+  for. The accepted set is read from the registry at run time, not fixed here —
+  only `max`, `high` and `minimal` have been confirmed from opencode's own help
+  text, so do not hard-code a vocabulary against this paragraph.
 
 - **A run that never answers is stopped.** The provider has been seen accepting
   a request and returning nothing at all — no events, no error, empty stderr,

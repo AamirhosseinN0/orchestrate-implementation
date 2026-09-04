@@ -5,7 +5,8 @@
 // State lives in .claude/orch/. The record (events.jsonl) is the truth and
 // state.json is a projection of it — every change appends the event first and
 // writes the projection second, so a crash between the two leaves an event with
-// no projection, which is repairable. The other order silently loses the change.
+// no projection. `rebuild` repairs that by replaying the last event's state
+// snapshot back into state.json. The other order would silently lose the change.
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
@@ -24,7 +25,11 @@ const die = (msg, code = 2) => { console.error('✗ ' + msg); process.exit(code)
 // relativises to a ../../../.. chain nobody can read or check.
 const shortest = (abs) => {
   const rel = path.relative(CWD, abs);
-  return rel && !rel.startsWith('../..') && rel.length < abs.length ? rel : abs;
+  // path.relative answers in the platform's own separator, so on Windows a
+  // path two levels up reads "..\\.." — a POSIX-only startsWith check let it
+  // straight through and printed the very ../../../.. chain this exists to
+  // stop. Fold to forward slashes before judging it.
+  return rel && !slashes(rel).startsWith('../..') && rel.length < abs.length ? rel : abs;
 };
 const SELF = () => shortest(process.argv[1]);
 const ok = (msg) => console.log('✓ ' + msg);
@@ -35,7 +40,7 @@ const EMPTY = { version: 1, created: null, plans: [], tasks: [], notes: [] };
 function readState() {
   if (!fs.existsSync(STATE)) return { ...EMPTY, tasks: [], plans: [], notes: [] };
   try { return JSON.parse(fs.readFileSync(STATE, 'utf8')); }
-  catch (e) { die(`state.json is not valid JSON (${e.message}). The record is intact — rebuild from ${EVENTS}`); }
+  catch (e) { die(`state.json is not valid JSON (${e.message}). The record is intact — run \`rebuild\` to replay it back from ${EVENTS}`); }
 }
 // Event first, projection second. See the header.
 function commit(s, why, argv) {
@@ -54,14 +59,46 @@ const depOf = (s, k) => tasks(s).find((t) => t.key === k);
 // record of what broke before. Two open steps touching one file is the single
 // failure this whole arrangement exists to prevent.
 function norm(p) {
-  let x = String(p).replace(/\/+$/, '').replace(/\/\*+$/, '');
+  // A record written on Windows holds backslashes; `slashes()` (below) is the
+  // one place that already folds them, so this reuses it rather than growing a
+  // second, slightly different, notion of "the same path".
+  let x = slashes(p).replace(/\/+$/, '');
   while (x.startsWith('./')) x = x.slice(2);
-  x = path.posix.normalize(x);
-  return x;
+  return path.posix.normalize(x === '' ? '.' : x);
+}
+// A glob only where `owns` actually uses one — `*` inside a segment or `**`
+// across segments — converted to the equivalent regex. `**/` and `/**` collapse
+// to "zero or more segments" so the boundary slash does not force at least one
+// directory to exist between the fixed parts of the pattern.
+const isGlob = (p) => /[*?]/.test(p);
+// Placeholders, not NUL: three characters from the Unicode private-use area,
+// which cannot occur in a path and, unlike a NUL byte, do not make git read this
+// file as binary and lose it to `diff` and `blame`.
+const PH_SLASH_STAR = '\uE000', PH_STAR_SLASH = '\uE001', PH_STAR_STAR = '\uE002';
+function globRe(pat) {
+  const esc = pat.replace(/[.+^${}()|[\]\\]/g, '\\$&');
+  const x = esc
+    .replace(/\*\*\//g, PH_SLASH_STAR)
+    .replace(/\/\*\*/g, PH_STAR_SLASH)
+    .replace(/\*\*/g, PH_STAR_STAR)
+    .replace(/\*/g, '[^/]*')
+    .replace(/\?/g, '.')
+    .replace(new RegExp(PH_SLASH_STAR, 'g'), '(?:.*/)?')
+    .replace(new RegExp(PH_STAR_SLASH, 'g'), '(?:/.*)?')
+    .replace(new RegExp(PH_STAR_STAR, 'g'), '.*');
+  return new RegExp('^' + x + '$');
 }
 function collides(a, b) {
-  const x = norm(a), y = norm(b);
-  return x === y || x.startsWith(y + '/') || y.startsWith(x + '/');
+  // Case-insensitive here only — not folded into `norm` itself, which other
+  // callers (firstMissing among them) use to build real filesystem paths that
+  // must keep their actual case on a case-sensitive filesystem.
+  const x = norm(a).toLowerCase(), y = norm(b).toLowerCase();
+  if (x === y || x.startsWith(y + '/') || y.startsWith(x + '/')) return true;
+  // Only a trailing glob used to be recognised, so a mid-path one — `src/**/*.js`
+  // against `src/a.js` — matched nothing and let stray files straight through.
+  if (isGlob(x) && !isGlob(y)) return globRe(x).test(y);
+  if (isGlob(y) && !isGlob(x)) return globRe(y).test(x);
+  return false;
 }
 function overlap(t1, t2) {
   const out = [];
@@ -73,17 +110,18 @@ function overlap(t1, t2) {
 // Comparing those by exact string equality is a check that can only ever fire
 // when two authors typed the same characters, and on a real run it never fired
 // once: a pre-flight found a docker-compose.yml collision it had reported clean.
-// Normalise before comparing; keep both spellings when reporting so the
-// mismatch is visible and can be tidied.
+// `normPoint` folds case and whitespace only, which those three spellings do
+// not agree on even after folding — the actual matching, including the scoped
+// `class: instance` form (a bare name still gates against any scoped instance
+// of the same class; two different instances do not), is `pointKinship` below,
+// which this reuses so the gate and `doctor`'s drift report agree on what
+// "the same point" means. Keep both spellings when reporting so a mismatch
+// worth tidying stays visible.
 const normPoint = (s) => String(s).trim().toLowerCase().replace(/\s+/g, ' ');
 function sharedPoints(t1, t2) {
-  const theirs = new Map();
-  for (const y of t2.serialises || []) theirs.set(normPoint(y), y);
   const out = [];
-  for (const x of t1.serialises || []) {
-    const y = theirs.get(normPoint(x));
-    if (y === undefined) continue;
-    out.push(y === x ? x : x + ' ≈ ' + y);
+  for (const x of t1.serialises || []) for (const y of t2.serialises || []) {
+    if (pointKinship(x, y) === 'same') out.push(y === x ? x : x + ' ≈ ' + y);
   }
   return out;
 }
@@ -231,6 +269,12 @@ const keyPrefix = (p) => 'S-' + planId(p);
 // id it is known by. A record written on Windows holds backslashes and every
 // caller types the other one.
 const slashes = (x) => String(x).split(path.win32.sep).join('/');
+// Every path this records or prints is repo-relative, and on Windows
+// path.relative hands back backslashes. Those are then compared against
+// `git diff --name-only`, which is always forward-slash, and pasted into
+// shell commands the operator is told to run — so the separator is folded
+// once, here, rather than at each of the eleven places that needed it.
+const relCwd = (p) => slashes(path.relative(CWD, p));
 // The same plan under either spelling. A step records the path it was handed;
 // the plan record holds the one `load` walked to, and on Windows those differ
 // by nothing but the slash.
@@ -247,6 +291,13 @@ function stepProblems(s, it, existing) {
   const p = [];
   if (!it || typeof it !== 'object' || Array.isArray(it)) return ['is not an object'];
   if (!it.key || typeof it.key !== 'string') p.push('needs a string key');
+  // A key becomes a worktree directory name and a branch name — `run open`
+  // builds both by string-pasting it in, with no path.join between the key and
+  // its neighbours. `owns` gets a whole gate of path checks below; a key of
+  // "../../evil" got none, and only git's own ref-format check stood between it
+  // and a worktree landing two directories outside the repo.
+  else if (/[\\/]/.test(it.key) || it.key === '.' || it.key === '..')
+    p.push(`key "${it.key}" cannot contain a slash — it becomes a worktree and branch name`);
   if (!existing && !it.title) p.push('needs a title');
   // A key is the address of one step. Two plans that both called something
   // "S-1" used to merge into one record without a word: the second plan's
@@ -301,7 +352,19 @@ function putStep(s, it) {
   const problems = stepProblems(s, it, existing);
   if (problems.length) return problems;
   const merged = existing ? { ...existing, ...it } : { status: 'planned', needs: [], owns: [], serialises: [], verify: [], ...it };
-  if (existing) Object.assign(existing, it); else s.tasks.push(merged);
+  if (existing) {
+    // Cancelled, never deleted (see `step rm`) — but a step add naming that key
+    // again is a deliberate act, and merging fields into a dead record while
+    // reporting success left it dead: `board` still showed it cancelled and
+    // `run open` refused it, with nothing having said so. Recording it again is
+    // what un-cancels it, unless the record itself says to stay cancelled.
+    if (existing.status === 'cancelled' && it.status === undefined) {
+      existing.status = 'planned';
+      delete existing.cancelledAt;
+      existing.revivedAt = new Date().toISOString();
+    }
+    Object.assign(existing, it);
+  } else s.tasks.push(merged);
   return null;
 }
 function reportOverlaps(s, keys) {
@@ -507,7 +570,7 @@ CMDS.load = (argv) => {
   if (!found.length) die('none of those paths held a plan file (.md, .markdown, .txt)');
   s.plans = found.map((f) => {
     const body = fs.readFileSync(f, 'utf8');
-    return { path: path.relative(CWD, f), lines: body.split('\n').length, bytes: Buffer.byteLength(body),
+    return { path: relCwd(f), lines: body.split('\n').length, bytes: Buffer.byteLength(body),
              sha: sha(body), requires: requiresOf(body) };
   });
   commit(s, 'load', argv);
@@ -673,6 +736,15 @@ function vetBatch(s, list) {
     probs.push(...needsProblems(dry, it || {}, mine));
     if (probs.length) bad.push([k || '(no key)', probs]);
   }
+  // A needs: edge that only closes into a loop once the whole batch is in place
+  // is invisible to the per-step checks above — each looks at one step against
+  // the state as it stood before this batch, and a self-reference or a cycle
+  // spread across several new steps passes every one of them individually.
+  // `needs "S1", which is not a step in this round` never fires because by the
+  // time it is checked, `dry` already holds S1. Only `waves`, run once over the
+  // batch as it would land, sees the loop.
+  const cyc = waves(dry).find((w) => w.wave === -1);
+  if (cyc) bad.push(['(cycle)', [`these steps depend on each other in a loop and could never open: ${cyc.tasks.map((t) => t.key).join(' ')}`]]);
   return bad;
 }
 
@@ -752,9 +824,13 @@ CMDS.step = (argv) => {
     // Nothing is recorded when a requirement would vanish. Half a graph is
     // worse than none, because the half that landed is the harder half to see.
     if (vanished.length) die(`${vanished.length} requirement(s) would be recorded nowhere. Nothing was written.`, 1);
-    if (!added.length) { ok('nothing to add — every plan already waits on what it says it comes after'); return; }
+    // An unknown plan is a failure on every path out of here, not only the one
+    // that goes on to commit — it used to exit 0 whenever there was also
+    // nothing to add or `--dry-run` was passed, so a caller checking the exit
+    // code alone never learned the ✗ line above had printed.
+    if (!added.length) { ok('nothing to add — every plan already waits on what it says it comes after'); if (unknown.length) process.exit(1); return; }
     for (const a of added) console.log('  ' + a);
-    if (dry) { console.log(`\n${added.length} link(s) — not recorded (--dry-run)`); return; }
+    if (dry) { console.log(`\n${added.length} link(s) — not recorded (--dry-run)`); if (unknown.length) process.exit(1); return; }
     // A requires: chain that loops is a mistake in the plans, and recording it
     // would leave a register no wave can be built from.
     const loop = waves(s).find((w) => w.wave === -1);
@@ -796,7 +872,12 @@ CMDS.step = (argv) => {
     }
     commit(s, 'step ' + argv[0], argv);
     ok(`${doomed.length} step(s) cancelled: ${doomed.map((t) => t.key).join(' ')}`);
-    if (orphaned.length) console.log(`  dropped from the needs of: ${orphaned.join(' ')}`);
+    // "Dropped from the needs of" reads as bookkeeping. What actually happened
+    // is that `check` was correctly holding these back on work that has not
+    // landed — cancelling the prerequisite does not satisfy it, and a dependent
+    // that opens now is opening on a hole its author never got to fill.
+    if (orphaned.length) console.log(`  ${orphaned.length} step(s) unblocked, but not because their dependency landed — it was ` +
+      `cancelled instead: ${orphaned.join(' ')}`);
     const leftovers = doomed.filter((t) => t.worktree);
     if (leftovers.length) {
       console.log(`\n${leftovers.length} of them had a worktree. Nothing here removes it — do it by hand:`);
@@ -816,9 +897,12 @@ CMDS.step = (argv) => {
     console.error(`\nNothing was recorded — ${bad.length} of ${list.length} step(s) could not be.`);
     process.exit(1);
   }
+  const wasCancelled = new Set(list.map((it) => it && it.key).filter((k) => k && depOf(s, k)?.status === 'cancelled'));
   for (const it of list) putStep(s, it);
   commit(s, 'step add', argv);
   ok(`${list.length} step(s) recorded. ${tasks(s).length} in the register.`);
+  const revived = [...wasCancelled].filter((k) => depOf(s, k)?.status !== 'cancelled');
+  if (revived.length) console.log(`  ${revived.length} of them were cancelled and are revived by this: ${revived.join(' ')}`);
   reportOverlaps(s, list.map((it) => it.key));
 };
 
@@ -1052,7 +1136,7 @@ Do two things:
    forbidden call itself. If you must write one, quote it and say it is
    forbidden in the same line.
 
-2. Write your report to ${path.relative(CWD, out)} as JSON:
+2. Write your report to ${relCwd(out)} as JSON:
 
    {
      "summary": "what you changed and why, in a few sentences",
@@ -1102,14 +1186,14 @@ Report the file written, not a summary in your reply.`);
     if (!plan) die('refine done <plan>');
     const rec = findPlan(s, plan) || die(`"${plan}" is not a loaded plan`);
     const f = refineReport(rec.path);
-    if (!fs.existsSync(f)) die(`no report at ${path.relative(CWD, f)} — the agent did not write one.\n  Its own reply is not a substitute: that route goes through a context that gets compacted.`);
+    if (!fs.existsSync(f)) die(`no report at ${relCwd(f)} — the agent did not write one.\n  Its own reply is not a substitute: that route goes through a context that gets compacted.`);
     let rep; try { rep = JSON.parse(fs.readFileSync(f, 'utf8')); } catch (e) { die(`the report at ${f} is not valid JSON: ${e.message}`); }
     const steps = rep.steps || [];
     if (!steps.length) die('the report names no steps');
     // A plan is one step, or two when a part must land before the rest. More
     // than that is an agent carving up work that was already small enough.
     if (steps.length > MAX_STEPS_PER_PLAN) die(`the report splits ${rec.path} into ${steps.length} steps; ${MAX_STEPS_PER_PLAN} is the most a plan may become.
-  Have the agent merge them and rewrite ${path.relative(CWD, f)}.`);
+  Have the agent merge them and rewrite ${relCwd(f)}.`);
     // Every step goes through the same gate as a hand-written one. The old
     // driver merged refined steps in raw, which put a hole in the one invariant
     // that matters on the path that creates almost every step. It is judged
@@ -1121,7 +1205,7 @@ Report the file written, not a summary in your reply.`);
     if (bad.length) {
       console.error('✗ the report has steps that cannot be recorded as written:');
       for (const [k, ps] of bad) { console.error(`  ${k}:`); for (const x of ps) console.error('    ' + x); }
-      console.error(`\nNothing from ${rec.path} was recorded. Have the agent fix ${path.relative(CWD, f)} and run this again.`);
+      console.error(`\nNothing from ${rec.path} was recorded. Have the agent fix ${relCwd(f)} and run this again.`);
       process.exit(1);
     }
     for (const it of stamped) putStep(s, it);
@@ -1189,24 +1273,49 @@ CMDS.run = (argv) => {
     // second one to try inherits a worktree pointing at somebody else's repo.
     const wtRoot = process.env.CURSOR_ORCH_WT || path.resolve(CWD, '..');
     t.worktree = t.worktree || path.join(wtRoot, `${path.basename(CWD)}-wt-${key}`);
+    let justCreated = false;
     if (!fs.existsSync(t.worktree)) {
-      try { sh('git', ['worktree', 'add', t.worktree, '-b', t.branch]); }
+      try { sh('git', ['worktree', 'add', t.worktree, '-b', t.branch]); justCreated = true; }
       catch (e) { die(`could not make a worktree at ${t.worktree}\n  ${String(e.stderr || e.message).trim()}`); }
     } else {
       // Something is already there. If git does not know about it, it is not a
       // worktree of this repo and opening onto it would write into a stranger.
-      const known = (() => { try { return shq('git', ['worktree', 'list']).includes(t.worktree); } catch { return false; } })();
-      if (!known) die(`${t.worktree} already exists and is not a worktree of this repo.\n  Move it, or pass a different one.`);
+      // `git worktree list` always prints forward slashes; `t.worktree` was
+      // built with `path.join`, which on Windows prints backslashes — so this
+      // could never match there, and re-opening a step after any interruption
+      // died on the "not a worktree of this repo" branch every time.
+      const known = (() => { try { return slashes(shq('git', ['worktree', 'list'])).toLowerCase().includes(slashes(t.worktree).toLowerCase()); } catch { return false; } })();
+      if (!known) die(`${t.worktree} already exists and is not a worktree of this repo.\n` +
+        `  Move it, or if it is stale: git worktree remove ${t.worktree}`);
     }
     // Cursor needs an address before it has a conversation, so one is minted
     // here. opencode puts `sessionID` on every event, so the address does not
     // exist until the run does and is read out of the log afterwards — minting
     // one would be inventing an id nothing will answer to.
     t.runner = runnerOf(s);
-    if (t.runner === 'cursor' && !t.chat) t.chat = sh('bash', [path.join(HERE, 'scripts', 'cursor-chat.sh')]);
+    if (t.runner === 'cursor' && !t.chat) {
+      // Unlike the worktree add three lines up, this used to have no try/catch
+      // at all: a missing `agent` binary threw a raw stack trace straight past
+      // `commit()`, leaving a branch and a worktree on disk with nothing in the
+      // record to say so — `doctor` never mentions either. If this call made
+      // the worktree itself, undo that; if the worktree already existed (a
+      // retry), leave it and just say how to pick it up.
+      try { t.chat = sh('bash', [path.join(HERE, 'scripts', 'cursor-chat.sh')]); }
+      catch (e) {
+        const msg = String(e.stderr || e.message).trim();
+        if (justCreated) {
+          try { execFileSync('git', ['worktree', 'remove', '--force', t.worktree], { stdio: 'ignore' }); } catch { /* best effort */ }
+          try { execFileSync('git', ['branch', '-D', t.branch], { stdio: 'ignore' }); } catch { /* best effort */ }
+          die(`could not start a chat for ${key}: ${msg}\n  The worktree and branch this call made were removed. Nothing was recorded.`);
+        }
+        die(`could not start a chat for ${key}: ${msg}\n` +
+          `  Its worktree at ${t.worktree} is still there — fix the runner and \`run open ${key}\` again,\n` +
+          `  or remove it by hand: git worktree remove ${t.worktree}`);
+      }
+    }
     const brief = sub('briefs', key + '.md');
     fs.writeFileSync(brief, briefText(s, t, row));
-    t.briefFile = path.relative(CWD, brief);
+    t.briefFile = relCwd(brief);
     // What the brief was written from. A step whose owns or verify changed
     // afterwards is holding an agent to instructions nobody has revised.
     t.briefSha = sha(JSON.stringify([t.owns, t.serialises, t.verify, t.needs, t.title, t.plan]));
@@ -1252,7 +1361,10 @@ CMDS.run = (argv) => {
     if (!log) die('run record <key> --log <run.jsonl>   (or --json <record.json> for a Claude Code step)');
     if (!fs.existsSync(log)) die(`no file at ${log}`);
     let rec;
-    if (flag('--json')) { rec = JSON.parse(fs.readFileSync(log, 'utf8')); }
+    if (flag('--json')) {
+      try { rec = JSON.parse(fs.readFileSync(log, 'utf8')); }
+      catch (e) { die(`${log} is not valid JSON: ${e.message}`); }
+    }
     else {
       // Harvest rather than ask: what the run did is in the log, and asking the
       // agent to summarise it is how 36 MB became five lines of prose.
@@ -1280,7 +1392,7 @@ CMDS.run = (argv) => {
     const out = sub('runs', key, n + '.json');
     fs.writeFileSync(out, JSON.stringify(rec, null, 2) + '\n');
     t.runs.push({ n, at: new Date().toISOString(), outcome: rec.outcome, seconds: rec.seconds,
-      files: (rec.files || []).length, model: rec.model, record: path.relative(CWD, out) });
+      files: (rec.files || []).length, model: rec.model, record: relCwd(out) });
     t.status = rec.outcome === 'passed' ? 'reported' : t.status;
     // A run that died is a fact about the run, recorded where it can be seen —
     // not something for somebody to notice in a log tail and type in later.
@@ -1312,6 +1424,19 @@ function briefText(s, t, row) {
   L.push(`You are already in your own worktree at ${t.worktree}, on branch`,
          `${t.branch}. It is checked out for you — do not create it, and never`,
          `touch the main checkout.`, '');
+  // The plan this project is built from is explicit that this must not be left
+  // unsaid: launching unattended (`--force --trust` on Cursor, `--auto` on
+  // opencode) auto-approves every permission that is not explicitly denied,
+  // which is the right setting for a worktree nothing else depends on and the
+  // wrong one to leave undocumented. A brief that never named the runner, the
+  // model or the effort it ran on left an agent unable to tell a person either.
+  const rm = runnerModel(s, t.tier);
+  L.push(`## How you are running`, '',
+         `Runner: ${t.runner}. Model: ${rm.model}${rm.effort ? ` (effort: ${rm.effort})` : ''}.`,
+         `This worktree was launched unattended, with every permission it is not`,
+         `explicitly denied auto-approved — there is no prompt to answer and no one`,
+         `watching for one. That is deliberate here, scoped to this worktree; do not`,
+         `take it as licence to touch anything outside it.`, '');
   L.push(`## The plan`, '', `Read ${plan} in full before writing anything.`, '');
   if ((t.needs || []).length) L.push(`## Built on`, '', `These landed before you: ${t.needs.join(', ')}. Their work is in your`, `worktree already.`, '');
   L.push(`## What you own`, '', `You may write these and nothing else:`, '');
@@ -1346,12 +1471,20 @@ CMDS.guard = (argv) => {
   // origin/HEAD to ask, and a repo that calls its trunk something else is not
   // wrong. Each fallback is tried in turn and the last one is a guess named as
   // such by the error if it is also absent.
+  //
+  // What the repo's own branches say has to win over what `init.defaultBranch`
+  // merely prefers — Git for Windows ships that config set to "master" in its
+  // own gitconfig, so on a `main` repo it out-voted the branch that actually
+  // exists and `guard` died diffing a ref nothing pointed to. And every
+  // candidate is verified with `rev-parse` before it is returned: a config
+  // value or a stray local branch name is worth nothing if it does not resolve.
   const guessBase = () => {
+    const verified = (v) => { if (!v) return null; try { shq('git', ['rev-parse', '--verify', v]); return v; } catch { return null; } };
     for (const fn of [
       () => shq('git', ['symbolic-ref', '--short', 'refs/remotes/origin/HEAD']).split('/').pop(),
-      () => shq('git', ['config', '--get', 'init.defaultBranch']),
       () => (shq('git', ['branch', '--format=%(refname:short)']).split('\n').find((b) => b === 'main' || b === 'master')),
-    ]) { try { const v = fn(); if (v) return v; } catch { /* try the next */ } }
+      () => shq('git', ['config', '--get', 'init.defaultBranch']),
+    ]) { try { const v = verified(fn()); if (v) return v; } catch { /* try the next */ } }
     return 'main';
   };
   const base = argv.includes('--base') ? argv[argv.indexOf('--base') + 1] : guessBase();
@@ -1479,7 +1612,11 @@ CMDS.slot = (argv) => {
   const [what, ...rest] = argv;
   const dashdash = argv.indexOf('--');
   const name = (rest[0] && !rest[0].startsWith('-')) ? rest[0] : 'ci';
-  const staleMin = Number((argv[argv.indexOf('--stale') + 1]) || 30);
+  // With no --stale, indexOf gives -1 and `argv[-1 + 1]` reads argv[0] — the
+  // subcommand name — so staleMin came out NaN and every comparison against it
+  // was false: the documented 30-minute default silently never applied.
+  const staleFlag = argv.indexOf('--stale');
+  const staleMin = Number(staleFlag === -1 ? 30 : (argv[staleFlag + 1] ?? 30));
   const staleMs = staleMin * 60000;
 
   if (what === 'status') {
@@ -1542,9 +1679,35 @@ CMDS.slot = (argv) => {
     // The command's own exit code is the result. A non-zero one is news about
     // the check, not a fault in the slot, so it is passed through rather than
     // thrown — the claim is released either way by the exit handler.
-    let code = 0;
+    //
+    // But a command that never started is not the same news, and used to be
+    // reported as one: `npm` on Windows is a `npm.cmd` shim, execFileSync with
+    // shell:false throws ENOENT for it before the process ever runs, and the
+    // catch below turned that into a bare "exit 1" with `e.message` discarded —
+    // indistinguishable from a genuinely red suite that printed nothing.
+    let code = 0, spawnErr = null;
     try { execFileSync(cmd[0], cmd.slice(1), { stdio: 'inherit', shell: false, env: process.env }); }
-    catch (e) { code = typeof e.status === 'number' ? e.status : 1; }
+    catch (e) {
+      if (e.code === 'ENOENT' && process.platform === 'win32') {
+        // The one deliberate use of shell:true: cmd.exe is the thing that
+        // resolves a .cmd/.bat shim, and Node quotes an array of args correctly
+        // for it even with shell:true — this is not the same as turning
+        // shell:true on everywhere, which would reopen the quoting bugs that
+        // shell:false exists to avoid.
+        try { execFileSync(cmd[0], cmd.slice(1), { stdio: 'inherit', shell: true, env: process.env }); }
+        catch (e2) { if (typeof e2.status === 'number') code = e2.status; else spawnErr = e2; }
+      } else if (typeof e.status === 'number') {
+        code = e.status;
+      } else {
+        spawnErr = e;
+      }
+    }
+    if (spawnErr) {
+      slotLog(name, `could not start: ${label} (${spawnErr.code || spawnErr.message})`);
+      release();
+      console.error(`✗ could not start "${cmd[0]}": ${spawnErr.message}`);
+      process.exit(127);
+    }
     slotLog(name, `released after: ${label} (exit ${code})`);
     release();
     process.exit(code);
@@ -1664,6 +1827,11 @@ CMDS.doctor = () => {
   const live = tasks(s).filter((t) => !DEAD_STATUS.includes(t.status));
   let bad = 0;
   const soft = [];
+  // A cycle in `needs` is not a scheduling problem, it is a mistake — nothing
+  // in it can ever open. `check` caught this; `doctor`, run right before
+  // opening work, did not, because it never asked `waves` at all.
+  const cyc = waves(s).find((w) => w.wave === -1);
+  if (cyc) { bad++; console.log('✗ these steps depend on each other in a loop and could never open: ' + cyc.tasks.map((t) => t.key).join(' ')); }
   // A plan rewritten after its steps were cut from it leaves steps citing text
   // that no longer says what they were built on. Refining rewrites its own
   // plan, so drift there is expected and only worth saying for a plan nobody
@@ -1867,15 +2035,18 @@ function refuseIfDirty() {
 // One branch into the main line. Returns the conflicted paths, having rolled the
 // merge back, or an empty list having left it in place.
 function mergeOne(s, t) {
-  let conflicted = [];
+  const before = shq('git', ['rev-parse', 'HEAD']);
+  let conflicted = [], failed = false, errMsg = '';
   try {
     execFileSync('git', ['merge', '--no-ff', t.branch, '-m', `land ${t.key}`],
       { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] });
-  } catch {
+  } catch (e) {
+    failed = true;
+    errMsg = String(e.stderr || e.message || e).trim();
     // Take the conflicted list before aborting; after the abort there is nothing
     // left to read it from.
     conflicted = shq('git', ['diff', '--name-only', '--diff-filter=U']).split('\n').filter(Boolean);
-    try { execFileSync('git', ['merge', '--abort'], { stdio: 'ignore' }); } catch { /* nothing to abort */ }
+    try { execFileSync('git', ['merge', '--abort'], { stdio: 'ignore' }); } catch { /* nothing to abort, or already clean */ }
   }
   t.joinAttempts = (t.joinAttempts || 0) + 1;
   if (conflicted.length) {
@@ -1886,6 +2057,22 @@ function mergeOne(s, t) {
     t.conflictedWith = others.map((x) => x.key);
     t.conflictedOn = conflicted;
     return { conflicted, others };
+  }
+  // Not every failed merge leaves conflict markers: a missing branch, unrelated
+  // histories, a rejecting hook, a locked index all throw `git merge` with
+  // nothing in `--diff-filter=U`. Falling through to the success path here used
+  // to set joinedAt on a merge that never happened — `join` on a step whose
+  // branch was `step/does-not-exist` printed "merged cleanly" with the same SHA
+  // before and after. Report the real failure instead, and don't stamp it landed.
+  if (failed) { t.joinError = errMsg; return { conflicted: [], hardFail: true, error: errMsg }; }
+  const after = shq('git', ['rev-parse', 'HEAD']);
+  if (after === before) {
+    // git exited 0 but HEAD did not move — not the ordinary "Already up to
+    // date" (that can't happen for a fresh branch being landed) but cheap
+    // insurance against the same silent-success failure mode by another route.
+    const msg = 'git merge reported success but HEAD did not move';
+    t.joinError = msg;
+    return { conflicted: [], hardFail: true, error: msg };
   }
   t.joinedAt = new Date().toISOString();
   t.joinedSha = shq('git', ['rev-parse', '--short', 'HEAD']);
@@ -1914,7 +2101,7 @@ function joinBatch(s, argv) {
   const merged = [], failed = [];
   for (const t of ts) {
     const r = mergeOne(s, t);
-    if (r.conflicted.length) failed.push({ t, ...r });
+    if (r.conflicted.length || r.hardFail) failed.push({ t, ...r });
     else merged.push(t);
   }
   // The order matters for the bisect, and only the record can still say what it
@@ -1929,10 +2116,16 @@ function joinBatch(s, argv) {
   } else {
     console.log(`✗ none of the ${ts.length} merged — the main line is untouched at ${before}.`);
   }
-  for (const { t, conflicted, others } of failed) {
-    console.log(`\n✗ ${t.key} conflicts with the main line on ${conflicted.length} file(s):`);
-    for (const f of conflicted) console.log('    ' + f);
-    if (others.length) console.log(`  The other side is ${others.map((x) => x.key).join(', ')}, already landed.`);
+  for (const { t, conflicted, others, hardFail, error } of failed) {
+    if (hardFail) {
+      console.log(`\n✗ ${t.key} could not be merged: ${error}`);
+      console.log('  No conflict markers were left, so there is nothing to resolve by hand — check');
+      console.log('  the branch exists, the histories are related, and no hook rejected it.');
+    } else {
+      console.log(`\n✗ ${t.key} conflicts with the main line on ${conflicted.length} file(s):`);
+      for (const f of conflicted) console.log('    ' + f);
+      if (others.length) console.log(`  The other side is ${others.map((x) => x.key).join(', ')}, already landed.`);
+    }
     console.log('  That one merge was rolled back; the rest of the batch stands.');
     console.log(`    node ${SELF()} sendback ${t.key} --why conflict`);
   }
@@ -1961,13 +2154,19 @@ CMDS.join = (argv) => {
   refuseIfDirty();
 
   const before = shq('git', ['rev-parse', 'HEAD']);
-  const { conflicted, others } = mergeOne(s, t);
+  const { conflicted, others, hardFail, error } = mergeOne(s, t);
 
-  if (conflicted.length) {
+  if (conflicted.length || hardFail) {
     commit(s, 'join (conflict)', argv);
-    console.log(`✗ ${t.key} conflicts with the main line on ${conflicted.length} file(s):`);
-    for (const f of conflicted) console.log('    ' + f);
-    if (others.length) console.log(`  The other side is ${others.map((x) => x.key).join(', ')}, already landed.`);
+    if (hardFail) {
+      console.log(`✗ ${t.key} could not be merged: ${error}`);
+      console.log('  No conflict markers were left, so there is nothing to resolve by hand — check');
+      console.log('  the branch exists, the histories are related, and no hook rejected it.');
+    } else {
+      console.log(`✗ ${t.key} conflicts with the main line on ${conflicted.length} file(s):`);
+      for (const f of conflicted) console.log('    ' + f);
+      if (others.length) console.log(`  The other side is ${others.map((x) => x.key).join(', ')}, already landed.`);
+    }
     console.log('\n  The merge was rolled back — the main line is untouched.');
     console.log(`  Send it back to the agent that wrote it, which is still on its chat:`);
     console.log(`    node ${SELF()} sendback ${t.key} --why conflict`);
@@ -2020,10 +2219,10 @@ Then re-run your proof and commit.`;
       : '');
   const f = sub('sendbacks', `${t.key}-${(t.sendbacks || []).length + 1}.txt`);
   fs.writeFileSync(f, prompt + '\n');
-  (t.sendbacks ||= []).push({ at: new Date().toISOString(), why: why.slice(0, 200), file: path.relative(CWD, f) });
+  (t.sendbacks ||= []).push({ at: new Date().toISOString(), why: why.slice(0, 200), file: relCwd(f) });
   t.status = 'open';
   commit(s, 'sendback', argv);
-  ok(`${t.key} sent back — the prompt is at ${path.relative(CWD, f)}`);
+  ok(`${t.key} sent back — the prompt is at ${relCwd(f)}`);
   // A step whose merge is already on HEAD may have had other worktrees cut from
   // it. Undoing it with a reset would strand those, so the fix has to go
   // forward. This is the one place the open-at-join trade has to be paid, and
@@ -2039,14 +2238,37 @@ Then re-run your proof and commit.`;
   if ((t.runner || 'cursor') === 'opencode') {
     const bin = runnerBin('opencode');
     const rm = runnerModel(s, t.tier);
-    console.log(`    ${bin.ok ? bin.path : 'opencode'} run --dir ${t.worktree} --session ${t.chat} \\`);
+    // opencode's resume flag is `-s <sessionID>`, not `--session` — recorded at
+    // docs/plans/running-steps-on-deepseek.md:273,321 from research against the
+    // real binary. `--session` risks being silently ignored rather than
+    // rejected, which resumes into a fresh session with no memory of the prior
+    // run while this tool believes the same conversation continued. Not
+    // confirmed against a live binary here — opencode is not installed.
+    console.log(`    ${bin.ok ? bin.path : 'opencode'} run --dir ${t.worktree} -s ${t.chat} \\`);
     console.log(`      -m ${rm.model} --variant ${rm.effort} --auto --format json \\`);
-    console.log(`      "$(cat ${path.relative(CWD, f)})"`);
+    console.log(`      "$(cat ${relCwd(f)})"`);
   } else {
-    console.log(`    agent -p --force --trust --resume ${t.chat} "$(cat ${path.relative(CWD, f)})"`);
+    console.log(`    agent -p --force --trust --resume ${t.chat} "$(cat ${relCwd(f)})"`);
   }
   console.log('\n  It has the context for why it made those changes. A new agent reading logs');
   console.log('  would have to reconstruct that from outside.');
+};
+
+// The header and `readState`'s own error promised this and nothing did it.
+// Every event already carries the full state it produced (see `commit`), so
+// the record does not need replaying instruction by instruction — the last
+// line already holds the answer.
+CMDS.rebuild = () => {
+  if (!fs.existsSync(EVENTS)) die(`no ${EVENTS} to rebuild from`);
+  const lines = fs.readFileSync(EVENTS, 'utf8').split('\n').filter(Boolean);
+  if (!lines.length) die(`${EVENTS} is empty — nothing to rebuild from`);
+  let last;
+  try { last = JSON.parse(lines[lines.length - 1]); }
+  catch (e) { die(`the last line of ${EVENTS} is not valid JSON (${e.message}) — state.json cannot be rebuilt from it`); }
+  if (!last.state) die(`the last event in ${EVENTS} carries no state snapshot — state.json cannot be rebuilt from it`);
+  fs.mkdirSync(ORCH, { recursive: true });
+  fs.writeFileSync(STATE, JSON.stringify(last.state, null, 2) + '\n');
+  ok(`state.json rebuilt from event ${last.seq} of ${lines.length} (${last.why}, ${last.at})`);
 };
 
 const HELP = `orchestrate — plan to merged code, on Cursor, opencode or Claude Code
@@ -2074,6 +2296,7 @@ const HELP = `orchestrate — plan to merged code, on Cursor, opencode or Claude
   doctor [--all]            everything the steps cite that can be checked without running
   slot run <n> -- <cmd>     one shared machine slot, so parallel heavy checks queue
   models [list|sync]        the ladder, and regenerating it from the CLI
+  rebuild                   replay the last event's state back into state.json
 
 A dependency counts as met once it has JOINED, not once it has landed: the
 merge is on the main checkout's HEAD by then and a worktree cut from it holds

@@ -232,6 +232,18 @@ function feed(line) {
   try { handle(ev); } catch { /* one odd event must not stop the watch */ }
 }
 
+// process.stdout to a non-TTY (a redirected file, a `| cat`) writes
+// asynchronously in Node, and process.exit() does not wait for a pending write
+// to land — it can truncate the very last line, which is the ■ result / ■
+// error line: the one line that says pass or fail. An empty write's callback
+// only fires after every write queued ahead of it has actually gone out
+// (writable streams keep write order), so it is a reliable "flushed" signal
+// without having to thread a callback through every call to say().
+function exitWhenFlushed(code) {
+  process.exitCode = code;
+  process.stdout.write('', () => process.exit(code));
+}
+
 let buf = '';
 function pump(chunk) {
   buf += chunk;
@@ -239,7 +251,7 @@ function pump(chunk) {
   while ((i = buf.indexOf('\n')) !== -1) {
     const line = buf.slice(0, i); buf = buf.slice(i + 1);
     feed(line);
-    if (ended && EXIT_ON_RESULT) process.exit(0);
+    if (ended && EXIT_ON_RESULT) exitWhenFlushed(0);
   }
 }
 
@@ -249,7 +261,12 @@ if (FOLLOW) {
   const read = () => {
     let size;
     try { size = fs.statSync(FOLLOW).size; } catch { return; }
-    if (size < at) at = 0;             // the file was replaced under us
+    // The file was replaced under us — start over, and drop whatever partial
+    // line was buffered from the file that no longer exists at this offset.
+    // Left in place, a dead run's stray partial line got prepended to a fresh
+    // run's first bytes, JSON.parse threw, and that unparseable line was read
+    // as the stream already having ended.
+    if (size < at) { at = 0; buf = ''; }
     if (size === at) return;
     const fd = fs.openSync(FOLLOW, 'r');
     const b = Buffer.alloc(size - at);
@@ -259,7 +276,7 @@ if (FOLLOW) {
     pump(b.toString('utf8'));
   };
   read();
-  if (ended && EXIT_ON_RESULT) process.exit(0);
+  if (ended && EXIT_ON_RESULT) exitWhenFlushed(0);
   // A quarter of a second is under the threshold at which a person reading the
   // pane would call it lag, and it costs one stat per tick.
   setInterval(read, 250);

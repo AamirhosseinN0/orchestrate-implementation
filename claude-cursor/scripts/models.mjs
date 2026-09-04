@@ -71,17 +71,31 @@ function binOf(r) {
 // — grok-4.6 takes low/medium/high/xhigh, deepseek-v4-flash takes low/high/max,
 // and `minimal` from the CLI's own help text is not valid for either. So the
 // only defence is to look it up before spending anything.
+// Returns `{ values, why }`. `values` is the list to check against, or null
+// when there is nothing to check against — and `why` says the specific reason,
+// because a caller that gets null back is not just missing a nice-to-have: it
+// is the one substantive guard this runner has, doing nothing. That happens
+// on the most ordinary machine there is — one that has never run `opencode`
+// interactively, so `~/.cache/opencode/models.json` was never written — and a
+// null that is checked with `if (allowed && ...)` and otherwise ignored is
+// exactly how that goes unnoticed: `resolve` and `effort-check` both used to
+// return success silently rather than say the check never ran.
 function effortsOf(r) {
   const f = homeOf(r.registry || '');
   let reg;
-  try { reg = JSON.parse(fs.readFileSync(f, 'utf8')); } catch { return null; }
+  try { reg = JSON.parse(fs.readFileSync(f, 'utf8')); }
+  catch (e) {
+    const reason = e && e.code === 'ENOENT' ? 'no such file' : (e && e.message) || String(e);
+    return { values: null, why: `the registry at ${f} could not be read (${reason})` };
+  }
   const prov = reg[r.provider];
   const models = prov && (prov.models || prov);
   const id = String(r.model).split('/').pop();
   const entry = models && models[id];
-  if (!entry) return null;
+  if (!entry) return { values: null, why: `${r.model} is not listed in the registry at ${f}` };
   const opt = (entry.reasoning_options || []).find((o) => o.type === 'effort');
-  return opt ? opt.values : null;
+  if (!opt) return { values: null, why: `${r.model}'s registry entry names no effort options` };
+  return { values: opt.values, why: null };
 }
 
 // Every spelling a row answers to. `shown` is the old single-string form and is
@@ -184,12 +198,43 @@ switch (cmd) {
     if (!effort) die(`runner "${flag('--runner')}" has no effort for tier "${tier}".\n` +
       `  tiers: ${Object.keys(r.efforts || {}).join(', ')}`);
     const allowed = effortsOf(r);
-    if (allowed && !allowed.includes(effort)) die(
+    if (allowed.values && !allowed.values.includes(effort)) die(
       `the ladder maps tier "${tier}" to effort "${effort}", which ${r.model} does not accept.\n` +
-      `  it accepts: ${allowed.join(', ')}\n` +
+      `  it accepts: ${allowed.values.join(', ')}\n` +
       `  An effort this model does not know is accepted in silence and thrown away,\n` +
       `  so this is refused here rather than billed for.`);
+    // Not fatal — the effort itself may well be fine — but this is the one
+    // substantive guard this runner has, and a machine that has never run
+    // `opencode` interactively (so its registry cache was never written) would
+    // otherwise sail through with no check having happened and nothing said.
+    if (!allowed.values) console.error(`⚠ ${allowed.why} — "${effort}" was not checked against what ${r.model} actually accepts.`);
     process.stdout.write(r.model + '\t' + (r.shown || r.model) + '\t' + effort + '\n');
+    break;
+  }
+
+  // The registry check `resolve` makes, exposed on its own so a launcher can
+  // run it even when `--model`/`--effort` were both supplied directly and
+  // never went through `resolve` at all. That path used to skip the guard
+  // entirely — the one thing here built specifically to catch a `--variant`
+  // opencode accepts and silently ignores.
+  case 'effort-check': {
+    const r = runnerOf(m, flag('--runner'));
+    if (!r) die('effort-check is for a non-Cursor runner — try `models.mjs list`');
+    const effort = flag('--effort');
+    if (!effort) die('effort-check needs --effort <name>');
+    const model = flag('--model') || r.model;
+    const allowed = effortsOf({ ...r, model });
+    if (allowed.values && !allowed.values.includes(effort)) die(
+      `effort "${effort}" is not accepted by ${model}.\n` +
+      `  it accepts: ${allowed.values.join(', ')}\n` +
+      `  An effort this model does not know is accepted in silence and thrown away,\n` +
+      `  so this is refused here rather than billed for.`);
+    if (!allowed.values) {
+      console.error(`⚠ ${allowed.why} — "${effort}" was not checked against what ${model} actually accepts.`);
+      console.log('ok, unchecked');
+    } else {
+      console.log('ok');
+    }
     break;
   }
 
@@ -212,11 +257,11 @@ switch (cmd) {
     if (!r) die('efforts is for a non-Cursor runner — try `models.mjs list`');
     const allowed = effortsOf(r);
     console.log(`${r.shown || r.model}  (${r.model})`);
-    console.log(`  accepts: ${allowed ? allowed.join(', ') : '(registry not readable — nothing to check against)'}`);
+    console.log(`  accepts: ${allowed.values ? allowed.values.join(', ') : `(${allowed.why} — nothing to check against)`}`);
     console.log(`  verified after the run: ${r.verifiable ? 'yes' : 'no — the log does not name the model'}`);
     console.log('\n  tier      effort');
     for (const [t, e] of Object.entries(r.efforts || {})) {
-      const bad = allowed && !allowed.includes(e);
+      const bad = allowed.values && !allowed.values.includes(e);
       console.log('  ' + t.padEnd(10) + e + (bad ? '   ✗ not accepted by this model' : ''));
     }
     // The collapse is real, so it is said rather than left to be noticed.
@@ -245,6 +290,18 @@ switch (cmd) {
   // Regenerating rather than hand-editing is the point: `shown` is the CLI's
   // string, not ours, and a table that drifts from it fails every run at once.
   case 'sync': {
+    // `sync` only knows how to regenerate Cursor's `shown` names, off
+    // `agent --list-models`. opencode has one model, and the only thing about
+    // it that can go stale — which efforts it accepts — is already read live
+    // out of its own registry on every `resolve` and `effort-check`, so there
+    // is nothing here to regenerate for it. Silently running the Cursor sync
+    // anyway when asked for opencode would look like it did something.
+    const runnerFlag = flag('--runner');
+    if (runnerFlag && runnerFlag !== 'cursor') die(
+      `sync only regenerates the cursor ladder's "shown" names, from \`agent --list-models\`.\n` +
+      `  opencode has one model, and its accepted efforts are read live from its own\n` +
+      `  registry on every \`resolve\`/\`effort-check\` — there is nothing here to sync.\n` +
+      `  See \`models.mjs efforts --runner opencode\`.`);
     const dry = rest.includes('--dry-run');
     const live = listModels();
     const changes = [], gone = [];

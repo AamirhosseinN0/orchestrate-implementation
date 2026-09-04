@@ -63,19 +63,33 @@ done
 OC=$(node "$MODELS" which --runner opencode) || exit 2
 
 # The model and the effort, from the table rather than a case statement in here.
-# This is also where an effort the model does not accept is refused, which is
-# the only check available: `opencode run --variant <nonsense>` runs a normal
-# turn and reports nothing, so a typo would cost the reasoning the tier was
-# chosen for and nothing would say so.
 if [ -z "$MODEL" ] || [ -z "$EFFORT" ]; then
   IFS=$'\t' read -r T_MODEL T_SHOWN T_EFFORT < <(node "$MODELS" resolve --runner opencode "${TIER:-$ROLE}") || exit 2
-  MODEL=${MODEL:-$T_MODEL}
+  if [ -z "$MODEL" ]; then
+    MODEL=$T_MODEL
+    SHOWN=$T_SHOWN
+  else
+    # An explicit --model overrides the table's, so what is reported and what
+    # is checked below both have to be the model that will actually run —
+    # not the tier's default, which `resolve` printed for a model nobody asked
+    # for here.
+    SHOWN=$MODEL
+  fi
   EFFORT=${EFFORT:-$T_EFFORT}
-  SHOWN=${T_SHOWN:-$MODEL}
 else
   SHOWN=$MODEL
 fi
 [ -n "$MODEL" ] || die "could not resolve a model for role $ROLE"
+
+# The one check available: `opencode run --variant <nonsense>` runs a normal
+# turn and reports nothing, so a typo would cost the reasoning the tier was
+# chosen for and nothing would say so. This used to run only when the table
+# picked BOTH the model and the effort — pass `--model` and `--effort`
+# together (both are documented, accepted flags) and it was skipped entirely,
+# which is exactly backwards: an explicit pair is at least as likely to carry
+# a typo as one the table resolved. It now runs unconditionally, against
+# whichever model will actually run.
+node "$MODELS" effort-check --runner opencode --model "$MODEL" --effort "$EFFORT" || exit 2
 
 LOG_DIR=${CURSOR_ORCH_LOG_DIR:-.claude/orch/logs}
 LOG="$LOG_DIR/$KEY.jsonl"
@@ -131,25 +145,97 @@ fi
 TIMEOUT=${OPENCODE_ORCH_TIMEOUT:-1800}
 have_timeout=0
 command -v timeout >/dev/null 2>&1 && have_timeout=1
+if [ "$have_timeout" != 1 ] && [ "$TIMEOUT" -gt 0 ] 2>/dev/null; then
+  # This is not a cosmetic gap. The fallback below is exercised against a
+  # sleeping stub (see the timeout tests), not against a real `opencode`
+  # binary — none was available while this was written — and that has to be
+  # said loudly rather than discovered later from a round that quietly ran
+  # forever.
+  echo "⚠ no \`timeout\` binary on PATH — falling back to a bash-based bound for" >&2
+  echo "  this run (see run-opencode.sh). If a run still seems to hang well past" >&2
+  echo "  ${TIMEOUT}s, check for a leftover opencode process and kill it by hand." >&2
+fi
 
 launch() {   # $1 = log to write, $2 = prompt
   local log=$1 prompt=$2
   local -a a=(run --dir "$WS" -m "$MODEL" --variant "$EFFORT" --auto --format json)
-  [ -n "$SESSION" ] && a+=(--session "$SESSION")
-  local -a t=()
-  [ "$have_timeout" = 1 ] && [ "$TIMEOUT" -gt 0 ] 2>/dev/null && t=(timeout --foreground "$TIMEOUT")
-  if [ "$QUIET" = 1 ]; then
-    "${t[@]}" "$OC" "${a[@]}" "$prompt" > "$log" 2>&1
-  else
-    # Drains to EOF rather than exiting on the last event, because this pipe is
-    # shared with the tee writing the log and exiting early truncates it.
-    #
-    # The timeout wraps opencode and not the pipeline, so a kill still lets the
-    # tee and the formatter finish what they already have — a timed-out run
-    # keeps whatever it managed to say.
-    "${t[@]}" "$OC" "${a[@]}" "$prompt" 2>&1 | tee "$log" | node "$STREAM" --key "$KEY" --runner opencode
+  # opencode's own resume flag is `-s <sessionID>` (see the plan this was built
+  # from) — not `--session`, which is only this launcher's own flag name for
+  # the same value. Unconfirmed against a live binary; nothing in this
+  # environment has opencode installed to check it against.
+  [ -n "$SESSION" ] && a+=(-s "$SESSION")
+
+  if [ "$have_timeout" = 1 ]; then
+    local -a t=()
+    [ "$TIMEOUT" -gt 0 ] 2>/dev/null && t=(timeout --foreground "$TIMEOUT")
+    if [ "$QUIET" = 1 ]; then
+      "${t[@]}" "$OC" "${a[@]}" "$prompt" > "$log" 2>&1
+    else
+      # Drains to EOF rather than exiting on the last event, because this pipe
+      # is shared with the tee writing the log and exiting early truncates it.
+      #
+      # The timeout wraps opencode and not the pipeline, so a kill still lets
+      # the tee and the formatter finish what they already have — a timed-out
+      # run keeps whatever it managed to say.
+      "${t[@]}" "$OC" "${a[@]}" "$prompt" 2>&1 | tee "$log" | node "$STREAM" --key "$KEY" --runner opencode
+    fi
+    return "${PIPESTATUS[0]}"
   fi
-  return "${PIPESTATUS[0]}"
+
+  if [ "$TIMEOUT" -le 0 ] 2>/dev/null; then
+    if [ "$QUIET" = 1 ]; then
+      "$OC" "${a[@]}" "$prompt" > "$log" 2>&1
+    else
+      "$OC" "${a[@]}" "$prompt" 2>&1 | tee "$log" | node "$STREAM" --key "$KEY" --runner opencode
+    fi
+    return "${PIPESTATUS[0]}"
+  fi
+
+  # No `timeout` binary. opencode has to be started as our own background job
+  # (not the first stage of a pipeline — killing the PID `$!` gives for the
+  # LAST stage of a pipeline does not stop the first one) so its PID is ours
+  # to bound with a watcher that sends SIGTERM at the limit, then reads its
+  # output back through a FIFO once it is running.
+  #
+  # Two things here earned their comment by failing first, measured rather
+  # than assumed:
+  #
+  #   · A first attempt piped straight from a `coproc`'s read-end fd instead
+  #     of a FIFO. Killing the coproc's child did NOT unblock a `cat` reading
+  #     that fd — it stayed blocked until the child would have exited on its
+  #     own, which is not a bound at all, just a slower way to not have one.
+  #     A FIFO does not have that problem: every writer closing is what gives
+  #     its reader EOF, and killing the writer closes it.
+  #   · Killing only `$oc_pid` was not enough either, once `$OC` is itself a
+  #     wrapper that runs the real work as its own child (true of the test
+  #     stub, and not something to assume is never true of a real install):
+  #     the wrapper dies, its child is orphaned still holding the FIFO open,
+  #     and the read side hangs exactly as before. `set -m` gives the
+  #     backgrounded job its own process group, and `kill -TERM -"$oc_pid"`
+  #     (the leading `-` means the group, not just the leader) takes the
+  #     whole thing down together — which is what real `timeout` was already
+  #     doing, confirmed by running it against this same wrapper stub.
+  local rc
+  local fifo; fifo=$(mktemp -u "${TMPDIR:-/tmp}/opencode-fallback.XXXXXX") || fifo="/tmp/opencode-fallback.$$"
+  mkfifo "$fifo" 2>/dev/null || { echo "✗ could not create a FIFO for the no-timeout fallback at $fifo" >&2; return 2; }
+  local had_m=1; case $- in *m*) : ;; *) had_m=0 ;; esac
+  set -m
+  "$OC" "${a[@]}" "$prompt" > "$fifo" 2>&1 &
+  local oc_pid=$!
+  ( sleep "$TIMEOUT"; kill -TERM -"$oc_pid" 2>/dev/null ) &
+  local watcher=$!
+  if [ "$QUIET" = 1 ]; then
+    cat < "$fifo" > "$log"
+  else
+    cat < "$fifo" | tee "$log" | node "$STREAM" --key "$KEY" --runner opencode
+  fi
+  wait "$oc_pid" 2>/dev/null
+  rc=$?
+  [ "$had_m" = 1 ] || set +m
+  kill "$watcher" 2>/dev/null; wait "$watcher" 2>/dev/null
+  rm -f "$fifo"
+  [ "$rc" -ge 128 ] && rc=124
+  return "$rc"
 }
 
 launch "$LOG" "$PROMPT"
@@ -171,7 +257,31 @@ fi
 
 # What the log can actually answer: did it error, did it say anything, and which
 # session is it on. There is no model question to ask.
-IFS=$'\t' read -r SESSION_ID HAS_ANSWER IS_ERROR TAIL < <(node "$HARVEST" "$LOG" --probe)
+#
+# Captured rather than fed straight into `read` via process substitution, so
+# the harvester's own exit code is not thrown away: 2 means it could not even
+# be run (bad args, an unreadable log), which is a different failure than the
+# run itself having died or errored, and deserves its own message rather than
+# reading as "ended without answering".
+PROBE_OUT=$(node "$HARVEST" "$LOG" --probe)
+HARVEST_RC=$?
+if [ "$HARVEST_RC" = 2 ]; then
+  OUTCOME=error
+  echo "✗ could not harvest $LOG" >&2
+  [ -n "$PROBE_OUT" ] && echo "  $PROBE_OUT" >&2
+  exit 1
+fi
+IFS=$'\t' read -r SESSION_ID HAS_ANSWER IS_ERROR TAIL <<< "$PROBE_OUT"
+# `-` is the harvester's sentinel for "no session id was ever reported" — not
+# empty. A field left genuinely empty would be a leading empty field ahead of
+# HAS_ANSWER/IS_ERROR/TAIL in tab-separated output, and `read` under
+# `IFS=$'\t'` collapses a leading tab the same way it collapses a leading
+# space: the empty field vanishes and every value after it shifts left by
+# one — HAS_ANSWER would silently take on the error flag's value, IS_ERROR
+# would take on the tail text, and an actually-errored run would read as
+# `IS_ERROR=<some text>`, never `1`, so the error branch below would never
+# fire. That is a failed run reported as passed.
+[ "$SESSION_ID" = '-' ] && SESSION_ID=
 
 OUTCOME=ran
 

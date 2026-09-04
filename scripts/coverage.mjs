@@ -26,6 +26,7 @@ const ROOT = path.dirname(HERE);
 const DRIVER = path.join(ROOT, 'driver.mjs');
 const ORCH = path.join(ROOT, 'claude-cursor', 'orchestrate.mjs');
 const TEST = path.join(ROOT, 'test.mjs');
+const SWEEP = path.join(ROOT, 'scripts', 'sweep.mjs');
 
 const argv = process.argv.slice(2);
 const onlyList = ['--report', '--report-only'].filter((f) => argv.includes(f));
@@ -39,7 +40,10 @@ function pull(dir, flag) {
 // --- run the sweep under coverage ---
 function runSweep() {
   const covDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orch-cov-'));
-  const res = spawnSync(process.execPath, [TEST], {
+  // Through the parallel runner: every shard and every driver it starts inherits
+  // NODE_V8_COVERAGE and writes its own dump into the same directory, and the
+  // merge below already folds many dumps into one number.
+  const res = spawnSync(process.execPath, [SWEEP], {
     cwd: ROOT,
     encoding: 'utf8',
     env: { ...process.env, NODE_V8_COVERAGE: covDir },
@@ -193,9 +197,30 @@ async function main() {
   // The backend of the cursor skill gets its own floor, spaced under its real
   // number the same way. Two files, two gates: a regression in one must not be
   // masked by the other being large and well covered.
-  const ORCH_THRESHOLD = Number(process.env.ORCHESTRATE_ORCH_COV_THRESHOLD ?? 85);
+  const DEFAULT_ORCH_THRESHOLD = 85;
+  const rawOrch = process.env.ORCHESTRATE_ORCH_COV_THRESHOLD;
+  let ORCH_THRESHOLD = DEFAULT_ORCH_THRESHOLD;
+  if (rawOrch !== undefined && String(rawOrch).trim() !== '') {
+    const n = Number(rawOrch);
+    // Same hazard as ORCHESTRATE_COV_THRESHOLD above: an empty or unreadable
+    // value must not silently become 0 and turn this gate off.
+    if (!Number.isFinite(n) || n < 0 || n > 100) {
+      console.error('error: ORCHESTRATE_ORCH_COV_THRESHOLD must be a number from 0 to 100 — got "' + rawOrch + '"');
+      process.exit(2);
+    }
+    ORCH_THRESHOLD = n;
+  }
   const pct = driverFns.pct ?? 0;
-  const orchPct = orchFns.total ? (orchFns.pct ?? 0) : 100;
+  // orchFns.total === 0 means the file we are gating on was not found in the
+  // merged coverage at all — renamed, moved, or simply not exercised. That is
+  // a reason to fail the gate, not a reason to report a false 100%: silently
+  // passing would let the gate disappear the moment the file it watches goes
+  // dark.
+  if (orchFns.total === 0) {
+    console.error(`\nerror: no coverage data for orchestrate.mjs (0 functions matched by '${ORCH}') — the gate cannot check what it cannot see`);
+    process.exit(1);
+  }
+  const orchPct = orchFns.pct ?? 0;
   const driverOk = pct >= threshold;
   const orchOk = orchPct >= ORCH_THRESHOLD;
   const coverOk = driverOk && orchOk;

@@ -26,12 +26,25 @@ need() { [ "$2" -ge 2 ] || die "$1 needs a value"; }
 # parse below rejects flags it does not know and the other runner has its own
 # — `--effort`, `--session`. Deciding after parsing would refuse the arguments
 # on the way to the script that wanted them.
-for i in $(seq 1 $#); do
+#
+# This has to walk the same value-flag/boolean-flag shape the parser below
+# uses, not just grep every position for the literal string "--runner" — a
+# value slot can legitimately hold that string (`--chat "--runner"`), and
+# treating it as the flag itself misreads whatever sits after it as the
+# runner name.
+i=1
+while [ "$i" -le $# ]; do
   eval "arg=\${$i}"
-  if [ "$arg" = "--runner" ]; then
-    eval "val=\${$((i + 1)):-}"
-    if [ "$val" = opencode ]; then exec bash "$SELF/run-opencode.sh" "$@"; fi
-  fi
+  case "$arg" in
+    --key|--workspace|--chat|--role|--tier|--model|--model-shown|--node-bin|--prompt-file|--runner)
+      if [ "$arg" = "--runner" ]; then
+        j=$((i + 1))
+        eval "val=\${$j:-}"
+        if [ "$val" = opencode ]; then exec bash "$SELF/run-opencode.sh" "$@"; fi
+      fi
+      i=$((i + 2)) ;;   # this flag's value slot is not itself a flag position
+    *) i=$((i + 1)) ;;
+  esac
 done
 
 while [ $# -gt 0 ]; do
@@ -73,7 +86,16 @@ fi
 if [ -z "$MODEL" ]; then
   # A tier is what `assess` decided for this step; the role is only the default
   # for agents nobody assesses individually.
-  IFS=$'\t' read -r MODEL DEFAULT_SHOWN < <(node "$MODELS" resolve "${TIER:-$ROLE}") || exit 2
+  #
+  # Not `IFS=$'\t' read -r MODEL DEFAULT_SHOWN` — a tab is IFS "whitespace" to
+  # `read`, so that form silently collapses an EMPTY field instead of keeping
+  # it in place. If the id ever came back empty, MODEL would be assigned the
+  # shown name instead (shifted one field left) and would still pass the
+  # `-n "$MODEL"` check below — wrong, but not empty. Splitting the raw line
+  # on tab by hand keeps every field, empty or not, exactly where it belongs.
+  _resolve_line=$(node "$MODELS" resolve "${TIER:-$ROLE}") || exit 2
+  MODEL=${_resolve_line%%$'\t'*}
+  DEFAULT_SHOWN=${_resolve_line#*$'\t'}
   [ -n "$MODEL" ] || die "could not resolve a model for role $ROLE"
   SHOWN_WANT=${SHOWN_WANT:-$DEFAULT_SHOWN}
 elif [ -z "$SHOWN_WANT" ]; then
@@ -116,8 +138,15 @@ PROMPT=$(cat "$PROMPT_FILE")
 # PATH inside an agent is rebuilt from the login profile, so what this script
 # exports does not order it: bare `node` is whatever that profile defaults to.
 # A project that pins a runtime has to say so in the prompt, per command.
+#
+# Kept as its own variable, not folded straight into PROMPT, because the
+# resume prompt built after a cut-off run (below) is a fresh string, not this
+# one with text appended — it needs the same preamble prepended to it too, or
+# a resumed agent with CURSOR_ORCH_NODE_BIN set goes right back to calling the
+# wrong `node`, which is the exact failure this preamble exists to prevent.
+NODE_PREAMBLE=
 if [ -n "$NODE_BIN" ]; then
-  PROMPT="Runtime, before anything else: bare \`node\` inside this agent is the login
+  NODE_PREAMBLE="Runtime, before anything else: bare \`node\` inside this agent is the login
 profile's default, not the runtime this project pins. Every command you run that
 depends on the project's runtime must begin with:
 
@@ -125,7 +154,8 @@ depends on the project's runtime must begin with:
 
 Prefix it per command — an export in one shell call does not reach the next one.
 
-$PROMPT"
+"
+  PROMPT="$NODE_PREAMBLE$PROMPT"
 fi
 
 launch() {   # $1 = log to write, $2 = prompt
@@ -143,7 +173,19 @@ launch() {   # $1 = log to write, $2 = prompt
 }
 
 report() {   # $1 = log; sets MODEL_SHOWN / HAS_RESULT / IS_ERROR / TAIL
-  IFS=$'\t' read -r MODEL_SHOWN HAS_RESULT IS_ERROR TAIL < <(node "$HARVEST" "$1" --probe)
+  # Not `IFS=$'\t' read -r a b c d` — a tab is IFS "whitespace" to `read`, so
+  # that form silently drops any EMPTY field instead of keeping it, and every
+  # field after it shifts one to the left. harvest.mjs's model field is empty
+  # whenever a run dies before it ever announces one (the exact shape of a
+  # failed run), which used to land HAS_RESULT's value on MODEL_SHOWN and lose
+  # IS_ERROR entirely — a failed run read as not-failed. Splitting the raw
+  # line on tab by hand keeps every field, empty or not, exactly where it is.
+  local _line _rest
+  _line=$(node "$HARVEST" "$1" --probe)
+  MODEL_SHOWN=${_line%%$'\t'*}; _rest=${_line#*$'\t'}
+  HAS_RESULT=${_rest%%$'\t'*}; _rest=${_rest#*$'\t'}
+  IS_ERROR=${_rest%%$'\t'*}; _rest=${_rest#*$'\t'}
+  TAIL=$_rest
 }
 
 launch "$LOG" "$PROMPT"
@@ -166,7 +208,7 @@ if [ "$HAS_RESULT" = 0 ] && [ -n "$CHAT" ] && [ "$RETRY" = 1 ]; then
   COUNT=$(printf '%s' "$STATE" | grep -c . || true)
   LOG2="$LOG_DIR/$KEY.2.jsonl"
   : 2>/dev/null > "$LOG2" || die "cannot write the resume log at $LOG2"
-  launch "$LOG2" "Your previous run was cut off before it finished. The last thing on the
+  launch "$LOG2" "${NODE_PREAMBLE}Your previous run was cut off before it finished. The last thing on the
 wire was:
 
     ${TAIL:-(the stream simply stopped)}

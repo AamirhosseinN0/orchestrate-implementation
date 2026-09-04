@@ -927,7 +927,7 @@ say('a slot taken by hand holds against a run');
 sect(() => {
   const d = box('slot-hold');
   ok('taking it by hand works', drv(d, ['slot', 'take', 'ci', '--task', 'probe']).code === 0);
-  const barge = drv(d, ['slot', 'run', 'ci', '--timeout', '1', '--', '/bin/echo', 'BARGED'],
+  const barge = drv(d, ['slot', 'run', 'ci', '--timeout', '1', '--', process.execPath, '-e', "console.log('BARGED')"],
     { timeout: 8000 });
   ok('a later run does not barge in', !has(barge.out, 'BARGED'));
   drv(d, ['slot', 'free', 'ci', '--force']);
@@ -951,10 +951,10 @@ sect(() => {
   const d = box('slot-race');
   const log = path.join(d, 'serial.log');
   fs.writeFileSync(log, '');
-  const one = (n) => 'node ' + JSON.stringify(DRIVER) + ' slot run ci -- /bin/bash -c ' +
+  const one = (n) => 'node ' + JSON.stringify(DRIVER) + ' slot run ci -- bash -c ' +
     JSON.stringify('echo START >> serial.log; sleep ' + n + '; echo END >> serial.log') + ' >/dev/null 2>&1 &';
   try {
-    execFileSync('/bin/bash', ['-c', [one(3), 'sleep 1', one(1), 'wait'].join('\n')],
+    execFileSync('bash', ['-c', [one(3), 'sleep 1', one(1), 'wait'].join('\n')],
       { cwd: d, timeout: 60000, stdio: 'ignore' });
   } catch { /* the assertion below says what happened */ }
   const seen = readIf(log).split('\n').filter(Boolean).join(' ');
@@ -1643,7 +1643,7 @@ sect(() => {
   const fakeHome = fs.mkdtempSync(path.join(os.tmpdir(), 'orch-home-'));
   const proj = path.join(fakeHome, '.claude/projects');
   fs.mkdirSync(proj, { recursive: true });
-  const projDir = path.join(proj, d.replace(/[/_]/g, '-'));
+  const projDir = path.join(proj, d.replace(/[/\\:_]/g, '-'));
   fs.mkdirSync(projDir, { recursive: true });
   const sub = path.join(d, 'apps/api');
   const body = 't1 is done.\nTHE-CONCLUSION';
@@ -2297,8 +2297,8 @@ sect(() => {
 // ============================================================================
 
 // ------------------------------------------------- ownership on the UPDATE path
+say('task add re-checks ownership when an update widens owns');
 sect(() => {
-  say('task add re-checks ownership when an update widens owns');
   const d = box('ownupd');
   // was: `if (at >= 0) continue` skipped the check for every update, so an
   // update could hand a second task a path another one already owned, silently.
@@ -2336,8 +2336,8 @@ sect(() => {
 });
 
 // ------------------------------------------- a path in a pre-flight is a path
+say('preflight done refuses prose where a path belongs');
 sect(() => {
-  say('preflight done refuses prose where a path belongs');
   const d = box('pfpath');
   const rep = path.join(d, '.claude/orchestration/preflight');
   fs.mkdirSync(rep, { recursive: true });
@@ -2371,8 +2371,8 @@ sect(() => {
   ok('and the generated brief says what a path is', has(b.out, 'bare') && has(b.out, 'repository-relative'), b.out);
 });
 
+say('doctor names an owns entry that is not a path');
 sect(() => {
-  say('doctor names an owns entry that is not a path');
   const d = box('docpath');
   // was: nothing anywhere reported prose sitting in owns. It matches itself, so
   // `preflight check` goes green on it and the pollution stops being visible.
@@ -2385,8 +2385,8 @@ sect(() => {
 });
 
 // ----------------------------------------------- amending an owed item in place
+say('owed edit amends a claim that turned out wrong');
 sect(() => {
-  say('owed edit amends a claim that turned out wrong');
   const d = box('owededit');
   drv(d, ['owed', 'add', '--what', 'six call sites', '--why', 'needs the window', '--to', 't1']);
   // was: add|assign|done|list only, so correcting a wrong claim meant
@@ -2414,8 +2414,8 @@ sect(() => {
 });
 
 // ------------------------------------------------------- repointing a moved plan
+say('a renamed plan is repointed, not appended beside itself');
 sect(() => {
-  say('a renamed plan is repointed, not appended beside itself');
   const d = box('planmv');
   // A phrase the scanner will actually catch, so the "no gap still points at
   // the old path" check below cannot pass on an empty list.
@@ -2467,8 +2467,8 @@ sect(() => {
 });
 
 // --------------------------------------------- what a checkpoint actually proves
+say('a checkpoint says which work it newly proves');
 sect(() => {
-  say('a checkpoint says which work it newly proves');
   const d = box('ckpt');
   const land = (k) => { drv(d, ['landed', k]); };
   const forceLanded = (keys) => {
@@ -2502,8 +2502,8 @@ sect(() => {
 });
 
 // -------------------------------------------------- the two kind vocabularies
+say('say and heard name both kind vocabularies');
 sect(() => {
-  say('say and heard name both kind vocabularies');
   const d = box('kinds');
   // was: `heard --kind question` worked and `say --kind question` did not, and
   // SKILL.md listed neither vocabulary — only examples two lines apart.
@@ -2524,8 +2524,8 @@ sect(() => {
 });
 
 // -------------------------------------------- brief --all under a running agent
+say('brief --all can be asked what it would disturb');
 sect(() => {
-  say('brief --all can be asked what it would disturb');
   const d = box('briefall');
   drv(d, ['brief', 't1']);
   drv(d, ['chip', 't1', '--id', 'task_x']);
@@ -2547,8 +2547,8 @@ sect(() => {
 });
 
 // ------------------------------------------ the address, and who is really there
+say('agent checks the address against the task\'s worktree');
 sect(() => {
-  say('agent checks the address against the task\'s worktree');
   const d = box('addr');
   const home = path.join(d, 'fakehome');
   const sess = path.join(home, '.claude/sessions');
@@ -2582,8 +2582,8 @@ sect(() => {
 // away for it. The short name is still a prefix of every other Grok 4.6 row; across the models one account can see
 // there are 197 such pairs. A prefix match would read a silent downgrade as a
 // correct run, which is the failure the check exists for.
+say('the model ladder, and its traps');
 sect(() => {
-  say('the model ladder, and its traps');
   const SK = path.join(path.dirname(fileURLToPath(import.meta.url)), 'claude-cursor', 'scripts');
   const M = path.join(SK, 'models.mjs');
   const run = (args, env = {}) => {
@@ -2691,8 +2691,8 @@ sect(() => {
 // ------------------------------------------- the launcher, and the runs it lost
 // Each case here is a way a real run was lost. The stub stands in for `agent`,
 // so the guards are exercised without a login, a network call or a billed run.
+say('the launcher, and the runs it lost');
 sect(() => {
-  say('the launcher, and the runs it lost');
   const SK = path.join(path.dirname(fileURLToPath(import.meta.url)), 'claude-cursor', 'scripts');
   const d = bare('launch');
   const stub = path.join(d, 'stub');
@@ -2856,8 +2856,8 @@ sect(() => {
 // The shapes here are the ones a real Cursor run emits. The one that matters
 // most is a log that simply stops: a hand-written `type=="result"` parser
 // reports that as silence, and a run that died then looks like a quiet one.
+say('reading a run back out of its log');
 sect(() => {
-  say('reading a run back out of its log');
   const SK = path.join(path.dirname(fileURLToPath(import.meta.url)), 'claude-cursor', 'scripts');
   const H = path.join(SK, 'harvest.mjs');
   const d = bare('harvest');
@@ -2924,8 +2924,8 @@ sect(() => {
 });
 
 // ------------------------------------------------ watching a run while it runs
+say('watching a run while it runs');
 sect(() => {
-  say('watching a run while it runs');
   const SK = path.join(path.dirname(fileURLToPath(import.meta.url)), 'claude-cursor', 'scripts');
   const FMT = path.join(SK, 'stream.mjs');
   const d = bare('stream');
@@ -3014,8 +3014,8 @@ sect(() => {
 
 // ------------------------------------------------------- the five stages, in order
 // load → assess → refine → check → run, driven end to end against a stub agent.
+say('the five stages, in order');
 sect(() => {
-  say('the five stages, in order');
   const ROOT = path.dirname(fileURLToPath(import.meta.url));
   const O = path.join(ROOT, 'claude-cursor', 'orchestrate.mjs');
   const d = bare('stages');
@@ -3227,8 +3227,8 @@ sect(() => {
 // ------------------------------------------------ one shared slot for heavy checks
 // Twelve agents each deciding to run the suite at the same moment is how a box
 // goes down. The slot makes that impossible rather than unlikely.
+say('one shared slot for heavy checks');
 sect(() => {
-  say('one shared slot for heavy checks');
   const ROOT = path.dirname(fileURLToPath(import.meta.url));
   const O = path.join(ROOT, 'claude-cursor', 'orchestrate.mjs');
   const d = bare('slot');
@@ -3274,8 +3274,8 @@ sect(() => {
 // -------------------------------------------- the sweep before work goes out
 // Everything a step cites that can be checked without running anything. Its
 // whole value is in being run at the moment work is about to be handed out.
+say('the sweep before work goes out');
 sect(() => {
-  say('the sweep before work goes out');
   const ROOT = path.dirname(fileURLToPath(import.meta.url));
   const O = path.join(ROOT, 'claude-cursor', 'orchestrate.mjs');
   const d = bare('doctor');
@@ -3392,8 +3392,8 @@ sect(() => {
 // ------------------------------------------ merging, and sending the work back
 // Two steps that shared a file finally meet here. Whichever goes second
 // reconciles, and the agent that should do it is the one that wrote the branch.
+say('merging, and sending the work back');
 sect(() => {
-  say('merging, and sending the work back');
   const ROOT = path.dirname(fileURLToPath(import.meta.url));
   const O = path.join(ROOT, 'claude-cursor', 'orchestrate.mjs');
   const d = bare('join');
@@ -3491,8 +3491,8 @@ sect(() => {
 // three green ticks; and six spellings of one migration head read as six
 // different things, so the gate that exists to stop two migration-writing steps
 // opening together would have opened them.
+say('what one 47-step round found');
 sect(() => {
-  say('what one 47-step round found');
   const ROOT = path.dirname(fileURLToPath(import.meta.url));
   const O = path.join(ROOT, 'claude-cursor', 'orchestrate.mjs');
   const d = bare('round');
@@ -3709,8 +3709,8 @@ sect(() => {
 // two that cost most were invisible from the outside: a dependent queueing
 // behind a suite it does not consume, and a plan-level requirement recorded as
 // a cross-product of step-level ones.
+say('widening the round');
 sect(() => {
-  say('widening the round');
   const ROOT = path.dirname(fileURLToPath(import.meta.url));
   const O = path.join(ROOT, 'claude-cursor', 'orchestrate.mjs');
 
@@ -4026,8 +4026,8 @@ sect(() => {
 // and share nothing else: opencode's log is a different vocabulary, its address
 // is a session that does not exist until the run does, and it never says which
 // model answered.
+say('running a round on opencode');
 sect(() => {
-  say('running a round on opencode');
   const ROOT = path.dirname(fileURLToPath(import.meta.url));
   const O = path.join(ROOT, 'claude-cursor', 'orchestrate.mjs');
   const MODELS = path.join(ROOT, 'claude-cursor', 'scripts', 'models.mjs');
@@ -4065,6 +4065,7 @@ sect(() => {
     fs.writeFileSync(path.join(stub, 'opencode'), `#!/usr/bin/env bash
 DIR=.
 while [ $# -gt 0 ]; do case "$1" in --dir) DIR=$2; shift 2 ;; *) shift ;; esac; done
+DIR=\${DIR//\\\\//}
 echo '{"type":"step_start","timestamp":1000,"sessionID":"ses_STUB","part":{"type":"step-start"}}'
 echo '{"type":"tool_use","timestamp":1500,"sessionID":"ses_STUB","part":{"type":"tool","tool":"write","state":{"status":"completed","input":{"filePath":"'"$DIR"'/src/a.ts","content":"one\\ntwo"},"metadata":{"filepath":"'"$DIR"'/src/a.ts"}}}}'
 echo '{"type":"tool_use","timestamp":1800,"sessionID":"ses_STUB","part":{"type":"tool","tool":"bash","state":{"status":"completed","input":{"command":"false"},"metadata":{"exit":3,"output":"nope"}}}}'
@@ -4227,9 +4228,15 @@ echo '{"type":"step_finish","timestamp":3000,"sessionID":"ses_STUB","part":{"typ
       filed.commands.some((c) => c.exitCode === 3), JSON.stringify(filed.commands));
     ok('tokens and cost are kept, which cursor\'s log has no values for',
       filed.usage.total === 100 && filed.usage.cost === 0.001, JSON.stringify(filed.usage));
-    // And the send-back resumes the session rather than a chat.
+    // And the send-back resumes the session rather than a chat. The flag is
+    // `-s`, which is what opencode's own help states and what the plan recorded
+    // from running it. This check used to assert `--session`, so it held the
+    // wrong spelling in place instead of catching it: a resume with a flag
+    // opencode ignores starts a fresh session with no memory of the run, while
+    // the record says the same conversation continued.
     const sb = b.run(['sendback', 'S-1', '--why', 'try again']);
-    ok('sendback resumes the opencode session', has(sb.out, '--session ses_STUB'), sb.out);
+    ok('sendback resumes the opencode session', has(sb.out, '-s ses_STUB'), sb.out);
+    ok('and not with a flag opencode would ignore', !has(sb.out, '--session'), sb.out);
     ok('with the model and effort it ran on', has(sb.out, '--variant high'), sb.out);
     ok('and not with cursor\'s resume flag', !has(sb.out, '--resume'), sb.out);
   }
@@ -4285,6 +4292,56 @@ echo '{"type":"step_finish","timestamp":3000,"sessionID":"ses_STUB","part":{"typ
     ok('elapsed time comes off opencode\'s own clock', has(outp, '00:08'), outp);
   }
 
+  // --- an opencode run that stopped short is not a passing one ------------
+  // The cursor harvester has required a terminal `result` event since the one
+  // run that died on this build, and reports `died` plus a non-zero exit
+  // without it. The opencode port had no equivalent: any run that emitted a
+  // single `text` chunk read as `passed`, so a provider drop after the model's
+  // first sentence was recorded as finished work. These hold the two
+  // harvesters to one contract, because a round cannot tell which one built
+  // the step and must not have to.
+  {
+    const HOC = path.join(SCRIPTS, 'harvest-opencode.mjs');
+    const b = box('oc-outcome', STEP, TIER);
+    const oc = (name, lines) => {
+      const f = path.join(b.d, name);
+      fs.writeFileSync(f, lines.map((l) => JSON.stringify(l)).join('\n') + (lines.length ? '\n' : ''));
+      try { return { rec: JSON.parse(execFileSync('node', [HOC, f], { encoding: 'utf8' })), code: 0 }; }
+      catch (e) { return { rec: JSON.parse(e.stdout), code: e.status }; }
+    };
+    const S = 'ses_CUT';
+    const cut = oc('cut.jsonl', [
+      { type: 'step_start', timestamp: 1000, sessionID: S, part: { type: 'step-start' } },
+      { type: 'text', timestamp: 1200, sessionID: S, part: { type: 'text', text: 'Let me look first' } },
+    ]);
+    ok('an opencode run with no step_finish reads as died', cut.rec.outcome === 'died', cut.rec.outcome);
+    ok('and exits non-zero, so it cannot pass for a finished one', cut.code !== 0, cut.code);
+
+    const done = oc('done.jsonl', [
+      { type: 'step_start', timestamp: 1000, sessionID: S, part: { type: 'step-start' } },
+      { type: 'text', timestamp: 1200, sessionID: S, part: { type: 'text', text: 'done' } },
+      { type: 'step_finish', timestamp: 3000, sessionID: S, part: { reason: 'stop', tokens: { total: 4 }, cost: 0.1 } },
+    ]);
+    ok('a run that finished reads as passed', done.rec.outcome === 'passed', done.rec.outcome);
+    ok('and exits zero', done.code === 0, done.code);
+
+    const empty = oc('empty.jsonl', []);
+    ok('an empty opencode log reads as died', empty.rec.outcome === 'died', empty.rec.outcome);
+
+    // The probe line is read by run-opencode.sh with `IFS=$'\t' read`, and tab is
+    // whitespace to IFS: a leading empty field is swallowed and every value
+    // shifts left one. A run that errored before opencode minted a session has
+    // exactly that shape, and it was reported as a pass with the error text
+    // landing in IS_ERROR where nothing compares it.
+    const errf = path.join(b.d, 'noses.jsonl');
+    fs.writeFileSync(errf, JSON.stringify({ type: 'error', timestamp: 2000,
+      error: { name: 'AuthError', data: { message: 'invalid API key' } } }) + '\n');
+    let probe = '';
+    try { probe = execFileSync('node', [HOC, errf, '--probe'], { encoding: 'utf8' }); }
+    catch (e) { probe = e.stdout || ''; }
+    ok('a probe line never begins with an empty field', !probe.startsWith('\t'), JSON.stringify(probe));
+    ok('and still carries four of them', probe.replace(/\n$/, '').split('\t').length === 4, JSON.stringify(probe));
+  }
   // --- and a cursor round is entirely unaffected --------------------------
   {
     const b = box('oc-cursor-intact', STEP, TIER);
@@ -4317,7 +4374,7 @@ else console.log('\nsandboxes kept: ' + boxes.join('\n                '));
 // the suite still ends on "all green", because green is only ever measured
 // against however many checks happened to run. Under a shard the total is the
 // runner's to check, since no one process sees them all.
-const EXPECTED = 835;   // every check above counts; raise it deliberately when you add one
+const EXPECTED = 843;   // every check above counts; raise it deliberately when you add one
 const total = pass + failures.length;
 const partial = Boolean(SHARD || ONLY);
 

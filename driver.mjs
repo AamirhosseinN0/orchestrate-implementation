@@ -110,7 +110,7 @@ function acquireLock() {
       if (e && e.code && e.code !== 'EEXIST')
         die('cannot create the register lock at ' + rel(lockDir()) + ': ' + e.code + ' — ' + e.message);
       if (lockIsDead()) { try { fs.rmSync(lockDir(), { recursive: true, force: true }); } catch { /* raced */ } continue; }
-      try { execSync('sleep 0.1'); } catch { /* keep spinning */ }
+      sleepSync(100);
     }
   }
   die('another driver process has held the register lock for a while: ' + rel(lockDir()) +
@@ -132,13 +132,29 @@ function releaseLock() {
 
 // When a process began, so a recycled pid can be told from the process that
 // really holds the lock. Linux keeps it in field 22 of /proc/<pid>/stat, in
-// clock ticks since boot; where that cannot be read there is simply no extra
+// clock ticks since boot. There is no /proc on Windows, so a holder is asked
+// through PowerShell instead — slower, but the only source that will still
+// agree with itself when a different process reads back what another one
+// wrote: both the write at acquire time and a later read during a staleness
+// check go through this same query, so the value one process records for its
+// own pid is exactly what another process gets back asking about that pid,
+// with no unit mismatch between a cheap self estimate and an exact read of
+// somebody else. Where neither source is available there is simply no extra
 // evidence and the pid check stands on its own, exactly as it did before.
 function procStartTime(pid) {
   try {
     const stat = fs.readFileSync('/proc/' + pid + '/stat', 'utf8');
     return Number(stat.slice(stat.lastIndexOf(')') + 2).split(' ')[19]) || null;
-  } catch { return null; }
+  } catch { /* not Linux — try the Windows source below */ }
+  if (process.platform === 'win32') {
+    try {
+      const out = execFileSync('powershell', ['-NoProfile', '-NonInteractive', '-Command',
+        '(Get-Process -Id ' + Number(pid) + ' -ErrorAction Stop).StartTime.ToFileTimeUtc()'],
+        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 5000 }).trim();
+      return out ? Number(out) || null : null;
+    } catch { return null; }
+  }
+  return null;
 }
 
 // A holder whose process is gone is dead however recently it started. A holder
@@ -220,7 +236,12 @@ function stampSaysEdited(text) {
   if (!st || typeof st.sha !== 'string') return null;
   return st.sha !== registerStamp(text);
 }
-const rel = (p) => path.relative(CWD, p) || p;
+// Always forward slashes, on every OS. `path.relative` answers in the native
+// separator, so on Windows every plan/gap/task got written as `docs\plans\p.md`
+// while every lookup — a `--plan` filter, a link in a report, a needle a user
+// typed — is spelled with `/`. Nothing but this function's own output ever
+// disagreed with itself; the only victims were comparisons against it.
+const rel = (p) => (path.relative(CWD, p) || p).split(path.sep).join('/');
 function nextId(r) {
   const n = r.gaps.reduce((m, g) => Math.max(m, parseInt(g.id.slice(1), 10) || 0), 0);
   return 'g' + String(n + 1).padStart(2, '0');
@@ -692,9 +713,16 @@ function walkPlans(root) {
 // walked for plans rather than read as one.
 function globPlans(arg) {
   const abs = path.resolve(CWD, arg);
-  const parts = abs.split(path.sep).filter(Boolean);
-  const seg = (s) => new RegExp('^' + s.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '[^/]*') + '$');
-  let here = [path.sep];
+  // The root itself was assumed to be a single separator character, which is
+  // true on POSIX (`/`) but not on Windows: `path.join('\\', 'C:')` makes
+  // `\C:`, a path that cannot exist, so `here` emptied out on the very first
+  // segment and every glob matched nothing. `path.parse().root` gives the real
+  // root either way — `C:\`, a UNC share's `\\host\share\`, or `/` — and the
+  // remaining segments are walked from there same as before.
+  const root = path.parse(abs).root;
+  const parts = abs.slice(root.length).split(path.sep).filter(Boolean);
+  const seg = (s) => new RegExp('^' + s.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '[^/\\\\]*') + '$');
+  let here = [root];
   for (let i = 0; i < parts.length; i++) {
     const part = parts[i];
     const next = [];
@@ -985,7 +1013,7 @@ function cmdList(flags) {
   let gs = reg.gaps;
   if (flags.status) gs = gs.filter((g) => g.status === flags.status);
   if (flags.scope) gs = gs.filter((g) => g.scope === flags.scope);
-  if (flags.plan) gs = gs.filter((g) => g.plan.includes(flags.plan));
+  if (flags.plan) gs = gs.filter((g) => norm(g.plan).includes(norm(flags.plan)));
   if (!gs.length) return console.log('(none)');
   for (const g of gs) {
     console.log(g.id + '  ' + g.status.padEnd(10) + g.scope.padEnd(6) + (g.title || g.quote.slice(0, 70)));
@@ -1254,7 +1282,7 @@ function cmdRender(flags) {
     die(hollow.length + ' gap(s) are marked answered with no answer recorded: ' +
         hollow.map((g) => g.id).join(', ') + '\n       Record each with `answer <id>`, or set it back to gap.');
   if (flags.plan) {
-    const gs = done.filter((g) => g.plan.includes(flags.plan));
+    const gs = done.filter((g) => norm(g.plan).includes(norm(flags.plan)));
     if (!gs.length) { console.log('(nothing was decided for ' + flags.plan + ' — leave that plan alone)'); return; }
     console.log('## Decisions (settled with the user — do not relitigate)\n');
     console.log('| Decision | Choice |');
@@ -1322,7 +1350,10 @@ function cmdRender(flags) {
 // code that actually exists — and is not allowed to decide anything itself.
 
 function planEntry(r, needle) {
-  const hits = r.plans.filter((x) => x.path.includes(needle));
+  // Tolerant of either slash spelling on both sides — the needle a user typed
+  // and a `.path` a register may still hold from before `rel` normalised.
+  const need = norm(needle);
+  const hits = r.plans.filter((x) => norm(x.path).includes(need));
   if (!hits.length) die('no plan matching "' + needle + '"');
   if (hits.length > 1) die('"' + needle + '" matches ' + hits.length + ': ' + hits.map((h) => h.path).join(', '));
   return hits[0];
@@ -1688,7 +1719,11 @@ function getTask(r, k) {
 // function that quietly equated those would make `guard` accept a file that is
 // not the one it was shown. Whitespace is trimmed where paths are authored.
 function norm(p) {
-  let x = String(p).replace(/\/+$/, '').replace(/\/\*+$/, '');
+  // A register written before `rel` was fixed to emit forward slashes still has
+  // `docs\plans\p.md` on disk, and a Windows shell will hand this a needle spelled
+  // the same way even now — so backslashes are folded to `/` before anything else
+  // runs, and old and new records read alike.
+  let x = String(p).replace(/\\/g, '/').replace(/\/+$/, '').replace(/\/\*+$/, '');
   while (x.startsWith('./')) x = x.slice(2);
   // after the strips, not before: normalize leaves a trailing slash alone
   x = path.posix.normalize(x);
@@ -2923,14 +2958,38 @@ function cmdArchive(flags) {
   console.log('exactly as it was. `verify` still passes, because a removal is recorded like any other change.');
 }
 
+// Is `b` something the shell that runs `verify` would actually find? This used
+// to shell out to `command -v` under `/bin/bash`, which does not exist on
+// native Windows Node — so `spawnSync` came back ENOENT for every single verify
+// binary and `doctor` reported the whole project broken. Walking PATH by hand
+// needs no shell at all, so it works the same on every OS, and it is what
+// `command -v` was doing internally anyway.
+function findBin(b) {
+  if (b.includes('/') || b.includes('\\')) {                 // given as a path, not a bare name
+    try { return fs.statSync(b).isFile() ? b : null; } catch { return null; }
+  }
+  const dirs = String(process.env.PATH || process.env.Path || '').split(path.delimiter).filter(Boolean);
+  const exts = process.platform === 'win32'
+    ? String(process.env.PATHEXT || '.COM;.EXE;.BAT;.CMD').split(';')
+    : [''];
+  for (const dir of dirs) {
+    for (const ext of exts) {
+      const cand = path.join(dir, b + ext);
+      try {
+        if (!fs.statSync(cand).isFile()) continue;
+        if (process.platform !== 'win32') fs.accessSync(cand, fs.constants.X_OK);
+        return cand;
+      } catch { /* not this one */ }
+    }
+  }
+  return null;
+}
+
 function cmdDoctor(flags = {}) {
   const r = readReg();
   const binCache = {};
   const binOk = (b) => {
-    if (!(b in binCache)) {
-      try { execSync('command -v -- ' + JSON.stringify(b), { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], shell: '/bin/bash' }); binCache[b] = true; }
-      catch { binCache[b] = false; }
-    }
+    if (!(b in binCache)) binCache[b] = !!findBin(b);
     return binCache[b];
   };
   let bad = 0, checked = 0;
@@ -3480,6 +3539,29 @@ function bashCommandLine(raw) {
   return out.join(' ');
 }
 
+// The shell that runs a verify or a slot command. `/bin/bash` was hardcoded,
+// which is a real path on Linux and macOS and nowhere on Windows — Node's
+// CreateProcess takes it literally rather than resolving it as a shell name,
+// so it ENOENTed every single time and a slot run "failed" whatever the
+// command actually was. Git for Windows ships a real bash on PATH, so find
+// that; the result never changes for the life of the process.
+let BASH_PATH;
+function bashPath() {
+  if (BASH_PATH === undefined) BASH_PATH = findBin('bash');
+  return BASH_PATH;
+}
+
+// A synchronous, portable sleep. `execSync('sleep ' + n)` shelled out to a
+// POSIX `sleep` binary that plain Windows does not have, and — since the
+// failure was swallowed as "keep waiting" — turned the wait into a tight
+// zero-delay spin instead of the ~10s backoff the jitter comment promises.
+// Atomics.wait blocks the calling thread for real, in Node, on every OS,
+// without shelling out to anything.
+function sleepSync(ms) {
+  try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); }
+  catch { /* best effort — never let a sleep failure abort the wait loop */ }
+}
+
 // Everything the slot does happens on the filesystem and cleans itself up, so a
 // contention incident left no trace anywhere: `events`, `digest` and `verify`
 // cannot see it, and the only surviving account of a real ninety-minute stall
@@ -3584,7 +3666,7 @@ function cmdSlot(sub, rest, flags, raw) {
         console.error('slot ' + name + ': ' + describeHolder(lock) + ' — waiting, checking every ~10s.'); told = true;
       }
       // ~10s with jitter, so a crowd of waiters does not stampede the same instant
-      try { execSync('sleep ' + (8 + Math.floor(Math.random() * 5))); } catch { /* keep waiting */ }
+      sleepSync((8 + Math.floor(Math.random() * 5)) * 1000);
     }
     // Free our own claim by its token. If we were evicted while the suite ran, the
     // lock now belongs to whoever replaced us and is not ours to delete.
@@ -3595,11 +3677,25 @@ function cmdSlot(sub, rest, flags, raw) {
     const q = bashCommandLine(raw);
     console.error('slot ' + name + ': taken — running: ' + raw.join(' '));
     slotLogAppend(name, 'took it' + (told ? ' after waiting' : '') + (flags.task ? ' for ' + flags.task : ''));
-    const res = spawnSync('/bin/bash', ['-c', q], { stdio: 'inherit', cwd: process.cwd() });
+    const bash = bashPath();
+    if (!bash) {
+      free();
+      slotLogAppend(name, 'freed after ' + Math.round((Date.now() - t0) / 1000) + 's, could not start: no bash on PATH');
+      console.error('slot ' + name + ': no bash on PATH to run the command — freed, not run.');
+      process.exit(127);
+    }
+    const res = spawnSync(bash, ['-c', q], { stdio: 'inherit', cwd: process.cwd() });
     free();
-    slotLogAppend(name, 'freed after ' + Math.round((Date.now() - t0) / 1000) + 's, exit ' + res.status);
+    // `status` is null both when the process could never start and when it died
+    // to a signal — those used to collapse onto the same bare exit 1, so "the
+    // command wasn't found" and "the command ran and failed" looked identical.
+    // 127 is what a shell itself reports for "command not found"; use it here
+    // for the same failure at one remove up, so a caller can tell the two apart.
+    const code = res.error ? 127 : (res.status === null ? 127 : res.status);
+    slotLogAppend(name, 'freed after ' + Math.round((Date.now() - t0) / 1000) + 's, exit ' +
+      (res.error ? 'could not start (' + res.error.code + ')' : res.status));
     console.error('slot ' + name + ': freed.');
-    process.exit(res.status === null ? 1 : res.status);
+    process.exit(code);
   }
   die('slot run <name> -- <cmd> | status | wait <name> | take <name> | free <name> [--force]   (default name: ci)');
 }
@@ -3916,13 +4012,13 @@ function sessionsIn(dir) {
   const reg = path.join(process.env.HOME || '', '.claude', 'sessions');
   if (!dir || !fs.existsSync(reg)) return null;
   try {
-    const want = fs.realpathSync(dir);
+    const want = realCase(dir);
     const out = [];
     for (const f of fs.readdirSync(reg)) {
       if (!f.endsWith('.json')) continue;
       let o; try { o = JSON.parse(fs.readFileSync(path.join(reg, f), 'utf8')); } catch { continue; }
       if (!o || !o.cwd || !o.name) continue;
-      let c; try { c = fs.realpathSync(o.cwd); } catch { c = o.cwd; }
+      const c = realCase(o.cwd);
       if (c === want || c.startsWith(want + path.sep)) out.push(o.name);
     }
     return out;
@@ -4038,14 +4134,26 @@ function cmdDone(key) {
   if (d) console.log('  recorded ' + d.id + ' — it said so itself, so it will not be lost.');
 }
 
+// The one spelling of a directory that every OS-level comparison agrees on.
+// git prints long-form, forward-slash paths on Windows; Node hands back
+// short 8.3 names for the very same directory (`CENTRA~1` for `CentralServer`)
+// when it was reached that way — and `fs.realpathSync` (the plain JS one)
+// does not undo that, so two callers naming the same worktree compared
+// unequal and `rel()` on it produced a path stitched together from unrelated
+// segments. `fs.realpathSync.native` asks the OS for the canonical path
+// (GetFinalPathNameByHandle on Windows) and does resolve it, so run every
+// worktree path through this before it is stored, compared, or displayed.
+function realCase(p) {
+  try { return (fs.realpathSync.native || fs.realpathSync)(p); } catch { return p; }
+}
 function worktreeFor(t) {
-  if (t.worktree && fs.existsSync(t.worktree)) return t.worktree;
+  if (t.worktree && fs.existsSync(t.worktree)) return realCase(t.worktree);
   try {
     const out = execSync('git worktree list --porcelain', { cwd: CWD, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
     let cur = null;
     for (const line of out.split('\n')) {
       if (line.startsWith('worktree ')) cur = line.slice(9).trim();
-      if (line.startsWith('branch ') && line.slice(7).trim() === 'refs/heads/' + t.branch) return cur;
+      if (line.startsWith('branch ') && line.slice(7).trim() === 'refs/heads/' + t.branch) return realCase(cur);
     }
   } catch { /* no git */ }
   return null;
@@ -4246,9 +4354,16 @@ function ledger() {
 // derived from that rather than typed — retroactively, and for messages the
 // orchestrator can no longer see.
 function transcriptDir() {
-  const base = path.join(process.env.HOME, '.claude', 'projects');
+  const base = path.join(process.env.HOME || process.env.USERPROFILE || '', '.claude', 'projects');
   if (!fs.existsSync(base)) return null;
-  const guess = path.join(base, CWD.replace(/[/_]/g, '-'));
+  // Claude Code's own convention: every `/`, `\`, `:` or `_` becomes a `-`,
+  // uncollapsed — `C:\Users\x` becomes `C--Users-x`, the doubled dash where the
+  // drive colon and the path separator land back to back included. The regex
+  // only stripped `/` and `_`, so `\` and `:` sailed through on Windows and the
+  // fast path never once matched; readdirSync below still found the real
+  // directory by content, so this was silent rather than broken, but it did
+  // the readdir-and-grep the fast path exists to skip on every single call.
+  const guess = path.join(base, CWD.replace(/[\\/:_]/g, '-'));
   if (fs.existsSync(guess)) return guess;
   // fall back to whichever project dir whose records name this cwd
   for (const d of fs.readdirSync(base)) {

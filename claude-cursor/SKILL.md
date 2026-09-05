@@ -471,6 +471,24 @@ node $ORCH step own S-1 src/capabilities.ts test/access/seed.test.ts
 `guard` prints that line itself, for the strays no other step owns — see
 [When a run finishes](#when-a-run-finishes).
 
+**`builtOn` is the reading the agent did, and it goes to whoever builds the
+step.** It used to go nowhere: the field was asked for in the report and appeared
+nowhere else in the tool, so every building agent opened with its plan, its own
+file list, and nothing at all about the repository it was building into — and
+spent its first hour re-deriving the map its own refining agent had drawn an hour
+earlier. `refine done` now records it on every step of that plan as `context`,
+and the brief prints it under **What is already there**, marking each entry the
+step does not own as read-only. A step that named its own `context` keeps it, and
+a later report naming none leaves what a step already had alone rather than
+blanking it.
+
+Paths there are repository-relative and are judged like `owns` is — the building
+agent opens them from its own worktree, so an absolute path or a sentence is
+refused and the whole report with it. A step with nothing recorded gets a brief
+that says so, rather than a section that quietly vanishes: an absent one reads as
+"there is nothing already there", which is never true and is the reading that
+gets a second copy of an existing helper written.
+
 **`provides` and `uses` are what decide build order**, and they are the only
 fields that can say it. `provides` is what a step makes reachable from outside
 itself — an exported type or function, a table, a config key, the handler behind
@@ -613,8 +631,13 @@ scheme to the project's own list through `CURSOR_ORCH_POINTS` so it is a decisio
 rather than a spelling drift.
 
 It also warns when a brief is older than the step it describes, because the agent
-holding it will not know. `doctor --all` adds the quieter notes: every
-serialisation point only one step names, whether or not anything looks like it.
+holding it will not know. What the brief was written from is one list, asked by
+all three places that need it — the two that write a brief, and this check. A
+field added to the brief and to two of them calls every brief stale; one added
+to the writers alone leaves a changed brief reading as current.
+
+`doctor --all` adds the quieter notes: every serialisation point only one step
+names, whether or not anything looks like it.
 
 Run it here, not earlier. With nothing open it says so rather than passing, and a
 tick over nothing checked is how a green report starts meaning nothing.
@@ -992,7 +1015,9 @@ for exactly the kind of round that gets wider.
   more steps.
 - **Do not let a thin slice ship a thin brief.** The cost of a wider round is
   that each agent sees less of the whole. Spend some of what you save on
-  context.
+  context. `builtOn` is where that spend goes: it is the only part of the brief
+  that says what already exists, and a brief whose **What is already there** says
+  nothing was recorded is one an agent will fill in by guessing.
 - **Do not skip `doctor` because the round got wide.** A wide round is where two
   spellings of one serialisation point cost the most.
 

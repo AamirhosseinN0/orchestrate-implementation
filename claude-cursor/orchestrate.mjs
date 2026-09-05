@@ -1821,6 +1821,14 @@ CMDS.run = (argv) => {
     console.log(`run end to end, and it is the single most expensive thing to get wrong here.`);
     console.log(`\nAlso written to ${relCwd(outFile)}:\n`);
     for (const l of lines) console.log(l + '\n');
+    // One more backgrounded call, in the same message. Nothing else can wake
+    // this session while the round is out: a wedged run never exits, and an
+    // agent that decided the suite was already red says so in its log and keeps
+    // going. This is the only thing that carries either of those back.
+    console.log('And one more beside them, backgrounded too. It sleeps 15 minutes, looks at');
+    console.log('every open run, and exits — and that exit is what wakes you if one has gone');
+    console.log('quiet or has said it is stuck. Launch another each time it comes back:\n');
+    console.log(`  node ${SELF()} vitals --wait\n`);
     if (f.merges.length) {
       console.log(`${f.merges.length} pair(s) of them share files — they still run together, and`);
       console.log('whichever lands second reconciles:');
@@ -2126,6 +2134,143 @@ function guessBase() {
   ]) { try { const v = verified(fn()); if (v) return v; } catch { /* try the next */ } }
   return 'main';
 }
+
+// ------------------------------------------------------------------- vitals
+// Between opening a round and the first run coming back there is nothing. The
+// only thing that wakes this orchestrator is a process exit, and a wedged run
+// never exits — nor does one whose agent decided an hour ago that the suite was
+// already red and has been saying so ever since. So one more backgrounded call
+// goes out beside the round: it sleeps, looks at every open run's log, prints
+// what it found and exits, and that exit is the wake-up.
+//
+// Two questions, both answerable from the log alone: is it still growing, and
+// do the agent's own words say it is stuck. Neither is repaired here. A wedged
+// run and a suite that was red before the step started are decisions, and they
+// go to the person.
+const VITALS = () => path.join(ORCH, 'vitals.json');
+const VITALS_MIN = () => {
+  const n = Number(process.env.CURSOR_ORCH_VITALS_MIN || 15);
+  return Number.isFinite(n) && n > 0 ? n : 15;
+};
+// What the agent SAID, across both runners: Cursor puts it on `assistant`
+// message content and on the final `result`, opencode on a `text` part and on
+// `error`. Tool output is deliberately not here — a failing suite prints
+// "failed" fifty times and none of those are the agent telling anyone anything.
+function saidIn(line) {
+  let ev;
+  try { ev = JSON.parse(line); } catch { return null; }
+  if (!ev || typeof ev !== 'object') return null;
+  if (ev.type === 'assistant') return (ev.message?.content || []).map((p) => p.text || '').join(' ').trim() || null;
+  if (ev.type === 'result' && typeof ev.result === 'string') return ev.result;
+  if (ev.type === 'text') return ev.part?.text || null;
+  if (ev.type === 'error') return 'error: ' + ((ev.error?.name || '') + ' ' + (ev.error?.data?.message || '')).trim();
+  return null;
+}
+// Tight on purpose. A phrase here stops a round and wakes a person, so the cost
+// of a loose one is that the check gets switched off. Each says which of the two
+// things the person has to decide about it.
+const DISTRESS = [
+  ['ci', /\b(?:pre-?existing|already (?:red|broken|failing)|broken before|fails? on (?:main|master|the base)|unrelated to (?:my|this) change|not caused by (?:my|this) change)\b/i],
+  ['stuck', /\b(?:i )?(?:can'?t|cannot|could not|unable to|won'?t be able to) (?:fix|resolve|proceed|continue|complete|do this)\b/i],
+  ['stuck', /\b(?:blocked (?:on|by)|needs? (?:a )?(?:human|decision|your input)|requires? a decision|out of scope for (?:this|the) step|giving up|i am stuck|i'?m stuck)\b/i],
+  ['stuck', /^error: \S/i],
+];
+const clipLine = (s, n = 160) => { const f = String(s ?? '').replace(/\s+/g, ' ').trim(); return f.length > n ? f.slice(0, n - 1) + '…' : f; };
+const ago = (ms) => (ms >= 60000 ? Math.floor(ms / 60000) + 'm' : Math.round(ms / 1000) + 's');
+const inKb = (b) => (b >= 1048576 ? (b / 1048576).toFixed(1) + ' MB' : b >= 1024 ? Math.round(b / 1024) + ' KB' : b + ' bytes');
+
+// One look at one open step. Says what to print and whether it needs a person.
+function vitalsOf(t, seen, quietMs) {
+  const st = runStatus(t.key);
+  const log = (st && st.log) || path.join(ORCH, 'logs', t.key + '.jsonl');
+  // A run that has ended has a log that correctly stops growing, so the status
+  // file is asked before silence is judged. Reporting it is useful in itself:
+  // a run that finished between two wake-ups is exactly what this arrives to
+  // notice.
+  if (st && st.outcome && st.outcome !== 'running')
+    return { state: 'finished', note: `${st.outcome} — \`run record ${t.key}\`` };
+  let stat;
+  try { stat = fs.statSync(log); }
+  catch {
+    // A Claude Code subagent step writes no jsonl at all, and the Agent tool's
+    // own completion wakes the orchestrator instead. Nothing to alarm about.
+    if (!st) return { state: 'skipped', note: 'no log — a Claude Code step, or not launched yet' };
+    return { alarm: true, state: 'ALARM', note: `no log at ${relCwd(log)} — the run never started` };
+  }
+  const quiet = Date.now() - stat.mtimeMs;
+  const prev = seen[t.key] || { offset: 0 };
+  // A log that was truncated and rewritten is shorter than where we got to;
+  // reading from the old offset would read past the end and report silence on a
+  // run that had just been relaunched. Start again from the top instead.
+  let from = stat.size < prev.offset ? 0 : prev.offset;
+  // A first look at a round already hours old can face 3.5 MB a run, and twelve
+  // of those in one process. Only the newest slice is read; the partial line at
+  // the cut simply fails to parse and is skipped, which is what the parser does
+  // with any line that is not an event.
+  const MOST = 8 * 1048576;
+  if (stat.size - from > MOST) from = stat.size - MOST;
+  const gained = stat.size - from;
+  // Only what is new. Re-reading twelve megabyte logs every fifteen minutes is
+  // pointless, and — the reason that actually matters — a phrase already
+  // reported must not be raised a second time, or the second look stops the
+  // round for something the person has already answered.
+  let found = null;
+  if (gained > 0) {
+    let slice = '';
+    try {
+      const fd = fs.openSync(log, 'r');
+      try {
+        const buf = Buffer.alloc(gained);
+        const got = fs.readSync(fd, buf, 0, gained, from);
+        slice = buf.toString('utf8', 0, got);
+      } finally { fs.closeSync(fd); }
+    } catch { /* a log that cannot be read is judged on its mtime below */ }
+    for (const line of slice.split('\n')) {
+      const said = saidIn(line);
+      if (!said) continue;
+      for (const [family, re] of DISTRESS) if (re.test(said)) { found = { family, said: clipLine(said) }; break; }
+      if (found) break;
+    }
+  }
+  seen[t.key] = { offset: stat.size, at: new Date().toISOString() };
+  if (found) return { alarm: true, state: 'ALARM', note: `${found.family}: "${found.said}"` };
+  if (quiet >= quietMs) return { alarm: true, state: 'ALARM', note: `silent for ${ago(quiet)} — nothing written to ${relCwd(log)} since` };
+  return { state: 'alive', note: `+${inKb(gained)} since the last look, last write ${ago(quiet)} ago` };
+}
+
+CMDS.vitals = (argv) => {
+  const every = argv.includes('--every') ? Number(argv[argv.indexOf('--every') + 1]) : VITALS_MIN();
+  if (!Number.isFinite(every) || every <= 0) die('--every takes a number of minutes');
+  const s = readState();
+  const out = tasks(s).filter((t) => t.status === 'open');
+  // Nothing out is not a quiet success to wait fifteen minutes for. The round is
+  // over, or has not started, and a watchdog left running past it is a process
+  // looking at logs nobody is waiting on.
+  if (!out.length) { console.log('Nothing is out — no run to check on.'); return; }
+  if (argv.includes('--wait')) {
+    const at = new Date(Date.now() + every * 60000);
+    console.log(`Watching ${out.length} step(s): ${out.map((t) => t.key).join(' ')}.\n` +
+      `The next look is at ${at.toTimeString().slice(0, 5)}. This exits then, and that exit is what wakes you.`);
+    // A synchronous wait, because everything in this file is synchronous: a
+    // timer would let the process fall off the end before the check ran.
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, every * 60000);
+  }
+  let seen = {};
+  try { seen = JSON.parse(fs.readFileSync(VITALS(), 'utf8')); } catch { /* the first look */ }
+  const rows = out.map((t) => ({ key: t.key, ...vitalsOf(t, seen, every * 60000) }));
+  fs.mkdirSync(ORCH, { recursive: true });
+  // Not an event. Where a reader got to in a file is not a decision, and one
+  // appended per open step per quarter hour would bury the record in it.
+  try { fs.writeFileSync(VITALS(), JSON.stringify(seen, null, 2) + '\n'); } catch { /* best effort */ }
+  for (const r of rows) console.log('  ' + r.key.padEnd(10) + r.state.padEnd(10) + r.note);
+  const bad = rows.filter((r) => r.alarm);
+  if (!bad.length) { console.log(`\nAll ${rows.length} accounted for. Launch another \`vitals --wait\` while they are still out.`); return; }
+  console.log(`\n${bad.length} of ${rows.length} need a person.`);
+  console.log('  Stop and ask the human. Do not send back and do not restart: a run that has');
+  console.log('  gone quiet, and a suite that was red before the step started, are both');
+  console.log('  decisions. Say which step, quote what it said, and let them choose.');
+  process.exit(1);
+};
 
 CMDS.guard = (argv) => {
   const s = readState();
@@ -3071,6 +3216,9 @@ const HELP = `orchestrate — plan to merged code, on Cursor, opencode or Claude
   run open <key>            worktree, chat, brief — everything one step needs to start
   run open <key> --rebrief  rewrite the brief of a step already out
   run record <key> --log L  harvest a finished run into the record
+  vitals [--wait]           look at every open run's log: still growing, and does
+                            it say it is stuck. --wait sleeps 15 minutes first, so
+                            its exit is what wakes you while a round is out
   guard <key>               did it touch anything it does not own
   join <key>                merge it into the main line; says when it conflicts
   join --batch <key>…       merge several, then one suite over the result

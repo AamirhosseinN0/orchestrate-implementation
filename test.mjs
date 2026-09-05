@@ -4819,6 +4819,10 @@ sect(() => {
     ok('with the whole round written down as well', has(all.out, '.claude/orch/launch/'), all.out);
     ok('and says they go as separate backgrounded calls, in one message',
       has(all.out, 'all in one\nmessage'), all.out);
+    // Nothing else can wake the session while the round is out, so the line
+    // that arms the look-in is printed with the round rather than remembered.
+    ok('and the round comes with the one call that wakes you if a run goes quiet',
+      has(all.out, 'vitals --wait'), all.out);
     ok('the fourth stays back on the point the third is moving',
       has(all.out, 'stayed back on a serialisation point') && has(all.out, 'S-4'), all.out);
     ok('and it really is not open', stepOf(b, 'S-4').status === 'planned', stepOf(b, 'S-4').status);
@@ -4877,6 +4881,134 @@ sect(() => {
   }
 });
 
+// ------------------------------------- looking in on a round while it is out
+// Between opening a round and the first run coming back there is nothing, and a
+// wedged run never exits to say so. `vitals` is the look-in: is each open run's
+// log still growing, and do the agent's own words say it is stuck. The case
+// that decides whether this survives a real round is the false-positive one — a
+// failing suite's output saying "cannot fix" is not the agent saying it.
+say('looking in on a round while it is out');
+sect(() => {
+  const ROOT = path.dirname(fileURLToPath(import.meta.url));
+  const O = path.join(ROOT, 'claude-cursor', 'orchestrate.mjs');
+  const J = (o) => JSON.stringify(o);
+
+  function box(name, steps) {
+    const d = bare(name);
+    fs.mkdirSync(path.join(d, '.claude', 'orch', 'logs'), { recursive: true });
+    fs.mkdirSync(path.join(d, '.claude', 'orch', 'runs'), { recursive: true });
+    fs.writeFileSync(path.join(d, '.claude', 'orch', 'state.json'), JSON.stringify({
+      version: 1, created: '2026-09-05T00:00:00.000Z', plans: [], notes: [],
+      tasks: steps.map((k) => ({ key: k, title: k, status: 'open' })) }, null, 2));
+    const log = (k, lines) => fs.writeFileSync(path.join(d, '.claude', 'orch', 'logs', k + '.jsonl'), lines.join('\n') + '\n');
+    // The four tab-separated fields both launchers write on every exit path.
+    const status = (k, ex, outcome) => fs.writeFileSync(path.join(d, '.claude', 'orch', 'runs', k + '.status'),
+      `exit ${ex}\t${outcome}\t${k}\t.claude/orch/logs/${k}.jsonl\n`);
+    const age = (k, minutes) => {
+      const t = new Date(Date.now() - minutes * 60000);
+      fs.utimesSync(path.join(d, '.claude', 'orch', 'logs', k + '.jsonl'), t, t);
+    };
+    const run = (args) => {
+      try { return { code: 0, out: execFileSync('node', [O, ...args], { cwd: d, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }) }; }
+      catch (e) { return { code: e.status ?? -1, out: String(e.stdout || '') + String(e.stderr || '') }; }
+    };
+    return { d, log, status, age, run };
+  }
+
+  // --- a growing log is what alive looks like; a silent one is not ---------
+  {
+    const b = box('vitals-alive', ['S-1', 'S-2']);
+    b.log('S-1', [J({ type: 'system', subtype: 'init' }), J({ type: 'assistant', message: { content: [{ text: 'reading the tests now' }] } })]);
+    b.status('S-1', '-', 'running');
+    b.log('S-2', [J({ type: 'system', subtype: 'init' })]);
+    b.status('S-2', '-', 'running');
+    b.age('S-2', 40);
+    const v = b.run(['vitals']);
+    ok('a log written a moment ago reads as alive', has(v.out, 'S-1') && has(v.out, 'alive'), v.out);
+    ok('one that has not grown in the interval is an alarm', has(v.out, 'S-2') && has(v.out, 'silent for 40m'), v.out);
+    ok('and the check exits non-zero when something needs a person', v.code === 1, v.code);
+    ok('saying so in words, not just in the code', has(v.out, '1 of 2 need a person'), v.out);
+    ok('and saying the human decides rather than sending it back',
+      has(v.out, 'Do not send back and do not restart'), v.out);
+  }
+
+  // --- what the agent said, and what a command merely printed --------------
+  {
+    const b = box('vitals-said', ['S-1', 'S-2', 'S-3']);
+    // Cursor's shape: the agent blaming a failure it says predates it.
+    b.log('S-1', [J({ type: 'assistant', message: { content: [{ text: 'npm test is red but it fails on main too, unrelated to my change' }] } })]);
+    b.status('S-1', '-', 'running');
+    // opencode's shape: the agent saying it cannot go on.
+    b.log('S-2', [J({ type: 'text', part: { text: 'I cannot fix this without a decision on the schema' } })]);
+    b.status('S-2', '-', 'running');
+    // The false positive that decides whether this is worth having: the same
+    // words, but printed BY a failing command rather than said by the agent.
+    b.log('S-3', [J({ type: 'tool_call', subtype: 'completed', tool_call: { shellToolCall: {
+      args: { command: 'npm test' },
+      result: { success: { exitCode: 1, stdout: 'FAIL: pre-existing failure, cannot fix', stderr: '' } } } } })]);
+    b.status('S-3', '-', 'running');
+    const v = b.run(['vitals']);
+    ok('a step blaming a failure it says predates it is an alarm', has(v.out, 'ci: "npm test is red'), v.out);
+    ok('one saying it cannot fix something is an alarm too', has(v.out, 'stuck: "I cannot fix this'), v.out);
+    ok('and the sentence is quoted rather than summarised', has(v.out, 'decision on the schema'), v.out);
+    ok('a failing command\'s own output is not the agent saying anything',
+      /S-3\s+alive/.test(v.out), v.out);
+    ok('two of the three need a person', has(v.out, '2 of 3 need a person'), v.out);
+
+    // Only what is new is read, so a line already raised is not raised again —
+    // otherwise every later look stops the round for something already answered.
+    const again = b.run(['vitals']);
+    ok('a line already raised is not raised a second time', again.code === 0, again.out);
+    ok('and the round reads as accounted for', has(again.out, 'All 3 accounted for'), again.out);
+  }
+
+  // --- what the status file settles that the log alone cannot --------------
+  {
+    const b = box('vitals-ended', ['S-1', 'S-2', 'S-3']);
+    // A finished run's log correctly stops growing. Judged on silence alone it
+    // would read as wedged; the status file is asked first.
+    b.log('S-1', [J({ type: 'result', result: 'done' })]);
+    b.status('S-1', '0', 'passed');
+    b.age('S-1', 90);
+    // Launched, but the log was never created: the run never started.
+    b.status('S-2', '-', 'running');
+    // No status file at all — a Claude Code step writes no jsonl, and the Agent
+    // tool's own completion wakes the orchestrator instead.
+    const v = b.run(['vitals']);
+    ok('a run that ended is reported as finished, not as stalled',
+      /S-1\s+finished/.test(v.out) && has(v.out, 'run record S-1'), v.out);
+    ok('a launched run with no log at all never started', /S-2\s+ALARM/.test(v.out) && has(v.out, 'never started'), v.out);
+    ok('a step with no run behind it is skipped, not alarmed on',
+      /S-3\s+skipped/.test(v.out) && has(v.out, 'Claude Code step'), v.out);
+    ok('and only the one that needs a person counts', has(v.out, '1 of 3 need a person'), v.out);
+  }
+
+  // --- the wake-up itself --------------------------------------------------
+  {
+    const b = box('vitals-wait', ['S-1']);
+    b.log('S-1', [J({ type: 'system', subtype: 'init' })]);
+    b.status('S-1', '-', 'running');
+    const started = Date.now();
+    const w = b.run(['vitals', '--wait', '--every', '0.02']);
+    ok('--wait sleeps before it looks', Date.now() - started >= 900, Date.now() - started);
+    ok('and says when it will come back, since that exit is the wake-up',
+      has(w.out, 'The next look is at') && has(w.out, 'wakes you'), w.out);
+
+    // Nothing out is not something to wait fifteen minutes for. A watchdog left
+    // running past its round is a process looking at logs nobody waits on.
+    const done = JSON.parse(fs.readFileSync(path.join(b.d, '.claude/orch/state.json'), 'utf8'));
+    done.tasks[0].status = 'landed';
+    fs.writeFileSync(path.join(b.d, '.claude/orch/state.json'), JSON.stringify(done));
+    const at = Date.now();
+    const none = b.run(['vitals', '--wait']);
+    ok('with nothing out it returns at once instead of sleeping', Date.now() - at < 60000, Date.now() - at);
+    ok('saying there is no run to check on', none.code === 0 && has(none.out, 'Nothing is out'), none.out);
+
+    const bad = b.run(['vitals', '--every', 'nonsense']);
+    ok('an interval that is not a number is refused', bad.code === 2 && has(bad.out, 'number of minutes'), bad.out);
+  }
+});
+
 // ---------------------------------------------------------------------- report
 // Run the slice this process was given. A case that throws is one failure, not
 // the end of the sweep - the rest still run, and the count below still notices
@@ -4899,7 +5031,7 @@ else console.log('\nsandboxes kept: ' + boxes.join('\n                '));
 // the suite still ends on "all green", because green is only ever measured
 // against however many checks happened to run. Under a shard the total is the
 // runner's to check, since no one process sees them all.
-const EXPECTED = 931;   // every check above counts; raise it deliberately when you add one
+const EXPECTED = 953;   // every check above counts; raise it deliberately when you add one
 const total = pass + failures.length;
 const partial = Boolean(SHARD || ONLY);
 

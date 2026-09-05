@@ -678,6 +678,50 @@ none of them complains when it breaks:
 If two steps genuinely are the same edit, that is one step — say so in the
 register, not in the prompt.
 
+### While the round is out, look in every 15 minutes
+
+Once the round is launched you stop, and the only thing that can wake you is a
+process exit. A wedged run never exits. Neither does one whose agent decided
+forty minutes ago that the suite was already red before it started and has been
+saying so ever since. So one more backgrounded call goes out beside the round:
+
+```bash
+node $ORCH vitals --wait
+```
+
+It sleeps fifteen minutes, looks at every open run's log, prints what it found
+and exits — **and that exit is what wakes you**, the same mechanism a finished
+run uses. Launch it in the same message as the round, as one more backgrounded
+`Bash` call. Each time it comes back, act on it and, if anything is still open,
+launch another. `vitals` on its own looks now instead of waiting.
+
+Two things, both read out of the log:
+
+- **The log should be growing.** A growing log is what alive looks like. One
+  that has not gained a byte in fifteen minutes is a run that has died, wedged,
+  or is waiting on something nobody is going to give it.
+- **The agent's own messages may say it is stuck** — a failure it has decided is
+  pre-existing or unrelated to its change, or a bug it says it cannot fix. Only
+  what the agent *said* is scanned, never tool output, so a suite printing
+  "failed" fifty times is not an alarm and one sentence about it is.
+
+```
+  S-1       alive     +412 KB since the last look, last write 40s ago
+  S-2       ALARM     silent for 22m — nothing written to .claude/orch/logs/S-2.jsonl since
+  S-3       ALARM     ci: "npm test is red but it fails on main too, unrelated to my change"
+  S-4       finished  passed — `run record S-4`
+```
+
+**An alarm stops you, and the human decides.** Do not send it back and do not
+restart it. Both of these are outside what the agent that hit them can settle: a
+run that has gone silent has no one to ask, and a suite that was red before the
+step started is not that step's to fix. Put it to the user with
+`AskUserQuestion` — which step, what it said, and what you would do.
+
+A line that has already been raised is not raised again: each look reads only
+what was appended since the last one. `--every <minutes>` changes the interval,
+and it is the silence threshold too.
+
 ### When a run finishes
 
 Its process exit wakes you.
@@ -908,7 +952,10 @@ for exactly the kind of round that gets wider.
   proof and a step cannot claim a suite covered work that never went through one.
 - **A run's liveness is its log, not `ps`.** The process does not show up under
   `agent`. A growing log is what alive looks like; the elapsed stamp on each
-  streamed line says the same thing without asking.
+  streamed line says the same thing without asking. `vitals` is that question
+  asked of the whole round at once — but only when something is armed to ask it.
+  A round with no `vitals --wait` out is a round nobody is looking at, and the
+  failures it catches are exactly the ones that never wake you by themselves.
 - **`PATH` inside an agent is rebuilt from the login profile.** What the launcher
   exports does not order it, so bare `node` is whatever that profile defaults to.
   If the project pins a runtime, pass `--node-bin <dir>` and the launcher puts

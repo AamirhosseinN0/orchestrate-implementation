@@ -88,6 +88,43 @@ Up to twelve agents in flight is verified clean; the ceiling is memory, not the
 API. Heavy checks inside those agents go through `slot`, so twelve suites queue
 instead of colliding.
 
+## The rule: every question goes to the user in plain words
+
+Four moments here stop and ask — which runner builds the round, what a refining
+agent could not settle from the code, an alarm only a human can call, and a step
+that ended its run with a question. All four go through `AskUserQuestion`, and
+all four are written the same way.
+
+**The user is deciding, not reviewing code.** A question they have to decode is
+a question they answer badly, and a badly answered question gets built.
+
+- **One decision per question.** If it needs "and", it is two questions.
+- **Under 28 words, ending in a question mark.**
+- **No step keys, no paths, no command names, no backticks.** `S-4` and
+  `orchestrate.mjs` are how you found the decision, not what the decision is.
+  Say "the step that builds the sign-up form", not `S-4`.
+- **Name a thing by what it does, not what it is called.** Not "two steps
+  contend on the migration head" — "two pieces of work both want to change the
+  shape of the stored data, and only one can go first".
+- **Code only when the answer is the code**: a line the user has to run
+  themselves, or a message an agent printed that they need to read exactly as it
+  was written. Never a snippet as background.
+
+Every option carries three things:
+
+```
+label     under 6 words, plain
+✓ gain    what you get. Concrete, not "better".
+✕ cost    what it costs. Never "slightly slower" — say what breaks, who
+          notices, and when.
+```
+
+**Exactly one option is marked `(Recommended)`, and it is listed first.** The
+recommendation follows from what is already on the board — say which, when that
+is not obvious. **A cost of "none" means the option is not real**: cut it, or
+find the true cost. In `AskUserQuestion` the gain and the cost are the option's
+`description`, as `✓ <gain> ✕ <cost>`.
+
 ## 0. Ask which runner, before anything else
 
 Steps run on one of two CLIs, and the choice is made once for the whole round —
@@ -95,13 +132,22 @@ after that it is automated, so there is no later moment to ask.
 
 **Put this to the user before `load`:**
 
-> **Which should build this — Cursor, or DeepSeek?**
+> **Which should build this round — Cursor, or DeepSeek?**
 >
-> · **Cursor** — five models, weakest to strongest. What actually answered is
->   read out of each run and checked, so a silent downgrade is caught.
-> · **DeepSeek** — one model, and the tier sets how hard it thinks. Cheaper and
->   faster. Nothing records which model answered, so a silent downgrade would
->   not be caught.
+> · **Cursor (Recommended)**
+>   ✓ Five models, weakest to strongest, so an easy step is not paid for at a
+>     hard step's price — and every run is checked against the model that
+>     actually answered it.
+>   ✕ Each step costs more and takes longer, and on a wide round that is the
+>     whole round's bill.
+> · **DeepSeek**
+>   ✓ Cheaper and faster, and one dial sets how hard it thinks.
+>   ✕ Nothing records which model answered, so a quiet drop to a weaker one
+>     builds the entire round before anybody could notice.
+
+Recommend Cursor unless the user has already said that cost or speed is the
+constraint. The ladder is the reason: it is what lets an easy step be cheap
+without leaving a hard one underpowered.
 
 Then set it:
 
@@ -499,7 +545,11 @@ Keys come from the plan's own name: `S-013-capabilities.md` gives `S-013.1`,
 and the keys cannot collide.
 
 `refine done` prints any question the agent could not settle from the code. **Put
-those to the user before building.** `refine check` exits 1 while one is open.
+those to the user before building** — in [the shape every question
+takes](#the-rule-every-question-goes-to-the-user-in-plain-words). The agent
+wrote them in the code's words, naming symbols and files; the user is choosing
+between real things and should never have to read either. `refine check` exits 1
+while one is open.
 
 ## 5. Check — what can open together
 
@@ -716,7 +766,9 @@ Two things, both read out of the log:
 restart it. Both of these are outside what the agent that hit them can settle: a
 run that has gone silent has no one to ask, and a suite that was red before the
 step started is not that step's to fix. Put it to the user with
-`AskUserQuestion` — which step, what it said, and what you would do.
+`AskUserQuestion` — name the step by what it builds, quote what it said exactly
+as it said it, and give what you would do as the recommended option with its
+cost beside it.
 
 A line that has already been raised is not raised again: each look reads only
 what was appended since the last one. `--every <minutes>` changes the interval,

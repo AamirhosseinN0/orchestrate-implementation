@@ -3750,7 +3750,8 @@ sect(() => {
     fs.mkdirSync(path.join(d, 'docs'), { recursive: true });
     fs.mkdirSync(path.join(d, 'src'), { recursive: true });
     for (const [name, body] of Object.entries(plans)) fs.writeFileSync(path.join(d, 'docs', name), body);
-    for (const f of ['a', 'b', 'c', 'shared']) fs.writeFileSync(path.join(d, 'src', f + '.ts'), 'orig\n');
+    for (const f of ['a', 'b', 'c', 'd', 'shared', 'exam', 'routes', 'it'])
+      fs.writeFileSync(path.join(d, 'src', f + '.ts'), 'orig\n');
     git(['add', '-A']); git(['commit', '-qm', 'init']);
     run(['load', 'docs']);
     if (steps) run(['step', 'add'], JSON.stringify(steps));
@@ -3872,22 +3873,130 @@ sect(() => {
   // Before: plan B comes after plan A, so every step of B was given a need on
   // every step of A. With two steps each that is four edges where one is real,
   // and the three spurious ones hold work that never conflicted.
+  //
+  // And before that was fixed, --only-shared answered it with the wrong test.
+  // It recorded an edge wherever two steps owned a path in common — which is a
+  // GATE, since `frontier` drops any candidate with an unmet need — while
+  // `blocks`/`willMerge` exist precisely to say a shared file is not a gate but
+  // a merge to sequence. So the command recommended for widening a narrow round
+  // hand-serialised the one thing the scheduler was rebuilt to run in parallel,
+  // and it still could not see the edge that actually orders work: B imports
+  // what A exports, from files with nothing in common.
   {
     const plans = { '1-a.md': '# A\n', '2-b.md': '---\nrequires: [1]\n---\n# B\n' };
     const steps = [
-      { key: 'S-1.1', title: 'contracts', plan: 'docs/1-a.md', owns: ['src/shared.ts'], verify: ['true'] },
-      { key: 'S-2.1', title: 'reads it', plan: 'docs/2-b.md', owns: ['src/a.ts', 'src/shared.ts'], verify: ['true'] },
-      { key: 'S-2.2', title: 'unrelated', plan: 'docs/2-b.md', owns: ['src/b.ts'], verify: ['true'] }];
+      { key: 'S-1.1', title: 'contracts', plan: 'docs/1-a.md', owns: ['src/exam.ts', 'src/shared.ts'],
+        provides: ['ExamAttempt'], verify: ['true'] },
+      // Imports what S-1.1 exports, and owns not one path in common with it.
+      // The old file test recorded nothing here at all.
+      { key: 'S-2.1', title: 'reads it', plan: 'docs/2-b.md', owns: ['src/routes.ts'],
+        uses: ['ExamAttempt'], verify: ['true'] },
+      // The mirror image: writes a file S-1.1 also writes, for its own
+      // unrelated reasons, and consumes nothing of it. The old file test made
+      // this one wait.
+      { key: 'S-2.2', title: 'unrelated', plan: 'docs/2-b.md', owns: ['src/shared.ts'], verify: ['true'] }];
     const b = box('widen-link', plans, steps, tier(['S-1.1', 'S-2.1', 'S-2.2']));
     const wide = b.run(['step', 'link', '--dry-run']);
     ok('the cross-product is still the default, and links both steps',
       has(wide.out, 'S-2.1 needs S-1.1') && has(wide.out, 'S-2.2 needs S-1.1'), wide.out);
     const narrow = b.run(['step', 'link', '--only-shared', '--dry-run']);
-    ok('--only-shared keeps the edge where they actually meet',
+    ok('--only-shared keeps the edge across disjoint files, where a symbol crosses',
       has(narrow.out, 'S-2.1 needs S-1.1'), narrow.out);
-    ok('and says which file made it real', has(narrow.out, 'src/shared.ts'), narrow.out);
-    ok('and drops the one that shares nothing',
-      !has(narrow.out, 'S-2.2 needs S-1.1') && has(narrow.out, 'S-2.2 ↮ S-1.1'), narrow.out);
+    ok('and says which symbol made it real', has(narrow.out, 'uses ExamAttempt'), narrow.out);
+    ok('and does NOT gate the pair that only shares a file',
+      !has(narrow.out, 'S-2.2 needs S-1.1'), narrow.out);
+    ok('reporting it as a merge to sequence instead',
+      has(narrow.out, 'write a file in common') && has(narrow.out, 'S-2.2 ↔ S-1.1'), narrow.out);
+    // The whole point of not recording that edge: both can go in one round.
+    b.run(['step', 'link', '--only-shared']);
+    const f = b.run(['check']);
+    ok('so the round opens both of them together',
+      has(f.out, 'S-1.1') && has(f.out, 'S-2.2') && !has(f.out, 'Waiting on work to reach the main line: S-2.2'), f.out);
+  }
+
+  // Case matters, and folding it would invent an edge as readily as catch one:
+  // `ExamAttempt` and `examAttempt` are two different exports in every language
+  // this runs against.
+  {
+    const plans = { '1-a.md': '# A\n', '2-b.md': '---\nrequires: [1]\n---\n# B\n' };
+    const steps = [
+      { key: 'S-1.1', title: 'a', plan: 'docs/1-a.md', owns: ['src/a.ts'], provides: ['ExamAttempt'], verify: ['true'] },
+      { key: 'S-2.1', title: 'b', plan: 'docs/2-b.md', owns: ['src/b.ts'], uses: ['examAttempt'], verify: ['true'] }];
+    const b = box('widen-case', plans, steps, tier(['S-1.1', 'S-2.1']));
+    const out = b.run(['step', 'link', '--only-shared']);
+    ok('a symbol that differs only in case is not a match', out.code === 1, out.out);
+    ok('and the requirement is reported as recorded nowhere rather than linked',
+      has(out.out, 'recorded nowhere'), out.out);
+  }
+
+  // A symbol is what you would type in an import. Both other things it gets
+  // written as look filled in and match nothing, which is the expensive way to
+  // be wrong here: no edge is recorded and the step opens against nothing.
+  {
+    const b = box('widen-symfields', { '1-a.md': '# A\n' }, null, null);
+    const bad = b.run(['step', 'add'], JSON.stringify([
+      { key: 'S-9.1', title: 'x', plan: 'docs/1-a.md', owns: ['src/a.ts'],
+        provides: ['src/exam.ts'], uses: ['the exam attempt type'], verify: ['true'] }]));
+    ok('a provides entry that is a path is refused',
+      has(bad.out, 'name the symbol it exports, not the file it lives in'), bad.out);
+    ok('and a uses entry that is prose is refused',
+      has(bad.out, 'reads as prose, not a symbol you could import'), bad.out);
+  }
+
+  // The dependency nobody named. `--only-shared` cannot see it, so `doctor`
+  // says the step is about to open against an import nothing writes.
+  {
+    const plans = { '1-a.md': '# A\n' };
+    const steps = [
+      { key: 'S-1.1', title: 'a', plan: 'docs/1-a.md', owns: ['src/a.ts'], provides: ['Alpha'], verify: ['true'] },
+      { key: 'S-1.2', title: 'b', plan: 'docs/1-a.md', owns: ['src/b.ts'], uses: ['Alpha', 'Nowhere'], verify: ['true'] }];
+    const b = box('widen-dangle', plans, steps, tier(['S-1.1', 'S-1.2']));
+    const d = b.run(['doctor']);
+    ok('doctor names a symbol no step provides',
+      has(d.out, 'no step in this round provides') && has(d.out, '"Nowhere"'), d.out);
+    ok('and does not name the one that is provided', !has(d.out, '"Alpha"'), d.out);
+  }
+
+  // A step that waits on many and frees nothing. Legitimate for an integration
+  // suite; also exactly what a cross-product link looks like from here.
+  {
+    const plans = { '1-a.md': '# A\n' };
+    const steps = [
+      ...['a', 'b', 'c', 'd'].map((x, i) => ({ key: `S-1.${i + 1}`, title: x, plan: 'docs/1-a.md', owns: [`src/${x}.ts`], verify: ['true'] })),
+      { key: 'S-1.9', title: 'integration suite', plan: 'docs/1-a.md', owns: ['src/it.ts'],
+        needs: ['S-1.1', 'S-1.2', 'S-1.3', 'S-1.4'], verify: ['true'] }];
+    const b = box('widen-barrier', plans, steps, tier(['S-1.1', 'S-1.2', 'S-1.3', 'S-1.4', 'S-1.9']));
+    const d = b.run(['doctor']);
+    ok('doctor names a step that waits on four or more and frees nothing',
+      has(d.out, 'wait on four or more and free nothing') && has(d.out, 'S-1.9'), d.out);
+    ok('and says it opens beside the next round rather than in front of it',
+      has(d.out, 'beside the next round'), d.out);
+  }
+
+  // The cap. It was 2, and a round of 36 plans still came back as 36 single
+  // steps — the cap was never what held it there, the refining prompt's bias
+  // towards one step was. Three is what the cap is for: a plan with three
+  // disjoint file sets runs on three agents, and the third used to be refused
+  // for no reason but the number. It does not go higher, and the refusal is
+  // what keeps it from going higher by accident.
+  {
+    const b = box('widen-cap', { '1-a.md': '# A\n' }, null, null);
+    const report = (n) => JSON.stringify({
+      summary: 'x', builtOn: [], openQuestions: [],
+      steps: Array.from({ length: n }, (_, i) => ({
+        key: `S-1.${i + 1}`, title: 't' + i, owns: [`src/${'abcd'[i]}.ts`], verify: ['true'] })) });
+    const put = (n) => {
+      const f = path.join(b.d, '.claude/orch/refine/docs-1-a-md.json');
+      fs.mkdirSync(path.dirname(f), { recursive: true });
+      fs.writeFileSync(f, report(n));
+    };
+    put(4);
+    const four = b.run(['refine', 'done', 'docs/1-a.md']);
+    ok('a plan split four ways is refused', four.code !== 0 && has(four.out, 'is the most a plan may become'), four.out);
+    put(3);
+    const three = b.run(['refine', 'done', 'docs/1-a.md']);
+    ok('and three is accepted, which two never was',
+      three.code === 0 && has(three.out, 'S-1.1') && has(three.out, 'S-1.3'), three.out);
   }
 
   // A requirement that comes out with no edges at all is the one thing
@@ -4790,7 +4899,7 @@ else console.log('\nsandboxes kept: ' + boxes.join('\n                '));
 // the suite still ends on "all green", because green is only ever measured
 // against however many checks happened to run. Under a shard the total is the
 // runner's to check, since no one process sees them all.
-const EXPECTED = 919;   // every check above counts; raise it deliberately when you add one
+const EXPECTED = 931;   // every check above counts; raise it deliberately when you add one
 const total = pass + failures.length;
 const partial = Boolean(SHARD || ONLY);
 

@@ -125,6 +125,31 @@ function sharedPoints(t1, t2) {
   }
   return out;
 }
+// A symbol one step exports and another consumes. This is the only footprint a
+// real build-order dependency leaves in the record: B imports `ExamAttempt`
+// from a module A creates, and the two touch no file in common and name no
+// point in common, so nothing else here can see the edge at all.
+//
+// `provides` is what a step's work makes reachable from outside it — an
+// exported type or function, a table, a config key, the handler behind a route.
+// `uses` is what it consumes that it does not itself create. Both are named by
+// whoever writes the step, because the step is the only thing that knows them;
+// a symbol read out of prose is a guess, and a guess in the one field that
+// decides build order is worse than no field.
+//
+// An identifier, always — the thing you would type in an import. A route is
+// named by its handler or its route constant, not by its URL: a URL is
+// indistinguishable from a path here, and `stepProblems` refuses paths because
+// a path in this field looks filled in and matches nothing.
+//
+// Compared case-sensitively after trimming: `ExamAttempt` and `examAttempt` are
+// two different exports in every language this runs against, and folding them
+// together would invent an edge as readily as it caught one.
+const normSym = (s) => String(s).trim();
+function sharedSymbols(provider, consumer) {
+  const mine = new Set((provider.provides || []).map(normSym).filter(Boolean));
+  return [...new Set((consumer.uses || []).map(normSym))].filter((u) => u && mine.has(u));
+}
 // Two things used to be one. They are not the same, and treating them alike
 // serialised work that never needed it.
 //
@@ -260,7 +285,7 @@ function frontier(s) {
 // gate runs whoever writes it. `refine done` used to skip this and merge an
 // agent's steps in raw, which put a hole in the one invariant that matters on
 // the path that creates almost every step.
-const LIST_FIELDS = ['needs', 'owns', 'serialises', 'verify', 'context'];
+const LIST_FIELDS = ['needs', 'owns', 'serialises', 'verify', 'context', 'provides', 'uses'];
 // Fields the tool keeps about a step, which whoever writes the step does not
 // get to set. `refine done` reads a file an agent wrote: a report carrying
 // `"status": "cancelled"` would merge straight into the record and leave a step
@@ -340,6 +365,19 @@ function stepProblems(s, it, existing) {
     if (/\s[—–]\s|\s--\s/.test(o)) p.push(`owns entry "${o}" is prose, not a path`);
     else if (/:\d+/.test(o)) p.push(`owns entry "${o}" carries a :line suffix — ownership is whole files`);
     else if (!/[/.]/.test(o) && o.split(/\s+/).length > 1) p.push(`owns entry "${o}" reads as a sentence, not a path`);
+  }
+  // `provides` and `uses` name symbols, and a symbol is the thing you would
+  // type in an import — not the file it lives in and not a sentence about it.
+  // Both mistakes make the field look filled while matching nothing, which is
+  // the failure that costs most here: a `uses` that can never intersect any
+  // `provides` records no edge, and the step opens against code that does not
+  // exist yet.
+  for (const f of ['provides', 'uses']) for (const x of it[f] || []) {
+    if (typeof x !== 'string' || !x.trim()) { p.push(`${f} has an empty entry`); continue; }
+    const v = x.trim();
+    if (/[/\\]/.test(v) || /\.(ts|tsx|js|jsx|mjs|cjs|py|go|rs|java|rb|php|sql|json|md)$/i.test(v))
+      p.push(`${f} entry "${v}" is a path — name the symbol it exports, not the file it lives in`);
+    else if (/\s/.test(v)) p.push(`${f} entry "${v}" reads as prose, not a symbol you could import`);
   }
   return p;
 }
@@ -889,18 +927,33 @@ CMDS.step = (argv) => {
     // typically one is real, and the three spurious ones hold work that never
     // conflicted.
     //
-    // `--only-shared` records the edge only where the two steps actually meet:
-    // one owns a path the other owns, or they name the same serialisation
-    // point. That is the ordering the requirements really have.
+    // `--only-shared` records the edge only where the two steps actually meet.
+    // What counts as meeting used to include owning a path in common, and that
+    // was this command working against the engine it feeds. A `needs` edge is a
+    // gate — `frontier` drops any candidate with one unmet, and `run open` dies
+    // on it — while `blocks`/`willMerge` above exist precisely to say a shared
+    // file is NOT a gate but a merge to sequence. So the command recommended
+    // for widening a narrow round was itself serialising, by hand, the one
+    // thing the scheduler had been rebuilt to run in parallel.
     //
-    // What it cannot see is a dependency with no footprint in the record — B
-    // reads at runtime what A writes, and no file or point says so. So a
+    // Two steps meet in a way that decides build order when one CONSUMES A
+    // SYMBOL the other CREATES, or when they move the same serialisation point.
+    // Nothing else is an ordering. A file they both write is reported, and they
+    // still run together.
+    //
+    // The symbol test is also the one that sees a dependency file overlap never
+    // could: B imports what A exports, from files that have nothing in common.
+    // That edge was missing from every graph this built, and a step opening
+    // against code that did not exist yet is what it cost.
+    //
+    // What it still cannot see is a dependency nobody named — B reads at
+    // runtime what A writes, and no symbol, file or point says so. So a
     // requirement that comes out with no edges at all is not quietly dropped:
     // it is named and it fails the command.
     const onlyShared = argv.includes('--only-shared');
     const live = tasks(s).filter((t) => !DEAD_STATUS.includes(t.status));
     const stepsOf = (rec) => live.filter((t) => samePlan(t.plan, rec.path));
-    const added = [], missing = [], unknown = [], skipped = [], vanished = [];
+    const added = [], missing = [], unknown = [], skipped = [], vanished = [], reconcile = [];
     for (const rec of s.plans || []) {
       const mine = stepsOf(rec);
       if (!mine.length) continue;
@@ -916,13 +969,20 @@ CMDS.step = (argv) => {
           if (t.key === d.key) continue;
           if ((t.needs || []).includes(d.key)) { kept++; continue; }
           if (onlyShared) {
-            const files = overlap(t, d), points = sharedPoints(t, d);
-            if (!files.length && !points.length) {
-              skipped.push(`${t.key} ↮ ${d.key} — nothing shared`);
+            // `t` is the dependent and `d` the dependency, so the symbols that
+            // order them are the ones `d` creates and `t` consumes. Asking it
+            // the other way round records the edge backwards.
+            const syms = sharedSymbols(d, t), points = sharedPoints(t, d), files = overlap(t, d);
+            if (!syms.length && !points.length) {
+              // Sharing a file is not nothing, and saying "nothing shared"
+              // about a pair that shares one reads as a mistake in the tool.
+              // It is a merge to sequence, and they still run together.
+              if (files.length) reconcile.push(`${t.key} ↔ ${d.key}  ${files.join('; ')}`);
+              else skipped.push(`${t.key} ↮ ${d.key} — no symbol, no point`);
               continue;
             }
             (t.needs ||= []).push(d.key);
-            added.push(`${t.key} needs ${d.key}  (${files.length ? files.join('; ') : 'point ' + points.join('; ')})`);
+            added.push(`${t.key} needs ${d.key}  (${syms.length ? 'uses ' + syms.join(', ') : 'point ' + points.join('; ')})`);
           } else {
             (t.needs ||= []).push(d.key);
             added.push(`${t.key} needs ${d.key}`);
@@ -932,17 +992,28 @@ CMDS.step = (argv) => {
         // The ordering the plan asked for came out as nothing at all. Under the
         // cross-product this cannot happen; under --only-shared it can, and it
         // is the one outcome that must not pass quietly.
-        if (onlyShared && !kept) vanished.push(`${rec.path} requires ${dep.path}, and no step of either shares a file or a point — ` +
-          `so that ordering would be recorded nowhere. Name the real dependency in the plan's steps, or link without --only-shared.`);
+        if (onlyShared && !kept) vanished.push(`${rec.path} requires ${dep.path}, and no step of one uses a symbol a step of the ` +
+          `other provides, nor do they share a serialisation point — so that ordering would be recorded nowhere.\n` +
+          `    Put what the later steps import into their \`uses\`, and what the earlier ones export into their \`provides\`;\n` +
+          `    a file they both write is not an ordering. Or link without --only-shared.`);
       }
     }
     for (const u of unknown) console.log('✗ ' + u);
     for (const v of vanished) console.log('✗ ' + v);
     for (const m of missing) console.log('· ' + m + ' — refine it, then run this again');
     if (onlyShared && skipped.length) {
-      console.log(`· ${skipped.length} pair(s) left unlinked because they share nothing:`);
+      console.log(`· ${skipped.length} pair(s) left unlinked because nothing orders them:`);
       for (const x of skipped.slice(0, 20)) console.log('    ' + x);
       if (skipped.length > 20) console.log(`    … and ${skipped.length - 20} more`);
+    }
+    // Said plainly rather than left to look like an omission. These pairs write
+    // a file in common and are deliberately NOT given an edge: they run in the
+    // same round, in their own worktrees, and whichever lands second reconciles.
+    if (onlyShared && reconcile.length) {
+      console.log(`· ${reconcile.length} pair(s) write a file in common — they still run together, and`);
+      console.log('  whichever lands second reconciles. A shared file is not an ordering:');
+      for (const x of reconcile.slice(0, 15)) console.log('    ' + x);
+      if (reconcile.length > 15) console.log(`    … and ${reconcile.length - 15} more`);
     }
     // Nothing is recorded when a requirement would vanish. Half a graph is
     // worse than none, because the half that landed is the harder half to see.
@@ -1230,8 +1301,13 @@ CMDS.check = () => {
       console.log('  That is a queue, not a round. Before opening it, look at why:');
       console.log('    `step link` without --only-shared gives every step of a plan a need on every');
       console.log('    step of the plan it comes after — with two steps each that is four edges');
-      console.log('    where one is real. `step link --only-shared --dry-run` shows the difference.');
-      console.log('    `doctor` names any serialisation point gating three or more steps.');
+      console.log('    where one is real. `step link --only-shared --dry-run` shows the difference:');
+      console.log('    it keeps only the edges where one step uses a symbol another provides, or');
+      console.log('    the two move one serialisation point. A file they both write is not an edge.');
+      console.log('    `doctor` names any serialisation point gating three or more steps, and any');
+      console.log('    step that waits on four or more and frees nothing.');
+      console.log('    If the round is a queue because every plan came back as ONE step, that is');
+      console.log('    upstream of all of this: re-refine the plans whose parts write disjoint files.');
     }
   }
   process.exit(bad ? 1 : 0);
@@ -1273,7 +1349,19 @@ CMDS.board = () => {
 
 // ------------------------------------------------------------------- refining
 // A plan may become at most this many steps. See `refine done`.
-const MAX_STEPS_PER_PLAN = 2;
+//
+// It was 2, which is the smallest cap that permits any widening at all, and a
+// round of 36 plans came back as 36 single steps under it — the cap was never
+// the binding constraint there, the refining prompt's bias towards one step
+// was. Three is what the cap is for: a plan with three genuinely disjoint file
+// sets runs on three agents instead of one, and the third was previously
+// refused for no reason but the number.
+//
+// It does not go higher. The failure this guards is a plan carved into parts
+// that all write the same files, which is more agents contending over one piece
+// of work rather than more work in flight, and the taste for doing that grows
+// with the room allowed for it.
+const MAX_STEPS_PER_PLAN = 3;
 const planSlug = (p) => String(p).replace(/[^A-Za-z0-9]+/g, '-').replace(/^-|-$/g, '');
 const refineReport = (p) => sub('refine', planSlug(p) + '.json');
 // Loaded plans other than this one that the working tree has changed. Only
@@ -1341,21 +1429,39 @@ Do two things:
        "key": "${keyPrefix(rec.path)}.1",
        "title": "one line",
        "owns": ["every file this step may write, whole paths only"],
+       "provides": ["symbols this step's work makes reachable from outside it"],
+       "uses": ["symbols it consumes that some other step creates"],
        "serialises": ["shared invariants it moves: a lockfile, a migration head"],
        "needs": ["keys of steps that must land first"],
        "verify": ["the command that proves it worked"]
      }]
    }
 
-   One plan is one step unless it genuinely has to be more than one, and never
-   more than ${MAX_STEPS_PER_PLAN}. Split it only when a part must land before another can
-   start, or when two parts write disjoint files and are worth running at the
-   same time. A plan this size is usually a single step - do not carve it up to
-   look thorough; a report with more steps than that is refused.
+   How many steps. ${rec.lines < 120
+     ? `${rec.path} is ${rec.lines} lines, which is usually one step. Split it only if the
+   test below genuinely passes.`
+     : `${rec.path} is ${rec.lines} lines, which is long enough that it is worth asking
+   properly. Do not default to one step because one is simpler to write.`}
+   ${MAX_STEPS_PER_PLAN} is the most a plan may become, and a report with more is refused.
 
-   Key every step from this plan: ${keyPrefix(rec.path)}.1, ${keyPrefix(rec.path)}.2. Other plans in this
-   round are being refined at the same time, keys are unique across all of them,
-   and a report that reuses one another plan already holds is refused whole.
+   Split it when EITHER holds, once per part:
+
+     · a part must land before another can start; or
+     · parts write files that do not overlap at all, and could therefore run at
+       the same time on separate agents.
+
+   The second is the one that gets skipped, and skipping it is not free: a plan
+   left whole is a plan that runs on one agent, and a round of single-step plans
+   is a queue whatever the scheduler does with it. Where the file sets are
+   disjoint, one step per disjoint set is the answer — that is what the split is
+   for. What you must not do is carve one coherent piece of work into parts that
+   write the same files, to look thorough; that is several agents contending
+   over one piece of work where one agent would already have finished it.
+
+   Key every step from this plan: ${keyPrefix(rec.path)}.1, ${keyPrefix(rec.path)}.2, ${keyPrefix(rec.path)}.3.
+   Other plans in this round are being refined at the same time, and keys are
+   unique across all of them: a report that reuses one another plan already
+   holds is refused whole.
 
    \`needs\` names step keys, never plan ids. A key that is not a step in this
    round is refused.
@@ -1398,6 +1504,29 @@ ${vocabulary().map((v) => '     · ' + v).join('\n')}
    instances of one kind of thing — a migration directory per package, a
    lockfile per workspace — scope the name: "migration head: orders". Those run
    at the same time; two bare names do not.
+
+   \`provides\` and \`uses\` are what decide build order, and they are the only
+   fields that can say it. \`provides\` is what your step makes reachable from
+   outside itself — an exported type or function, a table, a config key, the
+   handler behind a route. \`uses\` is what it consumes that it does not create.
+
+   Both are IDENTIFIERS: the thing you would type in an import. Not prose, and
+   not the file it lives in — "ExamAttempt", never "the exam attempt type" and
+   never "src/exam.ts". Both of those are refused, because both look filled in
+   and match nothing. Name a route by its handler or its route constant, not by
+   its URL, for the same reason. Case matters and both sides have to agree, so
+   copy the identifier rather than retyping it from memory.
+
+   This is what catches the dependency nothing else here can see. Two steps that
+   share no file and no point still have an order when one imports what the
+   other exports — and with these fields empty, that order is recorded nowhere
+   and the later step opens against code that does not exist yet. A shared file
+   does NOT do this job: two steps writing one file run together and reconcile
+   at the merge, deliberately.
+
+   If your step depends on work in a plan this one comes after, put the symbol
+   in \`uses\` even when you cannot see which step of that plan will provide it.
+   The match is made later, across every step in the round.
 
 Report the file written, not a summary in your reply.`);
     return;
@@ -2557,6 +2686,58 @@ CMDS.doctor = () => {
       console.log('    "migration head: orders" against "migration head: billing".');
     }
   }
+  // A symbol a step consumes that no step in the round creates. This is the
+  // failure the symbol fields exist to catch, and it is only visible from here:
+  // the step is well-formed, its paths exist, its needs are real keys, and it
+  // will still open against an import that nothing has written yet.
+  //
+  // Not fatal, because it is also what a symbol the repository ALREADY exports
+  // looks like — a step consuming something that has been there all along names
+  // it here and no step provides it. Only the round can say which, so this
+  // names them and leaves the judgement.
+  {
+    const made = new Map();
+    for (const t of live) for (const x of t.provides || []) {
+      const v = normSym(x); if (!v) continue;
+      (made.get(v) || made.set(v, []).get(v)).push(t.key);
+    }
+    const dangling = [];
+    for (const t of live) for (const x of t.uses || []) {
+      const v = normSym(x); if (!v || made.has(v)) continue;
+      dangling.push({ key: t.key, sym: v });
+    }
+    if (dangling.length) {
+      console.log(`· ${dangling.length} symbol(s) a step uses that no step in this round provides:`);
+      for (const d of dangling.slice(0, 15)) console.log(`    ${d.key.padEnd(10)} uses "${d.sym}"`);
+      if (dangling.length > 15) console.log(`    … and ${dangling.length - 15} more`);
+      console.log('    Fine if the repository already exports it. If a step in this round is meant');
+      console.log('    to write it, that step is missing it from `provides` — and until it is there,');
+      console.log('    `step link --only-shared` records no edge and this step opens against nothing.');
+    }
+    // A step whose `provides` nothing consumes is not worth a line: most steps
+    // are leaves and saying so forty times is noise.
+  }
+  // A step that waits on many and frees nothing. It is legitimate — an
+  // integration suite really does assert across all of its predecessors — but
+  // it is also what a cross-product link looks like from here, and the two are
+  // worth telling apart before a round is committed to.
+  //
+  // Under `frontier` a leaf holds nothing back: nothing needs it, so it opens
+  // beside whatever else can go rather than in front of it. That is only true
+  // if it is actually run that way, which is `run open --all`.
+  {
+    const gates = (k) => live.filter((x) => (x.needs || []).includes(k)).length;
+    const barriers = live.filter((t) => (t.needs || []).length >= 4 && gates(t.key) === 0)
+      .sort((a, b) => (b.needs || []).length - (a.needs || []).length);
+    if (barriers.length) {
+      console.log(`· ${barriers.length} step(s) wait on four or more and free nothing:`);
+      for (const t of barriers) console.log(`    ${t.key.padEnd(10)} needs ${(t.needs || []).length}, gates 0  —  ${String(t.title || '').slice(0, 40)}`);
+      console.log('    Nothing waits on these, so they open beside the next round rather than in');
+      console.log('    front of it — provided the round is opened with `run open --all`. If one is');
+      console.log('    not an integration suite, its needs are probably a cross-product from');
+      console.log('    `step link` without --only-shared, and most of them are not real.');
+    }
+  }
   // Edges `step rm` took out and nothing put back. The tool removed them, so
   // the tool is the one that has to keep saying so until somebody decides.
   {
@@ -2881,6 +3062,9 @@ const HELP = `orchestrate — plan to merged code, on Cursor, opencode or Claude
   step own <key> <path>…    widen what a step may write, without re-refining it
   step rm <key>…            cancel a step; the edges into it are severed, not lost
   step link [--only-shared] turn each plan's requires: into needs between steps
+                            --only-shared keeps only the edges that order the work:
+                            one step uses a symbol another provides, or they share
+                            a serialisation point. A file both write is not an edge
   step reset <plan>         cancel every live step of one plan
   check                     which steps can open together, and what blocks the rest
   run open --all            open every step that can go, in one round. The usual form.

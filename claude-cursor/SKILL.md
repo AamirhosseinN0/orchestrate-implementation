@@ -237,7 +237,7 @@ node $ORCH map
 ```
 
 **The width of a round is decided here, before any agent runs.** A plan becomes
-at most two steps, so ten plans cannot become more than twenty; and `step link`
+at most three steps, so ten plans cannot become more than thirty; and `step link`
 turns a plan-level `requires:` into a dependency between every pair of steps. A
 plan that is one coherent slice of files costs nothing under either rule. A plan
 holding four disjoint file sets pays under both.
@@ -265,8 +265,11 @@ already names the usual ones: route table, schema registry, public exports, env
 schema, generated client.
 
 **Then split what is left into slices whose file sets do not intersect.** One
-slice is one plan. Where a slice still has to be two steps, that is what the cap
-is for and the refining agent will find the split itself.
+slice is one plan. Where a slice still holds two or three disjoint file sets,
+that is what the cap is for, and the refining agent is now asked for one step per
+set rather than left to default to one step for the whole plan. A round of 36
+plans that came back as 36 single steps is a queue whatever the scheduler does
+with it, and the cap was never what held it at one.
 
 **Write the ordering as `requires:`, one line per real dependency.** This is the
 step that keeps the requirement intact: "first this part of the user API, then
@@ -422,6 +425,25 @@ node $ORCH step own S-1 src/capabilities.ts test/access/seed.test.ts
 `guard` prints that line itself, for the strays no other step owns — see
 [When a run finishes](#when-a-run-finishes).
 
+**`provides` and `uses` are what decide build order**, and they are the only
+fields that can say it. `provides` is what a step makes reachable from outside
+itself — an exported type or function, a table, a config key, the handler behind
+a route. `uses` is what it consumes that it does not create. Both are
+**identifiers**: the thing you would type in an import. `ExamAttempt`, not "the
+exam attempt type" and not `src/exam.ts`. A path or a sentence in either field is
+refused, because both look filled in and match nothing, and a `uses` that can
+never match records no edge at all. Name a route by its handler or its route
+constant rather than its URL — a URL is indistinguishable from a path here.
+
+They are compared case-sensitively. `ExamAttempt` and `examAttempt` are two
+different exports in every language this runs against, and folding them together
+would invent an edge as readily as catch one.
+
+`doctor` names any symbol a step uses that no step in the round provides. That
+is fine when the repository already exports it, and is the step about to open
+against nothing when it is not — only the round can say which, so it names them
+and leaves the judgement.
+
 A plan that names `requires:` in its front matter has that read at `load` — from
 `---` lines or from a ```yaml fence, both are read — and put in front of the
 refining agent along with whatever keys are already recorded for those plans.
@@ -446,16 +468,31 @@ one is real, and the three spurious ones hold work that never conflicted.
 node $ORCH step link --only-shared --dry-run
 ```
 
-records the edge only where the two steps actually meet — one owns a path the
-other owns, or they name the same serialisation point — and says which file made
-each edge real. Thin plans make the difference moot, which is the better fix;
-this is for the round you have rather than the round you wish you had authored.
+records the edge only where the two steps actually meet, and says what made each
+edge real. Two steps meet in a way that decides build order when **one consumes
+a symbol the other creates** — `provides` against `uses` — or when they **move
+the same serialisation point**. Thin plans make the difference moot, which is
+the better fix; this is for the round you have rather than the round you wish
+you had authored.
 
-**What it cannot see is a dependency with no footprint in the record**: B reads
-at runtime what A writes, and no file or point says so. So a requirement that
-comes out with no edges at all is not quietly dropped — it is named, and it
-fails the command, and nothing is written. Half a graph is worse than none,
-because the half that landed is the harder half to see.
+**A file both steps write is not an ordering, and does not become an edge.** It
+used to. That was this command working against the scheduler it feeds: a `needs`
+edge is a gate — `frontier` drops any candidate with one unmet — while `blocks`
+and `willMerge` exist precisely to say a shared file is a merge to sequence and
+not a gate. So the command recommended for widening a narrow round was
+hand-serialising the one thing the engine had been rebuilt to run in parallel.
+Those pairs are now listed as pairs that will reconcile, and they run together.
+
+**The symbol test also sees the edge nothing else here can.** B imports
+`ExamAttempt` from a module A creates; the two share no file and name no point,
+so under the old file test that edge was recorded nowhere and B opened against
+code that did not exist yet. That is the failure this exists to stop.
+
+**What it still cannot see is a dependency nobody named**: B reads at runtime
+what A writes, and no symbol, file or point says so. So a requirement that comes
+out with no edges at all is not quietly dropped — it is named, and it fails the
+command, and nothing is written. Half a graph is worse than none, because the
+half that landed is the harder half to see.
 
 Keys come from the plan's own name: `S-013-capabilities.md` gives `S-013.1`,
 `2.1-flashcards.md` gives `S-2.1.1`. Name plans so that first token is distinct
@@ -571,7 +608,7 @@ The shape of it: 18 live step(s) in 9 wave(s) — 3 → 2 → 2 → 2 → 2 → 
 ```
 
 A profile like that is a queue with a plan attached, and it is nearly always one
-of two things, both fixable in seconds and neither visible from the frontier
+of three things, all fixable in seconds and none visible from the frontier
 alone:
 
 - **`step link` without `--only-shared`.** The default is the cross-product:
@@ -579,7 +616,14 @@ alone:
   step of A. With two steps each that is four edges where typically one is real,
   and the three spurious ones hold work that never conflicted.
   `step link --only-shared --dry-run` shows the same round with only the edges
-  where two steps actually meet.
+  that order the work — one step uses a symbol another provides, or the two move
+  one serialisation point. A file both write is not an edge.
+- **Every plan came back as one step.** This one is upstream of the scheduler
+  and no linking flag reaches it: 36 single-step plans is 36 waves however clean
+  the graph is. `check` says how many live steps are in how many waves; if the
+  step count is about the plan count, the refining is what to fix, by
+  re-refining the plans whose parts write disjoint files. A plan may become
+  three steps.
 - **`serialises` used too readily.** A point is a gate: every step naming it runs
   alone against every other step naming it. Four points shared across a plan's
   steps is a plan that runs one step at a time whatever else is true.

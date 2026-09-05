@@ -29,10 +29,28 @@
     { "rank": 4, "tier": "high",     "id": "cursor-grok-4.6-high",   "accepts": ["Cursor Grok 4.6 High", "Cursor Grok 4.6"] },
     { "rank": 5, "tier": "xhigh",    "id": "cursor-grok-4.6-xhigh",  "accepts": ["Cursor Grok 4.6 Extra High"] }
   ],
+  "_roles": [
+    "A role is a default tier for work that `assess` never sees. It is a",
+    "starting point, not a judgement: a step the orchestrator has assessed",
+    "carries its own tier and never reads these.",
+    "",
+    "`chip` sits at `medium` because medium is where ordinary work belongs —",
+    "a step against a clear plan, in a couple of files. It used to sit at",
+    "`high`, which made the strongest-but-one model the thing every unassessed",
+    "step got by default, and reaching was the norm rather than the exception.",
+    "Above medium is a claim about the step: `high` for work that is genuinely",
+    "hard, `xhigh` for the top of the ladder only. Below it is fine too —",
+    "`low` covers verification and light tasks perfectly well.",
+    "",
+    "`refine` stays at `high` because it is one of the hard ones. It reads a",
+    "plan and decides the shape of the whole round — how many steps, what each",
+    "one owns, what waits on what — and a wrong answer there is not one step",
+    "re-run, it is the round built on the wrong skeleton."
+  ],
   "roles": {
     "refine": "high",
     "preflight": "composer",
-    "chip": "high"
+    "chip": "medium"
   },
 
   "_runners": [
@@ -42,9 +60,15 @@
     "",
     "opencode runs one model — DeepSeek V4 Flash — so a tier does not choose a",
     "model, it chooses how hard the model thinks. `efforts` maps the five tiers",
-    "onto the three the model accepts, which means composer and low are one",
-    "effort and so are medium and high. That collapse is real and is printed",
+    "onto the three the model accepts (low, high, max), which means composer,",
+    "low and medium are all one effort. That collapse is real and is printed",
     "rather than implied.",
+    "",
+    "Where the collapse falls is a choice, and it follows the ladder's centre",
+    "of gravity. `medium` is the default tier, so it maps to `low` — the",
+    "model's ordinary effort — and not to `high`. Mapping it to `high` meant",
+    "every default step on this runner reached, which is the thing `high` is",
+    "supposed to be the exception for. `high` reaches; `xhigh` is the top.",
     "",
     "`verifiable: false` is the important field. Cursor's log names the model",
     "that answered, so a silent downgrade is caught; opencode's names nothing,",
@@ -69,7 +93,7 @@
       "efforts": {
         "composer": "low",
         "low": "low",
-        "medium": "high",
+        "medium": "low",
         "high": "high",
         "xhigh": "max"
       }

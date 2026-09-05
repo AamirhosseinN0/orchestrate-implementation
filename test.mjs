@@ -2599,7 +2599,7 @@ sect(() => {
   const r = (n) => run(['resolve', n]).out.trim().split('\t');
   ok('refining defaults to grok 4.6 high', r('refine')[0] === 'cursor-grok-4.6-high', r('refine'));
   ok('pre-flight defaults to composer', r('preflight')[0] === 'composer-2.5', r('preflight'));
-  ok('chips default to grok 4.6 high', r('chip')[0] === 'cursor-grok-4.6-high', r('chip'));
+  ok('chips default to grok 4.6 medium', r('chip')[0] === 'cursor-grok-4.6-medium', r('chip'));
   ok('a tier resolves as well as a role', r('xhigh')[0] === 'cursor-grok-4.6-xhigh', r('xhigh'));
   ok('rank 4 resolves to its canonical name', r('high')[1] === 'Cursor Grok 4.6 High', r('high'));
   ok('and the table shows every spelling it answers to',
@@ -2706,7 +2706,7 @@ sect(() => {
     '#!/usr/bin/env bash',
     ': "${STUB_REC:=/dev/null}"',
     'printf "%s\\n" "$@" >> "$STUB_REC"',
-    'M=${STUB_SHOWN:-Cursor Grok 4.6}',
+    'M=${STUB_SHOWN:-Cursor Grok 4.6 Medium}',
     'I="{\\"type\\":\\"system\\",\\"subtype\\":\\"init\\",\\"model\\":\\"$M\\",\\"cwd\\":\\"$PWD\\"}"',
     'N=0; [ -f "$STUB_REC.n" ] && N=$(cat "$STUB_REC.n"); N=$((N+1)); echo $N > "$STUB_REC.n"',
     'case "${STUB_MODE:-normal}" in',
@@ -2753,7 +2753,7 @@ sect(() => {
   // --- the model comes from the ladder, and a tier beats the role default ---
   fresh(); const chip = run(base('--role', 'chip'));
   ok('a chip runs', chip.code === 0, chip.out);
-  ok('on the role default', has(sent(), 'cursor-grok-4.6-high'), sent());
+  ok('on the role default', has(sent(), 'cursor-grok-4.6-medium'), sent());
   fresh(); const pre = run(base('--role', 'preflight'), { STUB_SHOWN: 'Composer 2.5' });
   ok('pre-flight runs on composer', pre.code === 0 && has(sent(), 'composer-2.5'), pre.out + sent());
   fresh(); const tiered = run(base('--role', 'chip', '--tier', 'xhigh'), { STUB_SHOWN: 'Cursor Grok 4.6 Extra High' });
@@ -4129,12 +4129,12 @@ echo '{"type":"step_finish","timestamp":3000,"sessionID":"ses_STUB","part":{"typ
     const xh = mrun(['resolve', '--runner', 'opencode', 'xhigh']);
     ok('and the flag value is not mistaken for the tier', xh.out.trim().endsWith('max'), xh.out);
     ok('a role resolves the same as the tier it names',
-      mrun(['resolve', '--runner', 'opencode', 'chip']).out.trim().endsWith('high'), mrun(['resolve', '--runner', 'opencode', 'chip']).out);
+      mrun(['resolve', '--runner', 'opencode', 'chip']).out.trim().endsWith('low'), mrun(['resolve', '--runner', 'opencode', 'chip']).out);
     const eff = mrun(['efforts', '--runner', 'opencode']);
     ok('efforts says what the model accepts', has(eff.out, 'low, high, max'), eff.out);
     ok('and that a run cannot be verified afterwards', has(eff.out, 'the log does not name the model'), eff.out);
     ok('and says which tiers collapse into one effort',
-      has(eff.out, 'composer and low are the same effort'), eff.out);
+      has(eff.out, 'composer, low and medium are the same effort'), eff.out);
   }
 
   // --- an effort the model does not accept is refused before it is billed --
@@ -4191,7 +4191,7 @@ echo '{"type":"step_finish","timestamp":3000,"sessionID":"ses_STUB","part":{"typ
     b.run(['runner', 'use', 'opencode']);
     const open = b.run(['run', 'open', 'S-1']);
     ok('a step opens on the one model at its tier\'s effort',
-      has(open.out, 'DeepSeek V4 Flash · high'), open.out);
+      has(open.out, 'DeepSeek V4 Flash · low'), open.out);
     ok('and says the record will be unverified', has(open.out, 'marked unverified'), open.out);
     // Cursor mints a chat first because it needs an address before it has a
     // conversation. opencode's address does not exist until the run does.
@@ -4215,7 +4215,7 @@ echo '{"type":"step_finish","timestamp":3000,"sessionID":"ses_STUB","part":{"typ
     } catch (e) { code = e.status; out = String(e.stdout || '') + String(e.stderr || ''); }
     ok('run.sh hands an opencode run to its own launcher', code === 0, out);
     ok('which reports the model asked for and the effort',
-      has(out, 'DeepSeek V4 Flash') && has(out, 'effort: high'), out);
+      has(out, 'DeepSeek V4 Flash') && has(out, 'effort: low'), out);
     ok('and says plainly that this is not a verified fact',
       has(out, 'asked for rather than what was verified'), out);
     ok('the session is reported, since nothing else knows it', has(out, 'ses_STUB'), out);
@@ -4235,7 +4235,7 @@ echo '{"type":"step_finish","timestamp":3000,"sessionID":"ses_STUB","part":{"typ
       filed.outcome === 'passed' && Array.isArray(filed.files) && Array.isArray(filed.commands), JSON.stringify(filed).slice(0, 200));
     ok('and says the model was not verified', filed.modelVerified === false, String(filed.modelVerified));
     ok('and records what was asked for, not what answered',
-      filed.model === 'opencode-go/deepseek-v4-flash' && filed.effort === 'high', JSON.stringify([filed.model, filed.effort]));
+      filed.model === 'opencode-go/deepseek-v4-flash' && filed.effort === 'low', JSON.stringify([filed.model, filed.effort]));
     ok('the session is on the record, so a send-back can resume it',
       filed.session === 'ses_STUB', String(filed.session));
     // Paths in an opencode log are absolute and belong to the worktree.
@@ -4255,7 +4255,7 @@ echo '{"type":"step_finish","timestamp":3000,"sessionID":"ses_STUB","part":{"typ
     const sb = b.run(['sendback', 'S-1', '--why', 'try again']);
     ok('sendback resumes the opencode session', has(sb.out, '-s ses_STUB'), sb.out);
     ok('and not with a flag opencode would ignore', !has(sb.out, '--session'), sb.out);
-    ok('with the model and effort it ran on', has(sb.out, '--variant high'), sb.out);
+    ok('with the model and effort it ran on', has(sb.out, '--variant low'), sb.out);
     ok('and not with cursor\'s resume flag', !has(sb.out, '--resume'), sb.out);
   }
 

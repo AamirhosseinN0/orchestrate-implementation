@@ -98,6 +98,12 @@ function effortsOf(r) {
   return { values: opt.values, why: null };
 }
 
+// "a", "a and b", "a, b and c" — for saying which tiers collapsed onto one
+// effort, which is two of them or three depending on where the ladder's
+// default sits.
+const andList = (xs) => xs.length < 2 ? String(xs[0] ?? '')
+  : xs.slice(0, -1).join(', ') + ' and ' + xs[xs.length - 1];
+
 // Every spelling a row answers to. `shown` is the old single-string form and is
 // still read, so a table written before this change still works.
 export const namesOf = (row) => (row.accepts && row.accepts.length ? row.accepts : [row.shown]).filter(Boolean);
@@ -265,12 +271,14 @@ switch (cmd) {
       console.log('  ' + t.padEnd(10) + e + (bad ? '   ✗ not accepted by this model' : ''));
     }
     // The collapse is real, so it is said rather than left to be noticed.
+    // It is not always two tiers — five onto three leaves a three-way one —
+    // so the list is joined properly rather than with `and` between every pair.
     const byEffort = {};
     for (const [t, e] of Object.entries(r.efforts || {})) (byEffort[e] ||= []).push(t);
     const shared = Object.entries(byEffort).filter(([, ts]) => ts.length > 1);
     if (shared.length) {
       console.log('');
-      for (const [e, ts] of shared) console.log(`  ${ts.join(' and ')} are the same effort here (${e}).`);
+      for (const [e, ts] of shared) console.log(`  ${andList(ts)} are the same effort here (${e}).`);
     }
     break;
   }

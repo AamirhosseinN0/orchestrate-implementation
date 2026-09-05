@@ -139,14 +139,21 @@ does not choose a model, it chooses the effort:
 | tier | effort | for |
 |---|---|---|
 | `composer` | `low` | mechanical work, no judgement |
-| `low` | `low` | small, well-specified |
-| `medium` | `high` | ordinary feature work |
-| `high` | `high` | the default |
-| `xhigh` | `max` | security, concurrency, wide blast radius |
+| `low` | `low` | verification, and light or well-specified work |
+| `medium` | `low` | the default — ordinary feature work |
+| `high` | `high` | genuinely hard work |
+| `xhigh` | `max` | the top of the ladder only |
 
-`composer` and `low` are the same effort, and so are `medium` and `high`. That
-collapse is real — moving a step between them changes nothing — and `assess`
-prints it rather than leaving it to be discovered.
+`composer`, `low` and `medium` are all the same effort. That collapse is real —
+moving a step between them changes nothing — and `assess` prints it rather than
+leaving it to be discovered.
+
+Where the collapse falls follows the ladder's centre of gravity rather than its
+midpoint. Three efforts cannot hold five tiers evenly, so the default maps to
+the model's ordinary effort and the two rungs above it are the ones that buy
+something: `high` reaches, `xhigh` is the top. `medium` used to map to `high`,
+which meant every default step on this runner reached — which is the thing
+`high` exists to be the exception for.
 
 Two things are worth knowing before choosing this runner:
 
@@ -286,19 +293,31 @@ The ladder, weakest to strongest:
 | tier | model | for |
 |---|---|---|
 | `composer` | Composer 2.5 | mechanical work, no judgement — a lockfile bump, a rename |
-| `low` | Cursor Grok 4.6 Low | small, well-specified, one or two files |
-| `medium` | Cursor Grok 4.6 Medium | ordinary feature work against a clear plan |
-| `high` | Cursor Grok 4.6 High | the default — refining, and most steps |
-| `xhigh` | Cursor Grok 4.6 Extra High | security, concurrency, wide blast radius, anything subtle |
+| `low` | Cursor Grok 4.6 Low | verification, and light work — a check, a small well-specified change in one or two files |
+| `medium` | Cursor Grok 4.6 Medium | **the default** — ordinary feature work against a clear plan |
+| `high` | Cursor Grok 4.6 High | genuinely hard: subtle logic, a design call the plan left open, refining |
+| `xhigh` | Cursor Grok 4.6 Extra High | **the top of the ladder, and it should look like it** — security, concurrency, wide blast radius |
+
+**`medium` is where a step starts, and anything above it is a claim you have to
+make.** The tier is not a wish for a good result — every rung produces one — it
+is an estimate of how much thinking the work actually needs. A round where most
+rows read `high` is not a careful round, it is an unassessed one: `high` stops
+meaning "this one is hard" the moment it is what everything gets, and `xhigh`
+stops meaning anything at all. Going *down* needs no defence. Verification, a
+check, a change the plan already spelled out — `low` does those, and choosing it
+is not a risk taken, it is the tier being read correctly.
 
 Read the plans, then propose one row per step — the problem in a few words, the
-tier, and why:
+tier, and why. Note where these land: most rows are `medium`, `low` is used
+freely, and the one `xhigh` earns its place in a sentence:
 
 ```bash
 node $ORCH assess propose <<'J'
-[{"key":"S-1","problem":"contracts package + type provider","tier":"medium","why":"mechanical, schema-shaped"},
+[{"key":"S-1","problem":"contracts package + type provider","tier":"low","why":"mechanical, schema-shaped, the plan names every type"},
  {"key":"S-2","problem":"auth middleware, session + CSRF","tier":"xhigh","why":"security-sensitive, wide blast radius"},
- {"key":"S-3","problem":"bump lockfile, regenerate docs","tier":"composer","why":"no judgement needed"}]
+ {"key":"S-3","problem":"bump lockfile, regenerate docs","tier":"composer","why":"no judgement needed"},
+ {"key":"S-4","problem":"invite flow: form, endpoint, email","tier":"medium","why":"ordinary feature work against a clear plan"},
+ {"key":"S-5","problem":"reconcile the two clock sources on replay","tier":"high","why":"ordering is subtle and the plan leaves the tie-break open"}]
 J
 node $ORCH assess
 ```
@@ -336,6 +355,12 @@ unblocks one step and gates six.
 It comes out roughly cost-neutral and puts the strongest model where a mistake
 is most expensive. It only ever suggests: nothing is written without `--apply`,
 and a row the user set is left alone.
+
+This is another reason the default sits at `medium`: a notch is only worth
+something if there is room on both sides of it. From `medium`, a hub goes to
+`high` and a leaf to `low`, and both moves say something. From `high` — where
+the default used to sit — every hub landed on `xhigh` on position alone, which
+spent the top of the ladder on where a step sat rather than on what it was.
 
 ## 4. Refine — one agent per plan, all at once
 

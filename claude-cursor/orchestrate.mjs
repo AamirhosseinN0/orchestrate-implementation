@@ -1168,7 +1168,11 @@ CMDS.assess = (argv) => {
       for (const [t, e] of Object.entries(r.efforts || {})) (byEffort[e] ||= []).push(t);
       console.log('  ' + Object.entries(byEffort).map(([e, ts]) => `${ts.join('/')} → ${e}`).join('   '));
       const shared = Object.entries(byEffort).filter(([, ts]) => ts.length > 1);
-      for (const [e, ts] of shared) console.log(`  ${ts.join(' and ')} are the same effort (${e}), so moving between them changes nothing.`);
+      // Not always two tiers — five onto three leaves a three-way collapse —
+      // so the list is joined properly rather than `and` between every pair.
+      const andList = (xs) => xs.length < 2 ? String(xs[0] ?? '')
+        : xs.slice(0, -1).join(', ') + ' and ' + xs[xs.length - 1];
+      for (const [e, ts] of shared) console.log(`  ${andList(ts)} are the same effort (${e}), so moving between them changes nothing.`);
     }
   }
 };

@@ -3999,6 +3999,139 @@ sect(() => {
       three.code === 0 && has(three.out, 'S-1.1') && has(three.out, 'S-1.3'), three.out);
   }
 
+  // The floor under that ceiling. The ceiling was enforced from the first day
+  // and the floor never was: the split test the refining brief states in prose
+  // — one part must land before another, or their files do not overlap at all —
+  // was checked by nobody. So three steps carved out of one piece of work were
+  // recorded exactly as readily as three that had three real seams, and nine
+  // plans came back as twenty-seven steps, each paying a worktree, a merge and
+  // a run for a gate that still passed or failed whole.
+  {
+    const b = box('widen-earned', { '1-a.md': '# A\n' }, null, null);
+    const put = (steps) => {
+      const f = path.join(b.d, '.claude/orch/refine/docs-1-a-md.json');
+      fs.mkdirSync(path.dirname(f), { recursive: true });
+      fs.writeFileSync(f, JSON.stringify({ summary: 'x', builtOn: [], openQuestions: [], steps }));
+    };
+    const s = (key, owns, needs) => ({ key, title: key, owns, verify: ['true'], ...(needs ? { needs } : {}) });
+
+    put([s('S-1.1', ['src/a.ts']), s('S-1.2', ['src/a.ts']), s('S-1.3', ['src/a.ts'])]);
+    const carved = b.run(['refine', 'done', 'docs/1-a.md']);
+    ok('three parts writing one file and waiting on nothing are refused',
+      carved.code !== 0 && has(carved.out, 'have not earned it'), carved.out);
+    ok('and the refusal names each of them and the file they contend over',
+      has(carved.out, 'S-1.1') && has(carved.out, 'S-1.2') && has(carved.out, 'S-1.3') &&
+      has(carved.out, 'src/a.ts'), carved.out);
+    ok('and says the ceiling is not a number to fill',
+      has(carved.out, 'not a number to fill'), carved.out);
+    ok('and records none of it',
+      has(carved.out, 'Nothing from docs/1-a.md was recorded') &&
+      has(b.run(['board']).out, 'Nothing yet.'), carved.out);
+
+    // Two real seams with a third carved out of one of them. The third is what
+    // is wrong, and refusing the shape of the whole report says less.
+    put([s('S-1.1', ['src/a.ts']), s('S-1.2', ['src/b.ts']), s('S-1.3', ['src/b.ts'])]);
+    const mixed = b.run(['refine', 'done', 'docs/1-a.md']);
+    ok('a report two thirds right names only the parts that did not earn it',
+      mixed.code !== 0 && has(mixed.out, 'S-1.2') && has(mixed.out, 'S-1.3') &&
+      !has(mixed.out, 'S-1.1'), mixed.out);
+
+    // Ordering earns it on its own: parts that share a file but were never
+    // going to run at once, because one has to land before the next can start.
+    put([s('S-1.1', ['src/a.ts']), s('S-1.2', ['src/a.ts'], ['S-1.1']), s('S-1.3', ['src/a.ts'], ['S-1.2'])]);
+    const chained = b.run(['refine', 'done', 'docs/1-a.md']);
+    ok('a part that must land before another is a split worth making',
+      chained.code === 0 && has(chained.out, 'S-1.3'), chained.out);
+  }
+
+  // `builtOn` — the reading the refining agent actually did — reached the report
+  // and went no further. The field appeared exactly once in the whole tool, in
+  // the template asking for it: nothing recorded it and nothing printed it. So
+  // every building agent was handed its plan and its own file list and nothing
+  // else about the repository it was building into, and spent its first hour
+  // re-deriving the map its own refining agent had already drawn.
+  {
+    const b = box('widen-context', { '1-a.md': '# A\n' }, null, null);
+    const put = (extra) => {
+      const f = path.join(b.d, '.claude/orch/refine/docs-1-a-md.json');
+      fs.mkdirSync(path.dirname(f), { recursive: true });
+      fs.writeFileSync(f, JSON.stringify({ summary: 'x', openQuestions: [], ...extra,
+        steps: [{ key: 'S-1.1', title: 'one', owns: ['src/a.ts'], verify: ['true'] }] }));
+    };
+    put({ builtOn: [{ path: 'src/shared.ts', what: 'the retry helper' }] });
+    b.run(['refine', 'done', 'docs/1-a.md']);
+    b.run(['assess', 'propose'], JSON.stringify(tier(['S-1.1'])));
+    b.run(['run', 'open', 'S-1.1']);
+    const brief = fs.readFileSync(path.join(b.d, '.claude/orch/briefs/S-1.1.md'), 'utf8');
+    ok('what the refining agent read is in the brief the builder is handed',
+      has(brief, 'src/shared.ts') && has(brief, 'the retry helper'), brief);
+    ok('and one it may read but not write is marked as not its own',
+      has(brief, 'do not change it — it is not yours'), brief);
+    // A second report is how a plan gets corrected. It must not be how a brief
+    // gets emptied: a report that names no reading leaves the step's alone.
+    put({});
+    b.run(['refine', 'done', 'docs/1-a.md']);
+    const st = JSON.parse(fs.readFileSync(path.join(b.d, '.claude/orch/state.json'), 'utf8'));
+    const ctx = (st.tasks.find((t) => t.key === 'S-1.1') || {}).context || [];
+    ok('a later report naming none leaves what the step already had alone',
+      ctx.some((c) => c.path === 'src/shared.ts'), JSON.stringify(ctx));
+  }
+
+  // A step nobody recorded any reading for used to print no section at all,
+  // which reads as "there is nothing already there" — never true, and the more
+  // expensive of the two mistakes, because it is the one that gets a second copy
+  // of an existing helper written.
+  {
+    const b = box('widen-context-none', { '1-a.md': '# A\n' },
+      [{ key: 'S-1', title: 'one', plan: 'docs/1-a.md', owns: ['src/a.ts'], verify: ['true'] }],
+      tier(['S-1']));
+    b.run(['run', 'open', 'S-1']);
+    const brief = fs.readFileSync(path.join(b.d, '.claude/orch/briefs/S-1.md'), 'utf8');
+    ok('a step with nothing recorded says so instead of saying nothing',
+      has(brief, 'What is already there') && has(brief, 'hole in the brief'), brief);
+  }
+
+  // Prose where a path goes is the failure `owns` already had, one field over.
+  // It looks filled in, it costs the agent a search that finds nothing, and the
+  // brief prints it verbatim, so nothing downstream ever says why.
+  {
+    const b = box('widen-context-prose', { '1-a.md': '# A\n' }, null, null);
+    const f = path.join(b.d, '.claude/orch/refine/docs-1-a-md.json');
+    fs.mkdirSync(path.dirname(f), { recursive: true });
+    fs.writeFileSync(f, JSON.stringify({ summary: 'x', openQuestions: [],
+      builtOn: [{ path: 'the retry helper — over in src', what: 'x' }, { what: 'no path at all' }],
+      steps: [{ key: 'S-1.1', title: 'one', owns: ['src/a.ts'], verify: ['true'] }] }));
+    const r = b.run(['refine', 'done', 'docs/1-a.md']);
+    ok('a builtOn path that is prose is refused, and the whole report with it',
+      r.code !== 0 && has(r.out, 'is prose, not a path') &&
+      has(r.out, 'Nothing from docs/1-a.md was recorded'), r.out);
+    ok('and an entry carrying no path at all is named too',
+      has(r.out, 'has an entry with no path'), r.out);
+    const hand = b.run(['step', 'add'], JSON.stringify([{ key: 'S-9', title: 'x',
+      plan: 'docs/1-a.md', owns: ['src/b.ts'], verify: ['true'], context: ['the helper -- over there'] }]));
+    ok('and a hand-written step is judged by the same gate',
+      hand.code !== 0 && has(hand.out, 'is prose, not a path'), hand.out);
+  }
+
+  // The brief's fingerprint was computed in three places from three copies of
+  // one list — the two writers and `doctor`, which is what decides whether the
+  // brief in an agent's hands is still the current one. Adding a field to the
+  // brief and to two of them calls every brief stale; adding it to the writers
+  // alone leaves a changed one reading as current.
+  {
+    const b = box('widen-context-stale', { '1-a.md': '# A\n' },
+      [{ key: 'S-1', title: 'one', plan: 'docs/1-a.md', owns: ['src/a.ts'], verify: ['true'],
+        context: [{ path: 'src/shared.ts', what: 'the helper' }] }], tier(['S-1']));
+    b.run(['run', 'open', 'S-1']);
+    ok('a brief written a moment ago is not called stale',
+      !has(b.run(['doctor']).out, 'brief is older than the step'), b.run(['doctor']).out);
+    b.run(['step', 'add'], JSON.stringify([{ key: 'S-1',
+      context: [{ path: 'src/shared.ts', what: 'the helper' }, { path: 'src/b.ts', what: 'and this' }] }]));
+    const d = b.run(['doctor']);
+    ok('and one whose context moved under it is',
+      has(d.out, 'brief is older than the step'), d.out);
+  }
+
   // A requirement that comes out with no edges at all is the one thing
   // --only-shared must not do quietly: the ordering the plan asked for would be
   // recorded nowhere, and nothing downstream would ever say so.
@@ -5031,7 +5164,7 @@ else console.log('\nsandboxes kept: ' + boxes.join('\n                '));
 // the suite still ends on "all green", because green is only ever measured
 // against however many checks happened to run. Under a shard the total is the
 // runner's to check, since no one process sees them all.
-const EXPECTED = 953;   // every check above counts; raise it deliberately when you add one
+const EXPECTED = 968;   // every check above counts; raise it deliberately when you add one
 const total = pass + failures.length;
 const partial = Boolean(SHARD || ONLY);
 

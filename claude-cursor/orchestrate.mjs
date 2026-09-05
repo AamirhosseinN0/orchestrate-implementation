@@ -105,6 +105,12 @@ function overlap(t1, t2) {
   for (const a of t1.owns || []) for (const b of t2.owns || []) if (collides(a, b)) out.push(a + ' ↔ ' + b);
   return out;
 }
+// "a", "a and b", "a, b and c". Two callers wanted this and each had written
+// its own: five tiers collapsing onto three efforts is a three-way list, and
+// so is one file that three steps of a plan all claim. A bare join of three
+// reads as one long name.
+const andList = (xs) => xs.length < 2 ? String(xs[0] ?? '')
+  : xs.slice(0, -1).join(', ') + ' and ' + xs[xs.length - 1];
 // A serialisation point is a shared invariant named in prose by whoever wrote
 // the step — "docker-compose.yml", "docker compose file", "Docker-Compose.yml".
 // Comparing those by exact string equality is a check that can only ever fire
@@ -378,6 +384,39 @@ function stepProblems(s, it, existing) {
     if (/[/\\]/.test(v) || /\.(ts|tsx|js|jsx|mjs|cjs|py|go|rs|java|rb|php|sql|json|md)$/i.test(v))
       p.push(`${f} entry "${v}" is a path — name the symbol it exports, not the file it lives in`);
     else if (/\s/.test(v)) p.push(`${f} entry "${v}" reads as prose, not a symbol you could import`);
+  }
+  p.push(...contextProblems(it.context, 'context'));
+  return p;
+}
+
+// `context` is the only field a step carries for the reader rather than for the
+// scheduler: it names what already exists, says what is in it, and the brief
+// prints it verbatim. So the path has to be one the agent can open from its own
+// worktree — repository-relative, whole files, not a sentence. Prose here is the
+// same failure prose in `owns` was: it looks filled in, it costs the agent a
+// search that finds nothing, and nothing downstream ever says why.
+function contextProblems(list, field) {
+  const p = [];
+  if (list === undefined || list === null) return p;
+  if (!Array.isArray(list)) return [`${field} must be a list of {path, what} objects`];
+  for (const c of list) {
+    const v = typeof c === 'string' ? c
+      : (c && typeof c === 'object' && !Array.isArray(c) ? c.path : null);
+    if (typeof v !== 'string' || !v.trim()) {
+      p.push(`${field} has an entry with no path — each one is {"path": "…", "what": "…"}`);
+      continue;
+    }
+    const x = v.trim(), clip = x.slice(0, 60);
+    if (path.isAbsolute(x) || /^[A-Za-z]:[\/]/.test(x))
+      p.push(`${field} entry "${clip}" is an absolute path — it is read from a worktree that is not this checkout, so it has to be repository-relative`);
+    else if (norm(x).split('/').includes('..'))
+      p.push(`${field} entry "${clip}" climbs out of the repository`);
+    else if (/\s[—–]\s|\s--\s/.test(x))
+      p.push(`${field} entry "${clip}" is prose, not a path — what it is goes in "what"`);
+    else if (/:\d+/.test(x))
+      p.push(`${field} entry "${clip}" carries a :line suffix — name the file`);
+    else if (!/[/.]/.test(x) && x.split(/\s+/).length > 1)
+      p.push(`${field} entry "${clip}" reads as a sentence, not a path`);
   }
   return p;
 }
@@ -1239,10 +1278,6 @@ CMDS.assess = (argv) => {
       for (const [t, e] of Object.entries(r.efforts || {})) (byEffort[e] ||= []).push(t);
       console.log('  ' + Object.entries(byEffort).map(([e, ts]) => `${ts.join('/')} → ${e}`).join('   '));
       const shared = Object.entries(byEffort).filter(([, ts]) => ts.length > 1);
-      // Not always two tiers — five onto three leaves a three-way collapse —
-      // so the list is joined properly rather than `and` between every pair.
-      const andList = (xs) => xs.length < 2 ? String(xs[0] ?? '')
-        : xs.slice(0, -1).join(', ') + ' and ' + xs[xs.length - 1];
       for (const [e, ts] of shared) console.log(`  ${andList(ts)} are the same effort (${e}), so moving between them changes nothing.`);
     }
   }
@@ -1362,6 +1397,60 @@ CMDS.board = () => {
 // of work rather than more work in flight, and the taste for doing that grows
 // with the room allowed for it.
 const MAX_STEPS_PER_PLAN = 3;
+
+// The floor under that ceiling. `refine done` has always enforced the most a
+// plan may become and never once enforced the least. The test is stated in the
+// refining brief in prose — a part must land before another can start, or parts
+// write files that do not overlap at all — and nothing checked either half, so
+// a refiner that cut every plan into three because three was permitted passed
+// exactly as cleanly as one that found three real seams. Nine plans came back
+// as twenty-seven steps that way and the register took all of it without a
+// word: twenty-seven worktrees, merges and runs for nine plans whose gates
+// still passed or failed whole, which is the cost of the split with none of
+// what it is bought for.
+//
+// So the ceiling stays a ceiling and stops being a target. Three is what a plan
+// reaches when it has three real seams.
+//
+// Judged per part rather than per report. Two genuinely disjoint steps with a
+// third carved out of one of them is a split that is mostly right, and naming
+// the third is more use than refusing the shape of the whole thing.
+//
+// A part earns its place by ordering OR by disjointness. Ordering is a `needs`
+// edge in either direction between it and a sibling: the plan says this half
+// cannot start until that half has landed, and then they were never going to
+// run at once anyway. Disjointness is its files against every sibling's —
+// nothing in common means the two CAN run at once on separate agents, which is
+// the whole reason to split. Neither is several agents contending over one
+// piece of work, slower than the one agent that would already have finished it.
+//
+// Note which way the file test runs here. Two steps of DIFFERENT plans owning
+// one file is fine and is not a reason to make either wait — they build in
+// separate worktrees and reconcile at the merge. Two parts of ONE plan owning
+// one file is different: it is the evidence that the plan was never two parts.
+function splitProblems(steps) {
+  if (steps.length < 2) return [];
+  const keyOf = (it) => String((it && it.key) || '');
+  const out = [];
+  for (const it of steps) {
+    const me = keyOf(it);
+    if (!me) continue;                      // `stepProblems` owns the keyless step
+    const sibs = steps.filter((o) => keyOf(o) !== me);
+    if (sibs.some((o) => (it.needs || []).includes(keyOf(o)) || (o.needs || []).includes(me)))
+      continue;
+    // Grouped by the file, not by the pair. Three steps on one file is three
+    // pairs, and reporting it pairwise printed the same path to each of them
+    // twice over — the shape of the problem is one file with three claimants.
+    const shared = [];
+    for (const a of it.owns || []) {
+      if (typeof a !== 'string') continue;
+      const others = sibs.filter((o) => (o.owns || []).some((b) => typeof b === 'string' && collides(a, b)));
+      if (others.length) shared.push({ own: a, others: others.map(keyOf) });
+    }
+    if (shared.length) out.push({ key: me, shared });
+  }
+  return out;
+}
 const planSlug = (p) => String(p).replace(/[^A-Za-z0-9]+/g, '-').replace(/^-|-$/g, '');
 const refineReport = (p) => sub('refine', planSlug(p) + '.json');
 // Loaded plans other than this one that the working tree has changed. Only
@@ -1423,7 +1512,7 @@ Do two things:
 
    {
      "summary": "what you changed and why, in a few sentences",
-     "builtOn": [{"path": "src/x.ts", "what": "what you read there"}],
+     "builtOn": [{"path": "src/x.ts", "what": "what is in it, written for whoever builds this"}],
      "openQuestions": ["anything you could not settle from the code"],
      "steps": [{
        "key": "${keyPrefix(rec.path)}.1",
@@ -1436,6 +1525,15 @@ Do two things:
        "verify": ["the command that proves it worked"]
      }]
    }
+
+   \`builtOn\` is not a note to the orchestrator. It is put in front of the agent
+   that builds these steps, and besides the plan it is the whole of what that
+   agent is told about this repository before it starts writing. Name what you
+   actually read — the module it must call rather than reimplement, the helper it
+   should extend, the test that shows the expected shape — and write the "what"
+   for somebody arriving cold, not as a reminder to yourself. A bare path with no
+   sentence beside it is worth almost nothing to them. Keep the paths
+   repository-relative: it reads them from its own worktree, not from here.
 
    How many steps. ${rec.lines < 120
      ? `${rec.path} is ${rec.lines} lines, which is usually one step. Split it only if the
@@ -1457,6 +1555,14 @@ Do two things:
    for. What you must not do is carve one coherent piece of work into parts that
    write the same files, to look thorough; that is several agents contending
    over one piece of work where one agent would already have finished it.
+
+   Both of those conditions are checked, not taken on trust. A part that writes
+   a file another part of this plan also writes, and that neither waits on one
+   of them nor is waited on by one of them, is refused — and the whole report
+   goes back with it. So split where you can point at which of the two holds,
+   and leave the plan whole where you cannot. ${MAX_STEPS_PER_PLAN} is a ceiling
+   a plan reaches when it has ${MAX_STEPS_PER_PLAN} real seams, never a number
+   to fill.
 
    Key every step from this plan: ${keyPrefix(rec.path)}.1, ${keyPrefix(rec.path)}.2, ${keyPrefix(rec.path)}.3.
    Other plans in this round are being refined at the same time, and keys are
@@ -1539,10 +1645,32 @@ Report the file written, not a summary in your reply.`);
     let rep; try { rep = JSON.parse(fs.readFileSync(f, 'utf8')); } catch (e) { die(`the report at ${f} is not valid JSON: ${e.message}`); }
     const steps = rep.steps || [];
     if (!steps.length) die('the report names no steps');
-    // A plan is one step, or two when a part must land before the rest. More
-    // than that is an agent carving up work that was already small enough.
+    // A plan is one step, and two or three only where the parts genuinely come
+    // apart. The ceiling is checked first because it is the cheaper answer to
+    // read: too many is too many whatever the reasons given for them.
     if (steps.length > MAX_STEPS_PER_PLAN) die(`the report splits ${rec.path} into ${steps.length} steps; ${MAX_STEPS_PER_PLAN} is the most a plan may become.
   Have the agent merge them and rewrite ${relCwd(f)}.`);
+    // Then whether the split it did make was worth making. See `splitProblems`.
+    const unearned = splitProblems(steps);
+    if (unearned.length) {
+      console.error(`✗ the report splits ${rec.path} into ${steps.length} steps, and ${unearned.length} of them ${unearned.length === 1 ? 'has' : 'have'} not earned it:`);
+      for (const u of unearned) {
+        const line = (x) => `${x.own}, which ${andList(x.others)} also write${x.others.length > 1 ? '' : 's'}`;
+        console.error(`    ${u.key} writes ${line(u.shared[0])}`);
+        for (const x of u.shared.slice(1)) console.error(`    ${' '.repeat(u.key.length)}    and ${line(x)}`);
+      }
+      console.error('\n  Two parts of one plan are worth separating when one must land before the other');
+      console.error('  can start, or when their files do not overlap at all and they can therefore run');
+      console.error('  at the same time on separate agents. These do neither: they write the same');
+      console.error('  files and wait on nothing, so they are one piece of work handed to several');
+      console.error('  agents to contend over — a merge, a run and a handover apiece, and slower than');
+      console.error('  the single agent that would already have finished it.');
+      console.error(`\n  ${MAX_STEPS_PER_PLAN} steps is a ceiling a plan reaches when it has ${MAX_STEPS_PER_PLAN} real seams, not a number to fill.`);
+      console.error('  Merge them back into one step; or, if they truly are separate work, give each');
+      console.error('  its own files, or say in `needs` which of them has to land first.');
+      console.error(`\nNothing from ${rec.path} was recorded. Have the agent rewrite ${relCwd(f)} and run this again.`);
+      process.exit(1);
+    }
     // A refining agent is told to edit one plan. Nothing checked that it did.
     // One rewrote nine of them in a single run and keyed steps off text that
     // was then reverted, so the register described plans that no longer said
@@ -1592,7 +1720,25 @@ Report the file written, not a summary in your reply.`);
     // entire and written entire: a report half-recorded and half-refused is a
     // register nobody planned, and the half that landed is the harder half to
     // see.
-    const stamped = steps.map((it) => ({ ...it, plan: rec.path }));
+    // `builtOn` is the reading the refining agent did, and until now it reached
+    // the report and went no further. It is recorded on every step of this plan
+    // as `context`, which the brief prints. A step that named its own keeps it,
+    // and a report carrying none leaves whatever a step already had alone rather
+    // than blanking it — a second `refine done` must not empty a brief.
+    const builtOn = Array.isArray(rep.builtOn) ? rep.builtOn : [];
+    const ctxBad = contextProblems(rep.builtOn, 'builtOn');
+    if (ctxBad.length) {
+      console.error('✗ the report\'s "builtOn" cannot be recorded as written:');
+      for (const x of ctxBad) console.error('    ' + x);
+      console.error('\n  It is what the agent building these steps is told already exists, and it reads');
+      console.error('  those paths from its own worktree. A path it cannot open is worse than none.');
+      console.error(`\nNothing from ${rec.path} was recorded. Have the agent fix ${relCwd(f)} and run this again.`);
+      process.exit(1);
+    }
+    const stamped = steps.map((it) => {
+      const c = (it.context || []).length ? it.context : builtOn;
+      return c.length ? { ...it, plan: rec.path, context: c } : { ...it, plan: rec.path };
+    });
     const bad = vetBatch(s, stamped);
     if (bad.length) {
       console.error('✗ the report has steps that cannot be recorded as written:');
@@ -1754,7 +1900,7 @@ function openOne(s, t) {
   t.briefFile = relCwd(brief);
   // What the brief was written from. A step whose owns or verify changed
   // afterwards is holding an agent to instructions nobody has revised.
-  t.briefSha = sha(JSON.stringify([t.owns, t.serialises, t.verify, t.needs, t.title, t.plan]));
+  t.briefSha = briefKey(t);
   t.status = 'open'; t.openedAt = new Date().toISOString();
   const launcher = shortest(path.join(HERE, 'scripts', 'run.sh'));
   return { launch: `  bash ${launcher} \\\n` +
@@ -1852,7 +1998,7 @@ CMDS.run = (argv) => {
       const bf = sub('briefs', key + '.md');
       fs.writeFileSync(bf, briefText(s, t, tierOf(t.tier)));
       t.briefFile = relCwd(bf);
-      t.briefSha = sha(JSON.stringify([t.owns, t.serialises, t.verify, t.needs, t.title, t.plan]));
+      t.briefSha = briefKey(t);
       commit(s, 'run open --rebrief', argv);
       ok(`${key}'s brief rewritten at ${t.briefFile}`);
       console.log('  It is a file on disk, not something the running agent re-reads. Send it:');
@@ -2046,6 +2192,13 @@ CMDS.run = (argv) => {
   die('run open <key> | run record <key> --log <file>');
 };
 
+// What the brief was written from. Three places computed this list separately —
+// the two that write a brief and `doctor`, which decides whether the one in an
+// agent's hands is still the current one — so a field added to the brief had to
+// be added in three, and adding it in two makes every brief read as stale. One
+// list, asked by all of them.
+const briefKey = (t) => sha(JSON.stringify([t.owns, t.serialises, t.verify, t.needs, t.title, t.plan, t.context]));
+
 function briefText(s, t, row) {
   const plan = t.plan || '(no plan recorded)';
   const L = [];
@@ -2071,7 +2224,37 @@ function briefText(s, t, row) {
          `watching for one. That is deliberate here, scoped to this worktree; do not`,
          `take it as licence to touch anything outside it.`, '');
   L.push(`## The plan`, '', `Read ${plan} in full before writing anything.`, '');
-  if ((t.needs || []).length) L.push(`## Built on`, '', `These landed before you: ${t.needs.join(', ')}. Their work is in your`, `worktree already.`, '');
+  if ((t.needs || []).length) L.push(`## Landed before you`, '', `These landed before you: ${t.needs.join(', ')}. Their work is in your`, `worktree already.`, '');
+  // What the refining agent read, handed on. It was being thrown away: the
+  // refine report asks for `builtOn` — a path and what is in it — and that field
+  // appeared exactly once in the whole tool, in the template asking for it.
+  // Nothing recorded it and nothing printed it, so every step went out knowing
+  // its plan and its own file list and nothing else about the repository it was
+  // building into. That is a building agent re-deriving the map its own refining
+  // agent had drawn an hour earlier, and it is how a second copy of a helper
+  // three directories away gets written.
+  //
+  // When there is none, say so. A section that simply vanishes reads as "there
+  // is nothing already there", which is never true and is the more expensive of
+  // the two mistakes.
+  L.push(`## What is already there`, '');
+  const ctx = (t.context || [])
+    .map((c) => (typeof c === 'string' ? { path: c } : c || {}))
+    .filter((c) => c.path);
+  if (ctx.length) {
+    L.push(`Read these before you write anything that overlaps them, and build on them`,
+           `rather than writing your own:`, '');
+    for (const c of ctx) {
+      const mine = (t.owns || []).some((o) => collides(o, c.path));
+      L.push(`  - ${c.path}${c.what ? ' — ' + c.what : ''}` +
+             (mine ? '' : '   (read it, do not change it — it is not yours)'));
+    }
+    L.push('');
+  } else {
+    L.push(`Nothing was recorded for this step, which is a hole in the brief and not a`,
+           `licence to invent. Go and look for what already does this before you write a`,
+           `second one of it.`, '');
+  }
   L.push(`## What you own`, '', `You may write these and nothing else:`, '');
   for (const o of t.owns || []) L.push(`  - ${o}`);
   L.push('', `Anything outside that list is another step's, and two steps writing one`,
@@ -2718,8 +2901,7 @@ CMDS.doctor = () => {
     // A brief already handed out does not change when the record does, and the
     // agent holding it will not know.
     if (t.briefSha) {
-      const now = sha(JSON.stringify([t.owns, t.serialises, t.verify, t.needs, t.title, t.plan]));
-      if (now !== t.briefSha) probs.push('its brief is older than the step — rewrite it and tell the agent to re-read');
+      if (briefKey(t) !== t.briefSha) probs.push('its brief is older than the step — rewrite it and tell the agent to re-read');
     }
     if (probs.length) { bad += probs.length; console.log('✗ ' + t.key); for (const p of probs) console.log('    ' + p); }
   }

@@ -966,10 +966,14 @@ with the timings it actually ran at.
 Every one of these was earned from a specific failure, and each is load-bearing
 for exactly the kind of round that gets wider.
 
-- **Do not raise the two-steps-per-plan cap.** It is the guard against an agent
-  carving one plan into six to look thorough and losing the intent across the
-  seams. Width comes from writing four plans, not from a refiner splitting one
-  four ways. `map` is how you decide where to split; a person owns that call.
+- **Do not raise the three-steps-per-plan cap, and do not read it as a target.**
+  It is the guard against an agent carving one plan into six to look thorough
+  and losing the intent across the seams. Width comes from writing four plans,
+  not from a refiner splitting one four ways. `map` is how you decide where to
+  split; a person owns that call. `refine done` refuses a report above three,
+  and refuses one at two or three whose parts write the same files and wait on
+  nothing: nine plans once came back as twenty-seven steps that each cost a
+  worktree, a merge and a run, for gates that still passed or failed whole.
 - **Do not skip the suite on the joined tree.** Batch it, run it beside the next
   round, but run it.
 - **Do not put two step keys on one agent.** It reads like a saving and it is the

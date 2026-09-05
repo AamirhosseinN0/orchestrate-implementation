@@ -107,9 +107,12 @@ STATUS_DIR=${CURSOR_ORCH_DIR:-.claude/orch}/runs
 STATUS="$STATUS_DIR/$KEY.status"
 OUTCOME=started
 mkdir -p "$STATUS_DIR" 2>/dev/null || true
+KILLED_FILE=
 finish() {
   local code=$?
   printf 'exit %s\t%s\t%s\t%s\n' "$code" "$OUTCOME" "$KEY" "$LOG" > "$STATUS" 2>/dev/null || true
+  [ -n "$KILLED_FILE" ] && rm -f "$KILLED_FILE" 2>/dev/null
+  return 0
 }
 trap finish EXIT
 printf 'exit -\trunning\t%s\t%s\n' "$KEY" "$LOG" > "$STATUS" 2>/dev/null || true
@@ -140,21 +143,49 @@ fi
 # earlier. Two different models did it at once, so it was the service rather
 # than the model or the effort.
 #
-# So every run is bounded. The default is generous enough for real work at max
-# effort and short enough that a wedged round is noticed within the hour.
-TIMEOUT=${OPENCODE_ORCH_TIMEOUT:-1800}
-have_timeout=0
-command -v timeout >/dev/null 2>&1 && have_timeout=1
-if [ "$have_timeout" != 1 ] && [ "$TIMEOUT" -gt 0 ] 2>/dev/null; then
-  # This is not a cosmetic gap. The fallback below is exercised against a
-  # sleeping stub (see the timeout tests), not against a real `opencode`
-  # binary — none was available while this was written — and that has to be
-  # said loudly rather than discovered later from a round that quietly ran
-  # forever.
-  echo "⚠ no \`timeout\` binary on PATH — falling back to a bash-based bound for" >&2
-  echo "  this run (see run-opencode.sh). If a run still seems to hang well past" >&2
-  echo "  ${TIMEOUT}s, check for a leftover opencode process and kill it by hand." >&2
-fi
+# So every run is bounded — but bounded on the RIGHT thing. A wall-clock cap
+# cannot tell a wedged provider from a step that is simply long, and the cost of
+# guessing was paid twice: the 30-minute default killed an xhigh step that had
+# done all its work and had not yet committed, and raising it to 90 minutes
+# killed another one the same way. Meanwhile a genuinely wedged run — the case
+# the bound exists for — writes nothing at all, and says so within seconds.
+#
+# The bound is therefore SILENCE, not duration. If the log has not grown for
+# OPENCODE_ORCH_IDLE seconds the run is wedged and is stopped; as long as events
+# keep arriving it is working and is left alone. OPENCODE_ORCH_TIMEOUT stays as
+# an outer wall-clock backstop, now generous enough that reaching it means
+# something is wrong rather than that the work was big. Either at 0 switches
+# that bound off.
+IDLE=${OPENCODE_ORCH_IDLE:-900}
+TIMEOUT=${OPENCODE_ORCH_TIMEOUT:-21600}
+
+# Bytes on disk, however the platform spells it. `wc -c` is the one form present
+# everywhere `bash` is; `stat` differs between GNU and BSD and is not worth the
+# case statement. BSD's `wc` pads with spaces, so the value is stripped.
+#
+# An unreadable log has to come back as 0 and not as empty: an empty string
+# never equals the previous reading, so the watcher below would see the log
+# "growing" on every poll and the idle bound would never fire again — the one
+# failure mode that looks exactly like the bug this replaced.
+#
+# What it measures is the file, not the stream. A provider that emits an event
+# every few minutes could in principle sit in a pipe buffer between polls; at
+# the default fifteen-minute window there is no such gap that is not already
+# the silence this is looking for.
+log_size() {
+  # The redirection is inside the braces so a missing file is the SHELL's error
+  # to swallow, not `wc`'s: `wc -c < missing 2>/dev/null` still prints "No such
+  # file", because the redirect fails before wc runs — and the watcher below
+  # would print that on every poll for the whole run.
+  local n; n=$( { wc -c < "$1"; } 2>/dev/null ); n=${n//[^0-9]/}
+  printf '%s' "${n:-0}"
+}
+
+# Why the run was stopped, written by the watcher for the parent to read back.
+# A variable cannot cross the fork. Declared empty beside the EXIT trap above so
+# that trap can remove it on every path out, including the early ones.
+KILLED_FILE=$(mktemp "${TMPDIR:-/tmp}/opencode-killed.XXXXXX" 2>/dev/null) || KILLED_FILE="/tmp/opencode-killed.$$"
+: > "$KILLED_FILE"
 
 launch() {   # $1 = log to write, $2 = prompt
   local log=$1 prompt=$2
@@ -165,24 +196,7 @@ launch() {   # $1 = log to write, $2 = prompt
   # environment has opencode installed to check it against.
   [ -n "$SESSION" ] && a+=(-s "$SESSION")
 
-  if [ "$have_timeout" = 1 ]; then
-    local -a t=()
-    [ "$TIMEOUT" -gt 0 ] 2>/dev/null && t=(timeout --foreground "$TIMEOUT")
-    if [ "$QUIET" = 1 ]; then
-      "${t[@]}" "$OC" "${a[@]}" "$prompt" > "$log" 2>&1
-    else
-      # Drains to EOF rather than exiting on the last event, because this pipe
-      # is shared with the tee writing the log and exiting early truncates it.
-      #
-      # The timeout wraps opencode and not the pipeline, so a kill still lets
-      # the tee and the formatter finish what they already have — a timed-out
-      # run keeps whatever it managed to say.
-      "${t[@]}" "$OC" "${a[@]}" "$prompt" 2>&1 | tee "$log" | node "$STREAM" --key "$KEY" --runner opencode
-    fi
-    return "${PIPESTATUS[0]}"
-  fi
-
-  if [ "$TIMEOUT" -le 0 ] 2>/dev/null; then
+  if [ "$TIMEOUT" -le 0 ] 2>/dev/null && [ "$IDLE" -le 0 ] 2>/dev/null; then
     if [ "$QUIET" = 1 ]; then
       "$OC" "${a[@]}" "$prompt" > "$log" 2>&1
     else
@@ -191,11 +205,16 @@ launch() {   # $1 = log to write, $2 = prompt
     return "${PIPESTATUS[0]}"
   fi
 
-  # No `timeout` binary. opencode has to be started as our own background job
-  # (not the first stage of a pipeline — killing the PID `$!` gives for the
-  # LAST stage of a pipeline does not stop the first one) so its PID is ours
-  # to bound with a watcher that sends SIGTERM at the limit, then reads its
-  # output back through a FIFO once it is running.
+  # Bounded. opencode is started as our own background job (not the first stage
+  # of a pipeline — killing the PID `$!` gives for the LAST stage of a pipeline
+  # does not stop the first one) so its PID is ours to watch, and its output is
+  # read back through a FIFO once it is running.
+  #
+  # This used to be the fallback for machines with no `timeout` binary, with
+  # `timeout --foreground` taking the ordinary path. It is now the only path,
+  # because the bound is no longer a duration `timeout` could enforce: the
+  # watcher has to look at the log to tell a wedged run from a long one, and
+  # `timeout` cannot.
   #
   # Two things here earned their comment by failing first, measured rather
   # than assumed:
@@ -216,13 +235,37 @@ launch() {   # $1 = log to write, $2 = prompt
   #     whole thing down together — which is what real `timeout` was already
   #     doing, confirmed by running it against this same wrapper stub.
   local rc
-  local fifo; fifo=$(mktemp -u "${TMPDIR:-/tmp}/opencode-fallback.XXXXXX") || fifo="/tmp/opencode-fallback.$$"
-  mkfifo "$fifo" 2>/dev/null || { echo "✗ could not create a FIFO for the no-timeout fallback at $fifo" >&2; return 2; }
+  local fifo; fifo=$(mktemp -u "${TMPDIR:-/tmp}/opencode-fifo.XXXXXX") || fifo="/tmp/opencode-fifo.$$"
+  mkfifo "$fifo" 2>/dev/null || { echo "✗ could not create a FIFO for the bounded run at $fifo" >&2; return 2; }
   local had_m=1; case $- in *m*) : ;; *) had_m=0 ;; esac
   set -m
   "$OC" "${a[@]}" "$prompt" > "$fifo" 2>&1 &
   local oc_pid=$!
-  ( sleep "$TIMEOUT"; kill -TERM -"$oc_pid" 2>/dev/null ) &
+  # One watcher, both bounds. It polls rather than sleeping the whole limit,
+  # because the idle bound is a question about the log that has to be asked
+  # repeatedly. The interval comes off the SMALLER of the two live bounds — a
+  # poll derived from the idle window alone would overshoot a short wall-clock
+  # backstop by its whole first sleep, which is a bound that does not bound.
+  # A tenth of that, floored at a second so it cannot spin, capped at fifteen so
+  # a six-hour backstop does not wake every half hour for nothing.
+  local tightest=$IDLE
+  { [ "$tightest" -le 0 ] 2>/dev/null || { [ "$TIMEOUT" -gt 0 ] 2>/dev/null && [ "$TIMEOUT" -lt "$tightest" ]; }; } && tightest=$TIMEOUT
+  local poll=$(( tightest / 10 )); [ "$poll" -lt 1 ] && poll=1; [ "$poll" -gt 15 ] && poll=15
+  (
+    elapsed=0; quiet=0; last=$(log_size "$log")
+    while kill -0 "$oc_pid" 2>/dev/null; do
+      sleep "$poll"
+      elapsed=$(( elapsed + poll ))
+      now=$(log_size "$log")
+      if [ "$now" != "$last" ]; then quiet=0; last=$now; else quiet=$(( quiet + poll )); fi
+      if [ "$IDLE" -gt 0 ] 2>/dev/null && [ "$quiet" -ge "$IDLE" ]; then
+        echo "idle" > "$KILLED_FILE"; kill -TERM -"$oc_pid" 2>/dev/null; exit 0
+      fi
+      if [ "$TIMEOUT" -gt 0 ] 2>/dev/null && [ "$elapsed" -ge "$TIMEOUT" ]; then
+        echo "wall" > "$KILLED_FILE"; kill -TERM -"$oc_pid" 2>/dev/null; exit 0
+      fi
+    done
+  ) &
   local watcher=$!
   if [ "$QUIET" = 1 ]; then
     cat < "$fifo" > "$log"
@@ -234,6 +277,9 @@ launch() {   # $1 = log to write, $2 = prompt
   [ "$had_m" = 1 ] || set +m
   kill "$watcher" 2>/dev/null; wait "$watcher" 2>/dev/null
   rm -f "$fifo"
+  # Killed by the watcher, not by itself. 124 is what `timeout` uses and what
+  # every reader of this script's exit code already understands.
+  [ -s "$KILLED_FILE" ] && rc=124
   [ "$rc" -ge 128 ] && rc=124
   return "$rc"
 }
@@ -241,19 +287,35 @@ launch() {   # $1 = log to write, $2 = prompt
 launch "$LOG" "$PROMPT"
 LAUNCH_RC=$?
 
-# 124 is what `timeout` exits with when it had to kill the command.
+# 124: the watcher had to stop it. Which bound it hit changes what to do next,
+# so the two are not reported as one thing.
 if [ "$LAUNCH_RC" = 124 ]; then
   OUTCOME=timeout
-  echo "✗ $KEY was still running after ${TIMEOUT}s and was stopped." >&2
-  echo "  The log holds whatever it managed to say: $LOG" >&2
-  if [ ! -s "$LOG" ]; then
-    echo "  It wrote nothing at all, which is the provider accepting the request and" >&2
-    echo "  never answering. Check that a trivial run works before spending the round:" >&2
-    echo "    $OC run -m $MODEL --format json \"Reply with exactly: OK\"" >&2
+  WHY=$(cat "$KILLED_FILE" 2>/dev/null)
+  if [ "$WHY" = idle ]; then
+    echo "✗ $KEY wrote nothing for ${IDLE}s and was stopped." >&2
+    echo "  Not a long run — a silent one. The log holds whatever it managed to say: $LOG" >&2
+    if [ ! -s "$LOG" ]; then
+      echo "  It wrote nothing at all, which is the provider accepting the request and" >&2
+      echo "  never answering. Check that a trivial run works before spending the round:" >&2
+      echo "    $OC run -m $MODEL --format json \"Reply with exactly: OK\"" >&2
+    else
+      echo "  It was working and then stopped emitting. Resume it rather than starting" >&2
+      echo "  again — its worktree still holds the work." >&2
+    fi
+    echo "  OPENCODE_ORCH_IDLE=<seconds> changes how long silence is allowed (0 = never stop)." >&2
+  else
+    echo "✗ $KEY was still running after ${TIMEOUT}s and was stopped." >&2
+    echo "  It was still emitting events, so this is the outer backstop rather than a" >&2
+    echo "  wedged provider: the work is genuinely that long, or it is looping." >&2
+    echo "  The log holds whatever it managed to say: $LOG" >&2
+    echo "  OPENCODE_ORCH_TIMEOUT=<seconds> raises the backstop (0 = no wall-clock bound)." >&2
   fi
-  echo "  Raise the limit with OPENCODE_ORCH_TIMEOUT=<seconds> if the work is genuinely long." >&2
+  echo "  Whatever it had done is uncommitted in $WS — resume, do not restart." >&2
+  rm -f "$KILLED_FILE"
   exit 1
 fi
+rm -f "$KILLED_FILE"
 
 # What the log can actually answer: did it error, did it say anything, and which
 # session is it on. There is no model question to ask.

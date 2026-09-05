@@ -3168,17 +3168,27 @@ sect(() => {
     J({ type: 'tool_call', subtype: 'completed', timestamp_ms: 2000, tool_call: { editToolCall: {
       args: { path: wt + '/src/zzz.ts' }, result: { success: { path: wt + '/src/zzz.ts', linesAdded: 2, linesRemoved: 0 } } } } }),
     J({ type: 'result', result: 'S-1 done', timestamp_ms: 61000 })].join('\n') + '\n');
+  // A run whose branch holds nothing is not a finished run, whatever its log
+  // says — see the pair of cases below. So the agent's side of it happens
+  // first: write the file and commit it, the way a real one would.
+  const uncommitted = run(['run', 'record', 'S-1', '--log', runlog]);
+  ok('a run whose branch holds no commit is not recorded as passing',
+    uncommitted.code === 1 && has(uncommitted.out, 'no-commit'), uncommitted.out);
+  ok('and says the log was the one claiming otherwise',
+    has(uncommitted.out, 'Its log says "passed"'), uncommitted.out);
+  fs.writeFileSync(path.join(wt, 'src', 'a.ts'), 'export const x = 2\n');
+  git(['add', '-A'], wt); git(['commit', '-qm', 'widen a'], wt);
   const rec = run(['run', 'record', 'S-1', '--log', runlog]);
-  ok('a finished run is recorded from its log', rec.code === 0 && has(rec.out, 'passed'), rec.out);
+  ok('a finished run is recorded from its log', rec.code === 0 && has(rec.out, '✓ S-1 run 2: passed'), rec.out);
   ok('with what it changed', has(rec.out, '2 file(s) changed'), rec.out);
   ok('and a file it wrote but does not own is reported at once',
     has(rec.out, 'does not own') && has(rec.out, 'src/zzz.ts'), rec.out);
+  ok('and offers to widen the step rather than send correct work back',
+    has(rec.out, 'step own S-1'), rec.out);
   ok('the record is kept per run, because a step can run more than once',
     fs.existsSync(path.join(d, '.claude', 'orch', 'runs', 'S-1', '1.json')));
 
   // --- guard, against git rather than the log ---
-  fs.writeFileSync(path.join(wt, 'src', 'a.ts'), 'export const x = 2\n');
-  git(['add', '-A'], wt); git(['commit', '-qm', 'S-1'], wt);
   const g = run(['guard', 'S-1']);
   ok('guard passes a step that stayed inside what it owns', g.code === 0, g.out);
   ok('and works in a repository with no remote to ask', !has(g.out, 'fatal'), g.out);
@@ -3193,6 +3203,9 @@ sect(() => {
   ok('a step cannot land before what it needs', early.code === 2, early.out);
   ok('landing says what it frees', has(run(['land', 'S-1']).out, 'frees') === false || true);
   run(['run', 'open', 'S-2']);
+  const wt2 = JSON.parse(readIf(path.join(d, '.claude', 'orch', 'state.json'))).tasks.find((t) => t.key === 'S-2').worktree;
+  fs.writeFileSync(path.join(wt2, 'src', 'b.ts'), 'export const x = 3\n');
+  git(['add', '-A'], wt2); git(['commit', '-qm', 'widen b'], wt2);
   const rec2 = path.join(d, 'S-2.jsonl');
   fs.writeFileSync(rec2, [J({ type: 'system', subtype: 'init', model: 'Composer 2.5', cwd: d }),
     J({ type: 'result', result: 'done', timestamp_ms: 5 })].join('\n') + '\n');
@@ -4209,7 +4222,12 @@ echo '{"type":"step_finish","timestamp":3000,"sessionID":"ses_STUB","part":{"typ
     const status = readIf(path.join(b.d, '.claude', 'orch', 'runs', 'S-1.status'));
     ok('the status file is written in the same shape as cursor\'s',
       status.startsWith('exit 0\tpassed\tS-1\t'), status);
-    // The record, harvested by the right harvester.
+    // The record, harvested by the right harvester. The stub writes a log, not
+    // a commit, so the agent's side of the run is done here — a branch with
+    // nothing on it is one of the three things that stops a run being recorded
+    // as passing, and this case is about the harvester, not about that.
+    fs.writeFileSync(path.join(wt, 'src', 'a.ts'), 'done by the stub\n');
+    b.git(['add', '-A'], wt); b.git(['commit', '-qm', 'widen a'], wt);
     const rec = b.run(['run', 'record', 'S-1', '--log', '.claude/orch/logs/S-1.jsonl']);
     ok('run record routes to the opencode harvester', rec.code === 0, rec.out);
     const filed = JSON.parse(readIf(path.join(b.d, '.claude', 'orch', 'runs', 'S-1', '1.json')));
@@ -4247,30 +4265,68 @@ echo '{"type":"step_finish","timestamp":3000,"sessionID":"ses_STUB","part":{"typ
   // prompt that had answered in about a second minutes earlier, on two models
   // at once. Without a bound the status stays `running` and the round stalls
   // with no error anywhere, which is worse than failing.
-  {
-    const b = box('oc-timeout', STEP, TIER);
-    fs.writeFileSync(path.join(b.stub, 'opencode'), '#!/usr/bin/env bash\nsleep 60\n', { mode: 0o755 });
-    b.run(['runner', 'use', 'opencode']);
-    b.run(['run', 'open', 'S-1']);
+  //
+  // The bound is SILENCE, not duration. A wall-clock cap cannot tell a wedged
+  // provider from a long step, and the cost of guessing was paid twice: the
+  // 30-minute default killed an xhigh step that had done all its work and had
+  // not yet committed, and 90 minutes killed another the same way.
+  const ocRun = (b, env) => {
     const started = Date.now();
     let out = '', code = 0;
     try {
       out = execFileSync('bash', [path.join(SCRIPTS, 'run-opencode.sh'), '--role', 'chip', '--tier', 'medium',
         '--key', 'S-1', '--workspace', b.d, '--prompt-file', '.claude/orch/briefs/S-1.md', '--quiet'],
-        { cwd: b.d, encoding: 'utf8', env: { ...b.env, OPENCODE_ORCH_TIMEOUT: '3' }, stdio: ['pipe', 'pipe', 'pipe'] });
+        { cwd: b.d, encoding: 'utf8', env: { ...b.env, ...env }, stdio: ['pipe', 'pipe', 'pipe'] });
     } catch (e) { code = e.status; out = String(e.stdout || '') + String(e.stderr || ''); }
-    const took = Date.now() - started;
-    ok('a run that never answers is stopped', code === 1, String(code) + ' ' + out);
-    ok('and stopped at the limit rather than run to completion', took < 30_000, took + 'ms');
-    ok('it says how long it waited', has(out, 'after 3s'), out);
+    return { out, code, took: Date.now() - started };
+  };
+  {
+    const b = box('oc-timeout', STEP, TIER);
+    fs.writeFileSync(path.join(b.stub, 'opencode'), '#!/usr/bin/env bash\nsleep 60\n', { mode: 0o755 });
+    b.run(['runner', 'use', 'opencode']);
+    b.run(['run', 'open', 'S-1']);
+    const r = ocRun(b, { OPENCODE_ORCH_IDLE: '3' });
+    ok('a run that never answers is stopped', r.code === 1, String(r.code) + ' ' + r.out);
+    ok('and stopped at the limit rather than run to completion', r.took < 30_000, r.took + 'ms');
+    ok('it says how long the silence lasted', has(r.out, 'nothing for 3s'), r.out);
+    ok('and calls it a silent run rather than a long one', has(r.out, 'Not a long run'), r.out);
     ok('and that an empty log means the provider never answered',
-      has(out, 'never answering'), out);
+      has(r.out, 'never answering'), r.out);
     ok('and offers the one-line check before spending a round',
-      has(out, 'Reply with exactly: OK'), out);
-    ok('and says how to allow longer', has(out, 'OPENCODE_ORCH_TIMEOUT'), out);
+      has(r.out, 'Reply with exactly: OK'), r.out);
+    ok('and says how to allow longer silence', has(r.out, 'OPENCODE_ORCH_IDLE'), r.out);
     const status = readIf(path.join(b.d, '.claude', 'orch', 'runs', 'S-1.status'));
     ok('the status says timeout, which a detached exit code could not',
       status.startsWith('exit 1\ttimeout\tS-1\t'), status);
+  }
+
+  // --- the step that was working and got killed anyway --------------------
+  // The defect this replaced: a step that had been emitting events for the
+  // whole run was stopped at a fixed wall-clock cap with its work uncommitted,
+  // twice, at two different caps. A run that keeps writing is a run that is
+  // working, and the idle bound leaves it alone.
+  {
+    const b = box('oc-idle-working', STEP, TIER);
+    // Writes a line every second for six seconds: never silent for two.
+    fs.writeFileSync(path.join(b.stub, 'opencode'), '#!/usr/bin/env bash\n' +
+      'for i in 1 2 3 4 5 6; do\n' +
+      '  echo \'{"type":"text","timestamp":1000,"sessionID":"ses_STUB","part":{"type":"text","text":"working"}}\'\n' +
+      '  sleep 1\n' +
+      'done\n' +
+      'echo \'{"type":"step_finish","timestamp":9000,"sessionID":"ses_STUB","part":{"type":"step-finish","reason":"stop","tokens":{"total":1},"cost":0}}\'\n',
+      { mode: 0o755 });
+    b.run(['runner', 'use', 'opencode']);
+    b.run(['run', 'open', 'S-1']);
+    const r = ocRun(b, { OPENCODE_ORCH_IDLE: '3' });
+    ok('a run that keeps emitting outlives an idle bound shorter than itself',
+      r.code === 0, String(r.code) + ' ' + r.out);
+    ok('and finishes rather than being stopped', has(r.out, 'finished'), r.out);
+    ok('having run well past that bound', r.took > 4000, r.took + 'ms');
+    // The outer backstop still exists, and says which of the two it was.
+    const wall = ocRun(b, { OPENCODE_ORCH_IDLE: '0', OPENCODE_ORCH_TIMEOUT: '2' });
+    ok('the wall-clock backstop still stops a run that will not end', wall.code === 1, wall.out);
+    ok('and does not blame a wedged provider for it',
+      has(wall.out, 'still emitting events') && !has(wall.out, 'never answering'), wall.out);
   }
 
   // --- the formatter reads the other vocabulary ---------------------------
@@ -4352,6 +4408,366 @@ echo '{"type":"step_finish","timestamp":3000,"sessionID":"ses_STUB","part":{"typ
   }
 });
 
+// -------------------------------------------- what one real 18-step round found
+// Six defects from a build driven end to end against this tool, plus the two
+// runner behaviours that cost the most wall-clock. Each of these failed before
+// the fix beside it; the comment says what the old behaviour was, because a
+// check nobody has watched fail is not a check.
+say('what one real round found');
+sect(() => {
+  const ROOT = path.dirname(fileURLToPath(import.meta.url));
+  const O = path.join(ROOT, 'claude-cursor', 'orchestrate.mjs');
+  function box(name) {
+    const d = bare(name);
+    const stub = path.join(d, 'stub');
+    fs.mkdirSync(stub, { recursive: true });
+    fs.writeFileSync(path.join(stub, 'agent'),
+      '#!/usr/bin/env bash\necho "Created chat 11111111-2222-3333-4444-555555555555"\n', { mode: 0o755 });
+    const wts = path.join(d, 'wts');
+    fs.mkdirSync(wts, { recursive: true });
+    const env = { ...process.env, PATH: stub + path.delimiter + process.env.PATH, CURSOR_ORCH_WT: wts };
+    const run = (args, input) => {
+      try { return { code: 0, out: execFileSync('node', [O, ...args], { cwd: d, encoding: 'utf8', input, env, stdio: ['pipe', 'pipe', 'pipe'] }) }; }
+      catch (e) { return { code: e.status ?? -1, out: String(e.stdout || '') + String(e.stderr || '') }; }
+    };
+    const git = (args, cwd = d) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] });
+    const write = (rel, body) => {
+      fs.mkdirSync(path.dirname(path.join(d, rel)), { recursive: true });
+      fs.writeFileSync(path.join(d, rel), body);
+    };
+    const report = (plan, obj) => write(path.join('.claude', 'orch', 'refine',
+      plan.replace(/[^A-Za-z0-9]+/g, '-').replace(/^-|-$/g, '') + '.json'), JSON.stringify(obj));
+    git(['init', '-q', '-b', 'main']);
+    git(['config', 'user.email', 'ci@example.invalid']);
+    git(['config', 'user.name', 'ci']);
+    return { d, run, git, write, report, wts };
+  }
+  const state = (b) => JSON.parse(readIf(path.join(b.d, '.claude/orch/state.json')) || '{}');
+  const stepOf = (b, k) => (state(b).tasks || []).find((t) => t.key === k) || {};
+
+  // --- 1. cancelling took the edges out and nothing put them back ----------
+  // Cancelling S-023.1…S-030.1 dropped `needs` from every survivor. Re-refining
+  // brought the same keys back with nothing pointing at them, and four steps
+  // were one `run open` away from building against a tree that held none of the
+  // work they were written on top of. `step link` already refuses to record
+  // half a graph for exactly this reason; `step rm` was doing it quietly.
+  {
+    const b = box('sever');
+    b.write('docs/1-a.md', '# A\n'); b.write('docs/2-b.md', '# B\n');
+    b.write('src/a.ts', 'a\n'); b.write('src/b.ts', 'b\n');
+    b.git(['add', '-A']); b.git(['commit', '-qm', 'init']);
+    b.run(['load', 'docs']);
+    b.run(['step', 'add'], JSON.stringify([
+      { key: 'S-1', title: 'tables', plan: 'docs/1-a.md', owns: ['src/a.ts'], verify: ['true'] },
+      { key: 'S-2', title: 'ownership', plan: 'docs/2-b.md', owns: ['src/b.ts'], needs: ['S-1'], verify: ['true'] }]));
+    const cancelled = b.run(['step', 'rm', 'S-1']);
+    ok('cancelling a dependency says the dependent was unblocked by a cancellation',
+      has(cancelled.out, 'cancelled instead'), cancelled.out);
+    ok('and names the edge it took out', has(cancelled.out, 'S-2') && has(cancelled.out, 'no longer needs S-1'), cancelled.out);
+    ok('the edge really is out of needs', !(stepOf(b, 'S-2').needs || []).includes('S-1'), JSON.stringify(stepOf(b, 'S-2')));
+    ok('but it is kept, not forgotten',
+      (stepOf(b, 'S-2').severed || []).some((x) => x.key === 'S-1'), JSON.stringify(stepOf(b, 'S-2')));
+    const doc = b.run(['doctor']);
+    ok('doctor says the edge is severed while the dependency stays cancelled',
+      has(doc.out, 'severed by a cancellation'), doc.out);
+    // The part that mattered: recording the key again restores what cancelling
+    // it removed. It used to come back with nothing pointing at it.
+    b.report('docs/1-a.md', { summary: 's', steps: [{ key: 'S-1', title: 'tables again', owns: ['src/a.ts'], verify: ['true'] }] });
+    const revived = b.run(['refine', 'done', 'docs/1-a.md']);
+    ok('re-refining a cancelled plan revives its step', revived.code === 0, revived.out);
+    ok('and says the edges are back', has(revived.out, 'are back') && has(revived.out, 'S-2 needs S-1 again'), revived.out);
+    ok('so the dependent waits for it again',
+      (stepOf(b, 'S-2').needs || []).includes('S-1'), JSON.stringify(stepOf(b, 'S-2')));
+    ok('and nothing is left severed', !(stepOf(b, 'S-2').severed || []).length, JSON.stringify(stepOf(b, 'S-2')));
+    b.run(['assess', 'set', 'S-1=low', 'S-2=low']);
+    const chk = b.run(['check']);
+    ok('the dependent is held back rather than opened on a hole',
+      has(chk.out, 'Waiting on work to reach the main line: S-2'), chk.out);
+  }
+
+  // --- 2. a report that never reached the board, announced as recorded -----
+  // `refine done` printed its tick off the report it had just read, which is
+  // true of the report whatever happened to the register. The one number that
+  // would have said otherwise — the register total beside it — sat unchanged at
+  // 18 across three consecutive additions and nothing compared them.
+  {
+    const b = box('board-check');
+    b.write('docs/1-a.md', '# A\n'); b.write('src/a.ts', 'a\n');
+    b.git(['add', '-A']); b.git(['commit', '-qm', 'init']);
+    b.run(['load', 'docs']);
+    b.report('docs/1-a.md', { summary: 's', steps: [
+      { key: 'S-1', title: 'x', owns: ['src/a.ts'], verify: ['true'], status: 'cancelled' }] });
+    const forged = b.run(['refine', 'done', 'docs/1-a.md']);
+    ok('a report that writes the tool\'s own bookkeeping is refused', forged.code === 1, forged.out);
+    ok('and says which field', has(forged.out, '"status"') && has(forged.out, 'bookkeeping'), forged.out);
+    ok('and records nothing', !(state(b).tasks || []).length, JSON.stringify(state(b).tasks));
+    b.report('docs/1-a.md', { summary: 's', steps: [{ key: 'S-1', title: 'x', owns: ['src/a.ts'], verify: ['true'] }] });
+    const good = b.run(['refine', 'done', 'docs/1-a.md']);
+    ok('the same report without it is recorded', good.code === 0, good.out);
+    ok('and the total beside the tick comes off the register',
+      has(good.out, '(1 in the register)'), good.out);
+    // A step add whose key was cancelled comes back live, and says so.
+    b.run(['step', 'rm', 'S-1']);
+    const back = b.run(['step', 'add'], JSON.stringify([{ key: 'S-1', title: 'x', owns: ['src/a.ts'] }]));
+    ok('a cancelled key recorded again is revived rather than merged into a dead row',
+      back.code === 0 && has(back.out, 'revived by this'), back.out);
+    ok('and the board holds it as live work', has(b.run(['board']).out, 'planned'), b.run(['board']).out);
+  }
+
+  // --- 3. a run killed at its bound, recorded as a passing one -------------
+  // S-022.1's status file said `exit 1 timeout`; `run record` said passed, 19m,
+  // 6 files changed. opencode's cap had stopped it mid-gate with everything
+  // uncommitted — the log still held a `step_finish`, and that was the only
+  // witness anyone asked.
+  {
+    const b = box('three-witnesses');
+    b.write('docs/1-a.md', '# A\n'); b.write('src/a.ts', 'a\n');
+    b.git(['add', '-A']); b.git(['commit', '-qm', 'init']);
+    b.run(['load', 'docs']);
+    b.run(['step', 'add'], JSON.stringify([{ key: 'S-1', title: 'x', plan: 'docs/1-a.md', owns: ['src/a.ts'], verify: ['true'] }]));
+    b.run(['assess', 'set', 'S-1=low']);
+    b.run(['run', 'open', 'S-1']);
+    const wt = stepOf(b, 'S-1').worktree;
+    const log = path.join(b.d, 'run.jsonl');
+    fs.writeFileSync(log, [
+      JSON.stringify({ type: 'system', subtype: 'init', model: 'Cursor Grok 4.6 Medium', cwd: wt }),
+      JSON.stringify({ type: 'result', result: 'done', timestamp_ms: 61000 })].join('\n') + '\n');
+    // The work is committed, so the branch is not the dissenting witness here.
+    fs.writeFileSync(path.join(wt, 'src', 'a.ts'), 'done\n');
+    b.git(['add', '-A'], wt); b.git(['commit', '-qm', 'widen a'], wt);
+    fs.mkdirSync(path.join(b.d, '.claude', 'orch', 'runs'), { recursive: true });
+    fs.writeFileSync(path.join(b.d, '.claude', 'orch', 'runs', 'S-1.status'),
+      'exit 1\ttimeout\tS-1\t.claude/orch/logs/S-1.jsonl\n');
+    const killed = b.run(['run', 'record', 'S-1', '--log', log]);
+    ok('a log that says passed does not outvote the launcher\'s status file',
+      killed.code === 1 && has(killed.out, 'timeout'), killed.out);
+    ok('and the disagreement is stated rather than resolved silently',
+      has(killed.out, 'Its log says "passed"'), killed.out);
+    ok('the step stays open, so it is resumed rather than merged',
+      stepOf(b, 'S-1').status === 'open', stepOf(b, 'S-1').status);
+    ok('and it says to resume rather than start again', has(killed.out, 'sendback S-1'), killed.out);
+    // The same run, with a status file that agrees.
+    fs.writeFileSync(path.join(b.d, '.claude', 'orch', 'runs', 'S-1.status'),
+      'exit 0\tpassed\tS-1\t.claude/orch/logs/S-1.jsonl\n');
+    const clean = b.run(['run', 'record', 'S-1', '--log', log]);
+    ok('three witnesses agreeing is a pass', clean.code === 0 && has(clean.out, '✓ S-1 run 2: passed'), clean.out);
+    // The third witness on its own: work left uncommitted in the worktree.
+    fs.writeFileSync(path.join(wt, 'src', 'a.ts'), 'half done\n');
+    const dirty = b.run(['run', 'record', 'S-1', '--log', log]);
+    ok('a run that left work uncommitted is not a finished one',
+      dirty.code === 1 && has(dirty.out, 'uncommitted'), dirty.out);
+    b.git(['checkout', '--', 'src/a.ts'], wt);
+    // A commit named for the merge rather than for the change. The idiom is
+    // this tool's own, learned off `git log` on the main line and copied back.
+    b.git(['commit', '-qm', 'land S-1', '--allow-empty'], wt);
+    const idiom = b.run(['run', 'record', 'S-1', '--log', log]);
+    ok('a commit named for the merge instead of the change is noticed',
+      has(idiom.out, 'named for the merge, not for the change'), idiom.out);
+    ok('and it says how to amend it', has(idiom.out, 'commit --amend'), idiom.out);
+    // The check is anchored to the whole subject. Reconciling with the main
+    // line is what `sendback --why conflict` asks for, and its merge commit
+    // carries the branch name — a first-word match would have called the one
+    // correct thing an agent does after a conflict a mistake.
+    b.git(['commit', '-qm', "Merge branch 'main' into step/S-1", '--allow-empty'], wt);
+    const real = b.run(['run', 'record', 'S-1', '--log', log]);
+    ok('but reconciling with the main line is not that mistake',
+      (real.out.match(/named for the merge, not for the change/g) || []).length === 1 &&
+      !has(real.out, "Merge branch 'main'"), real.out);
+  }
+
+  // --- 4. join advertised a step that run open then refused ---------------
+  // `join` answered "what can open now" with its own filter — planned, needs
+  // me, nothing held — which knows about dependencies and nothing about
+  // serialisation points. So it named S-024.1, and `run open S-024.1` replied
+  // that it moves the same four points as S-023.1, which was still open.
+  {
+    const b = box('one-idea-of-ready');
+    b.write('docs/1-a.md', '# A\n');
+    for (const f of ['a', 'b', 'c']) b.write('src/' + f + '.ts', 'orig\n');
+    b.git(['add', '-A']); b.git(['commit', '-qm', 'init']);
+    b.run(['load', 'docs']);
+    b.run(['step', 'add'], JSON.stringify([
+      { key: 'S-1', title: 'first', plan: 'docs/1-a.md', owns: ['src/a.ts'], verify: ['true'] },
+      { key: 'S-2', title: 'holds the head', plan: 'docs/1-a.md', owns: ['src/b.ts'],
+        serialises: ['migration head'], needs: ['S-1'], verify: ['true'] },
+      { key: 'S-3', title: 'moves it too', plan: 'docs/1-a.md', owns: ['src/c.ts'],
+        serialises: ['migration head'], needs: ['S-1'], verify: ['true'] }]));
+    b.run(['assess', 'set', 'S-1=low', 'S-2=low', 'S-3=low']);
+    b.run(['run', 'open', 'S-1']);
+    const wt = stepOf(b, 'S-1').worktree;
+    fs.writeFileSync(path.join(wt, 'src', 'a.ts'), 'one\n');
+    b.git(['add', '-A'], wt); b.git(['commit', '-qm', 'one'], wt);
+    const joined = b.run(['join', 'S-1']);
+    ok('join names only one of the two, because they share a point',
+      has(joined.out, 'can open now') && has(joined.out, 'S-2') && !has(joined.out, 'S-3: '), joined.out);
+    ok('and says the other is held, rather than leaving run open to refuse it',
+      has(joined.out, 'still cannot open') && has(joined.out, 'migration head'), joined.out);
+    // The claim underneath: what join advertises, run open takes.
+    const first = b.run(['run', 'open', 'S-2']);
+    ok('what join advertised really opens', first.code === 0, first.out);
+    const second = b.run(['run', 'open', 'S-3']);
+    ok('and what it held back is the one run open refuses', second.code === 2, second.out);
+  }
+
+  // --- 5. a short owns list failing correct work --------------------------
+  // Three times in one round a step was required by its own plan or its own
+  // proof command to write a file it did not own — a migration journal, a
+  // capability registry, a seed file. Each produced a guard failure on work
+  // that was right, and the only remedy was re-refining the whole plan.
+  {
+    const b = box('short-owns');
+    b.write('docs/1-a.md', '# A\n');
+    b.write('src/a.ts', 'a\n'); b.write('src/registry.ts', 'export const all = []\n');
+    b.write('src/other.ts', 'other\n');
+    b.git(['add', '-A']); b.git(['commit', '-qm', 'init']);
+    b.run(['load', 'docs']);
+    b.run(['step', 'add'], JSON.stringify([
+      { key: 'S-1', title: 'adds a capability', plan: 'docs/1-a.md', owns: ['src/a.ts'], verify: ['true'] },
+      { key: 'S-2', title: 'owns the other one', plan: 'docs/1-a.md', owns: ['src/other.ts'], verify: ['true'] }]));
+    b.run(['assess', 'set', 'S-1=low', 'S-2=low']);
+    b.run(['run', 'open', 'S-1']);
+    const wt = stepOf(b, 'S-1').worktree;
+    fs.writeFileSync(path.join(wt, 'src', 'a.ts'), 'done\n');
+    fs.writeFileSync(path.join(wt, 'src', 'registry.ts'), 'export const all = [1]\n');
+    fs.writeFileSync(path.join(wt, 'src', 'other.ts'), 'taken\n');
+    b.git(['add', '-A'], wt); b.git(['commit', '-qm', 'work'], wt);
+    const g = b.run(['guard', 'S-1']);
+    ok('guard still fails a step that went outside its list', g.code === 1, g.out);
+    ok('a file another live step owns is called a breach',
+      has(g.out, 'belong to another live step') && has(g.out, 'S-2 owns it'), g.out);
+    ok('and that one is what sendback is offered for', has(g.out, 'sendback S-1'), g.out);
+    ok('a file nobody owns is called a short list instead',
+      has(g.out, 'belong to nobody'), g.out);
+    ok('and offers to widen the step rather than send correct work back',
+      has(g.out, 'step own S-1 src/registry.ts'), g.out);
+    const own = b.run(['step', 'own', 'S-1', 'src/registry.ts']);
+    ok('a step can be widened without re-refining its plan', own.code === 0, own.out);
+    ok('and it says the agent is holding a brief written from the old list',
+      has(own.out, 'brief was written from the old list'), own.out);
+    const g2 = b.run(['guard', 'S-1']);
+    ok('the registry no longer counts against it', !has(g2.out, 'src/registry.ts\n') || !has(g2.out, 'belong to nobody'), g2.out);
+    ok('while the real trespass still does', g2.code === 1 && has(g2.out, 'src/other.ts'), g2.out);
+    const brief = b.run(['refine', 'brief', 'docs/1-a.md']);
+    ok('and the refine brief now names the three kinds of path that get missed',
+      has(brief.out, 'your `verify` command WRITES') && has(brief.out, 'registry, barrel, index or manifest'), brief.out);
+  }
+
+  // --- 6. a refining agent editing plans it was not given ------------------
+  // One rewrote nine plans in a single run and registered steps off text that
+  // was then reverted. `refine done` validated the shape of every owns entry
+  // and every key, and never asked which plan the agent had actually touched.
+  {
+    const b = box('plan-scope');
+    b.write('docs/1-a.md', '# A\n'); b.write('docs/2-b.md', '# B\n'); b.write('src/a.ts', 'a\n');
+    b.git(['add', '-A']); b.git(['commit', '-qm', 'init']);
+    b.run(['load', 'docs']);
+    b.write('docs/2-b.md', '# B\n\nrewritten by the wrong agent\n');
+    b.report('docs/1-a.md', { summary: 's', steps: [{ key: 'S-1', title: 'x', owns: ['src/a.ts'], verify: ['true'] }] });
+    const strayed = b.run(['refine', 'done', 'docs/1-a.md']);
+    ok('a report is refused when the agent edited a plan it was not given',
+      strayed.code === 1, strayed.out);
+    ok('naming the plan it touched', has(strayed.out, 'docs/2-b.md'), strayed.out);
+    ok('and offering the revert', has(strayed.out, 'git checkout --'), strayed.out);
+    ok('and recording nothing', !(state(b).tasks || []).length, JSON.stringify(state(b).tasks));
+    ok('with a way to keep the edits if they were meant', has(strayed.out, '--allow-plan-edits'), strayed.out);
+    const kept = b.run(['refine', 'done', 'docs/1-a.md', '--allow-plan-edits']);
+    ok('which records the report', kept.code === 0, kept.out);
+    // Keys are the other half: a report cannot register work under a plan whose
+    // own agent has not reported yet.
+    b.git(['checkout', '--', 'docs/2-b.md']);
+    b.report('docs/2-b.md', { summary: 's', steps: [{ key: 'S-1.1', title: 'poached', owns: ['src/b.ts'], verify: ['true'] }] });
+    const poached = b.run(['refine', 'done', 'docs/2-b.md']);
+    ok('a report keyed into another plan\'s numbering is refused', poached.code === 1, poached.out);
+    ok('naming the plan that numbering belongs to', has(poached.out, 'docs/1-a.md'), poached.out);
+    const brief = b.run(['refine', 'brief', 'docs/1-a.md']);
+    ok('and the brief says so before the agent starts',
+      has(brief.out, 'is the only file you may edit'), brief.out);
+  }
+
+  // --- the round that opens one step at a time ----------------------------
+  // Everything else in this tool says to open the whole set, and then the only
+  // way to act on that was one `run open` per step. A round opened that way
+  // drifts into being run that way.
+  {
+    const b = box('open-all');
+    b.write('docs/1-a.md', '# A\n');
+    for (const f of ['a', 'b', 'c']) b.write('src/' + f + '.ts', 'orig\n');
+    b.git(['add', '-A']); b.git(['commit', '-qm', 'init']);
+    b.run(['load', 'docs']);
+    b.run(['step', 'add'], JSON.stringify([
+      { key: 'S-1', title: 'one', plan: 'docs/1-a.md', owns: ['src/a.ts'], verify: ['true'] },
+      { key: 'S-2', title: 'two', plan: 'docs/1-a.md', owns: ['src/b.ts'], verify: ['true'] },
+      { key: 'S-3', title: 'three', plan: 'docs/1-a.md', owns: ['src/c.ts'],
+        serialises: ['lockfile'], verify: ['true'] },
+      { key: 'S-4', title: 'four', plan: 'docs/1-a.md', owns: ['src/d.ts'],
+        serialises: ['lockfile'], verify: ['true'] }]));
+    b.run(['assess', 'set', 'S-1=low', 'S-2=low', 'S-3=low', 'S-4=low']);
+    ok('check offers the one command that opens the round',
+      has(b.run(['check']).out, 'run open --all'), b.run(['check']).out);
+    const all = b.run(['run', 'open', '--all']);
+    ok('one command opens every step that can go', all.code === 0 && has(all.out, '3 step(s) open'), all.out);
+    ok('and prints a launcher line for each', (all.out.match(/--prompt-file/g) || []).length === 3, all.out);
+    ok('with the whole round written down as well', has(all.out, '.claude/orch/launch/'), all.out);
+    ok('and says they go as separate backgrounded calls, in one message',
+      has(all.out, 'all in one\nmessage'), all.out);
+    ok('the fourth stays back on the point the third is moving',
+      has(all.out, 'stayed back on a serialisation point') && has(all.out, 'S-4'), all.out);
+    ok('and it really is not open', stepOf(b, 'S-4').status === 'planned', stepOf(b, 'S-4').status);
+    ok('every other one is', ['S-1', 'S-2', 'S-3'].every((k) => stepOf(b, k).status === 'open'),
+      JSON.stringify((state(b).tasks || []).map((t) => [t.key, t.status])));
+    const again = b.run(['run', 'open', '--all']);
+    ok('running it again with nothing to open says so rather than passing', again.code === 1, again.out);
+    ok('and names what is holding the rest', has(again.out, 'lockfile'), again.out);
+  }
+
+  // --- the narrow round, made visible while it can still be changed -------
+  // A queue and a round both print a frontier, and the difference between them
+  // is the difference between a day and a week. Nothing said which one you had.
+  {
+    const b = box('shape');
+    b.write('docs/1-a.md', '# A\n');
+    b.write('docs/2-b.md', '---\nrequires: [1]\n---\n# B\n');
+    b.write('docs/3-c.md', '---\nrequires: [2]\n---\n# C\n');
+    b.write('docs/4-d.md', '---\nrequires: [3]\n---\n# D\n');
+    for (const f of ['a', 'b', 'c', 'd']) b.write('src/' + f + '.ts', 'orig\n');
+    b.git(['add', '-A']); b.git(['commit', '-qm', 'init']);
+    b.run(['load', 'docs']);
+    b.run(['step', 'add'], JSON.stringify([
+      { key: 'S-1.1', title: 'a', plan: 'docs/1-a.md', owns: ['src/a.ts'], verify: ['true'] },
+      { key: 'S-2.1', title: 'b', plan: 'docs/2-b.md', owns: ['src/b.ts', 'src/a.ts'], verify: ['true'] },
+      { key: 'S-3.1', title: 'c', plan: 'docs/3-c.md', owns: ['src/c.ts', 'src/b.ts'], verify: ['true'] },
+      { key: 'S-4.1', title: 'd', plan: 'docs/4-d.md', owns: ['src/d.ts', 'src/c.ts'], verify: ['true'] }]));
+    const linked = b.run(['step', 'link']);
+    ok('linking says what the edges cost, in waves', has(linked.out, 'the round runs in 4 wave(s)'), linked.out);
+    ok('and offers the narrower reading of the same requirements',
+      has(linked.out, '--only-shared'), linked.out);
+    b.run(['assess', 'set', 'S-1.1=low', 'S-2.1=low', 'S-3.1=low', 'S-4.1=low']);
+    const chk = b.run(['check']);
+    ok('check prints the shape of the whole graph, not just its first row',
+      has(chk.out, 'The shape of it: 4 live step(s) in 4 wave(s) — 1 → 1 → 1 → 1'), chk.out);
+    ok('and names a queue as a queue', has(chk.out, 'That is a queue, not a round'), chk.out);
+  }
+
+  // --- a serialisation point across many steps is a queue with a name ------
+  {
+    const b = box('point-fanout');
+    b.write('docs/1-a.md', '# A\n');
+    for (const f of ['a', 'b', 'c']) b.write('src/' + f + '.ts', 'orig\n');
+    b.git(['add', '-A']); b.git(['commit', '-qm', 'init']);
+    b.run(['load', 'docs']);
+    b.run(['step', 'add'], JSON.stringify(['a', 'b', 'c'].map((f, i) => ({
+      key: 'S-' + (i + 1), title: f, plan: 'docs/1-a.md', owns: ['src/' + f + '.ts'],
+      serialises: ['capability registry'], verify: ['true'] }))));
+    b.run(['assess', 'set', 'S-1=low', 'S-2=low', 'S-3=low']);
+    const doc = b.run(['doctor']);
+    ok('a point three steps name is reported with the queue it makes',
+      has(doc.out, 'gate three or more steps'), doc.out);
+    ok('naming it and counting them', has(doc.out, '3×') && has(doc.out, 'capability registry'), doc.out);
+    ok('and saying what is and is not one', has(doc.out, 'A file two steps both edit is not one'), doc.out);
+    ok('with the way to say two are separate things', has(doc.out, 'migration head: orders'), doc.out);
+  }
+});
+
 // ---------------------------------------------------------------------- report
 // Run the slice this process was given. A case that throws is one failure, not
 // the end of the sweep - the rest still run, and the count below still notices
@@ -4374,7 +4790,7 @@ else console.log('\nsandboxes kept: ' + boxes.join('\n                '));
 // the suite still ends on "all green", because green is only ever measured
 // against however many checks happened to run. Under a shard the total is the
 // runner's to check, since no one process sees them all.
-const EXPECTED = 843;   // every check above counts; raise it deliberately when you add one
+const EXPECTED = 919;   // every check above counts; raise it deliberately when you add one
 const total = pass + failures.length;
 const partial = Boolean(SHARD || ONLY);
 

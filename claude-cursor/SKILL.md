@@ -41,6 +41,20 @@ Not caution about the runner, not tidiness, not "let me see how the first one
 goes", not the size of the round. If `check` names five steps, five agents start
 now — five separate backgrounded `Bash` calls, in one message.
 
+**Open them with one command, not five.** `run open --all` opens every step
+`check` named, in one call, and prints every launcher line together:
+
+```bash
+node $ORCH run open --all
+```
+
+This matters more than it looks. Opening a round used to take one `run open` per
+step, each its own round trip, each printing one launcher line to be collected by
+hand — and a round opened that way is a round that drifts into being opened one
+step at a time, which is the same round run end to end. The set `--all` opens is
+`check`'s, checked against itself as well as against what is out, so opening all
+of it at once is exactly as safe as opening the first one.
+
 **Two steps owning the same file is not a reason to wait.** Each builds in its
 own worktree, on its own copy of the repository, so two agents writing one file
 never meet. What they both changed is reconciled once, at the merge, by whichever
@@ -149,14 +163,25 @@ Two things are worth knowing before choosing this runner:
   only `max`, `high` and `minimal` have been confirmed from opencode's own help
   text, so do not hard-code a vocabulary against this paragraph.
 
-- **A run that never answers is stopped.** The provider has been seen accepting
-  a request and returning nothing at all — no events, no error, empty stderr,
-  nothing in opencode's own log — for a prompt that had answered in about a
-  second minutes earlier, on two models at once. Unbounded, that leaves the
-  status on `running` and stalls the round with no error anywhere, which is
-  worse than failing. Every run is capped at 30 minutes; raise it with
-  `OPENCODE_ORCH_TIMEOUT=<seconds>`, and a run that hits the cap is recorded as
-  `timeout` rather than as a run that died.
+- **A run that never answers is stopped — but a long one is not.** The provider
+  has been seen accepting a request and returning nothing at all — no events, no
+  error, empty stderr, nothing in opencode's own log — for a prompt that had
+  answered in about a second minutes earlier, on two models at once. Unbounded,
+  that leaves the status on `running` and stalls the round with no error
+  anywhere, which is worse than failing.
+
+  **The bound is silence, not duration.** A wall-clock cap cannot tell a wedged
+  provider from a step that is simply long, and guessing cost two runs: a
+  30-minute default killed an `xhigh` step that had done all its work and had
+  not yet committed, and raising it to 90 minutes killed another the same way.
+  A run is stopped when its log has not grown for `OPENCODE_ORCH_IDLE` seconds
+  (default 900). `OPENCODE_ORCH_TIMEOUT` remains as an outer wall-clock backstop,
+  now 6 hours — reaching it means something is looping, not that the work was
+  big. Either at `0` switches that bound off. A run stopped by either is recorded
+  as `timeout`, and the message says which bound it was and what to do about it.
+
+  Neither is a reason to start the step again. The worktree still holds the work:
+  `sendback <key>`.
 
 `opencode` is not on a non-interactive `PATH` — the login profile puts it there
 — so the launcher resolves it rather than assuming. Being able to run it in a
@@ -343,6 +368,35 @@ It also prints what the refining agent did to the plan, as a diffstat. Refining
 rewrites its plan in place, and a rewrite that breaks a repo-level lint is
 otherwise invisible.
 
+**A refining agent may edit its own plan and no other.** One rewrote nine plans
+in a single run and registered steps off text that was then reverted — the
+register described a round that no longer existed anywhere. `refine done` now
+diffs the working tree and refuses the whole report if any *other* loaded plan
+changed, naming them and printing the `git checkout --` line. If the edits were
+meant, `refine done <plan> --allow-plan-edits` records it anyway. A report is
+also refused if it keys steps into another plan's numbering: `S-1.2.x` belongs
+to the plan whose id is `1.2`, whether or not that plan has reported yet.
+
+**The report may not write the tool's own bookkeeping.** `status`, `runs`,
+`branch`, `worktree`, `joinedAt` and the rest are refused with the field named.
+A report carrying `"status": "cancelled"` used to merge straight in and leave the
+step off the board while the command printed a tick; one carrying
+`"status": "landed"` would have claimed a proof that never ran.
+
+**`owns` comes out short far more often than long**, and always in the same
+places — the shared registry a step adds one line to, the journal its own
+migration writes, the fixture its own proof command regenerates. None of those
+is in the plan; they are in the repository's habits. The brief now walks the
+agent through all four kinds explicitly. When one is still missed, the answer is
+not to re-refine the plan:
+
+```bash
+node $ORCH step own S-1 src/capabilities.ts test/access/seed.test.ts
+```
+
+`guard` prints that line itself, for the strays no other step owns — see
+[When a run finishes](#when-a-run-finishes).
+
 A plan that names `requires:` in its front matter has that read at `load` — from
 `---` lines or from a ```yaml fence, both are read — and put in front of the
 refining agent along with whatever keys are already recorded for those plans.
@@ -456,27 +510,58 @@ tick over nothing checked is how a green report starts meaning nothing.
 ## 6. Run
 
 ```bash
-node $ORCH run open S-1
+node $ORCH run open --all
 ```
 
-That makes the worktree and branch, mints a fresh chat, writes the brief, and
-prints the exact launcher line. Then launch it as a **backgrounded** `Bash` call:
+That makes a worktree and branch for every step that can go, mints each a fresh
+chat, writes each a brief, and prints one launcher line per step — the whole
+round, in one command. It also writes them to `.claude/orch/launch/<time>.txt`.
+
+Then launch each of them as its own **backgrounded** `Bash` call:
 
 ```bash
 $RUN --role chip --tier medium --key S-1 --workspace <worktree> \
      --chat <uuid> --prompt-file .claude/orch/briefs/S-1.md
 ```
 
+`run open <key>` opens exactly one, for the rare case where you mean to.
+
 ### Open everything `check` names, in the same round
 
 This is **the rule** at the top of this document, and it is the single biggest
-thing you can get wrong. `run open` each step, then launch each as its own
-backgrounded `Bash` call — separate calls in one message, not a loop that waits
-on each in turn. That is what makes them concurrent and what wakes you as each
-finishes.
+thing you can get wrong. One `run open --all`, then one backgrounded `Bash` call
+per launcher line — separate calls in one message, not a loop that waits on each
+in turn. That is what makes them concurrent and what wakes you as each finishes.
 
-`run open` tells you when you have stopped short: it names how many more `check`
-would still allow and refuses to let that pass unnoticed.
+If you do open one at a time, `run open` tells you when you have stopped short:
+it names how many more `check` would still allow, and the command that takes
+them all.
+
+### When the round is narrow, find out why before running it
+
+`check` prints the shape of the whole graph, not just its first row:
+
+```
+The shape of it: 18 live step(s) in 9 wave(s) — 3 → 2 → 2 → 2 → 2 → 2 → 2 → 2 → 1
+```
+
+A profile like that is a queue with a plan attached, and it is nearly always one
+of two things, both fixable in seconds and neither visible from the frontier
+alone:
+
+- **`step link` without `--only-shared`.** The default is the cross-product:
+  plan B comes after plan A, so *every* step of B is given a need on *every*
+  step of A. With two steps each that is four edges where typically one is real,
+  and the three spurious ones hold work that never conflicted.
+  `step link --only-shared --dry-run` shows the same round with only the edges
+  where two steps actually meet.
+- **`serialises` used too readily.** A point is a gate: every step naming it runs
+  alone against every other step naming it. Four points shared across a plan's
+  steps is a plan that runs one step at a time whatever else is true.
+  `doctor` names every point gating three or more steps, with the count.
+  A point is only for what git merges *cleanly and wrongly* — a lockfile, a
+  migration head, a closed list a test asserts on. A file two steps both edit is
+  not one: that is `owns`, and they reconcile at the merge instead of queueing.
 
 **Do not judge a backgrounded run by its exit code.** A detached process comes
 back as `-1  [process exited while detached; exit code unknown]` whether it
@@ -488,8 +573,24 @@ exit 0	passed	S-1	.claude/orch/logs/S-1.jsonl
 exit 1	wrong-model	S-2	.claude/orch/logs/S-2.jsonl
 ```
 
-Read that, then `run record <key> --log <log>`, which harvests the log whatever
-the status says.
+Then `run record <key> --log <log>`, which reads that status file itself and
+holds the log's account against it.
+
+**A run is only recorded as `passed` when three separate witnesses agree**: the
+log, the launcher's status line, and the branch. Any one of them dissenting is
+enough, and `run record` exits non-zero and says which:
+
+- The **status file** says the process was killed or exited non-zero. A run
+  stopped at a bound still holds every event it emitted, and a `step_finish`
+  among them reads as a finished run — which is how one step stopped mid-gate
+  with everything uncommitted was recorded `passed, 19m, 6 files changed`.
+- The **branch has no commit on it.** Whatever the run did is not on the branch,
+  so `join` would merge nothing and `guard` would pass on an empty diff.
+- The **worktree still has uncommitted tracked changes.** The run stopped before
+  it committed.
+
+None of those is a reason to start again. The worktree still holds the work and
+the agent still holds the context — `sendback <key> --why "<what to finish>"`.
 
 ### One step per agent, and never two
 
@@ -549,12 +650,24 @@ re-join in halves. You pay that only when something is genuinely broken.
 
 `run record` reads the log rather than asking what happened: what files were
 written and by how much, which commands failed and what they printed, how much
-transport trouble the run hit, and whether it answered at all. A file the step
-wrote but does not own is reported here, before `guard` runs.
+transport trouble the run hit, and whether it answered at all. It then holds that
+account against the launcher's status file and against the branch — see
+[three witnesses](#6-run) — and exits non-zero if any of them dissents.
 
 **Do not summarise a run into the record yourself.** That is the failure this
 replaces. On the real build, 36 MB across 27 runs became 5,670 characters of
 typed prose and a five-line ledger.
+
+A file the step wrote but does not own is reported here, before `guard` runs, and
+`guard` then separates the two things that used to come out as one sentence:
+
+- **A file another live step owns is a breach.** Two agents wrote it and one of
+  them should not have. `sendback`.
+- **A file nobody owns is almost always a short `owns` list**, not a trespass —
+  the step's own plan or its own proof command required it. `guard` prints the
+  `step own` line for exactly those paths. Read the diff, then widen the step
+  and guard again. Sending correct work back because the list was short costs a
+  whole run and teaches the agent nothing.
 
 ### When a join conflicts, or the joined tree goes red
 
@@ -623,13 +736,31 @@ A round is editable. Cancelling is not deleting — `events.jsonl` is the record
 and a step that once existed is not the same fact as one that never did:
 
 ```bash
-node $ORCH step rm S-2.1.1 S-2.1.2      # cancel, and drop them from what needed them
+node $ORCH step rm S-2.1.1 S-2.1.2      # cancel, and sever the edges into them
 node $ORCH step reset 2.1               # every live step of one plan
 ```
 
 Both refuse a step that has already gone out unless you say `--force`, because a
 worktree and a branch outlive the record; when you do force one, they print the
 `git worktree remove` line, which nothing here runs for you.
+
+**Cancelling has to take the edges into a step out of its dependents' `needs`** —
+a cancelled step never reaches the main line, so anything waiting on it would
+wait for ever. Those edges are **severed, not dropped**: the record keeps them,
+`doctor` lists them, and **recording that key again puts them back**.
+
+That is not bookkeeping. Cancelling eight steps once stripped `needs` from every
+survivor; re-refining brought the same keys back with nothing pointing at them,
+and four steps were one `run open` away from building against a tree that held
+none of the work they were written on top of. `step link` already refuses to
+record half a graph for the same reason — `step rm` was doing it quietly.
+
+If the cancelled work comes back under a *different* key, nothing can restore
+the edge for you. `doctor` keeps naming the severed edge until you do:
+
+```bash
+node $ORCH step add < json     # the dependent, with the needs it should now have
+```
 
 Reach for `reset` when a plan is re-refined after its steps turn out wrong. The
 alternative — editing `state.json` and appending to `events.jsonl` by hand — is
@@ -680,9 +811,16 @@ for exactly the kind of round that gets wider.
   opposite: two steps in one agent run one after the other, two agents run at
   once. It also breaks the chat address, the unit of merge and the run record,
   and none of the three complains.
-- **Do not narrow `owns` to make a step look independent.** A list that is too
-  narrow buys a wider round now and pays for it as a collision nobody sees until
-  the merge. `guard` catches the stray file; it cannot recover the hour.
+- **Do not narrow `owns` to make a step look independent.** Two steps owning one
+  file is not a reason to wait — they reconcile at the merge — so a narrow list
+  buys nothing and pays for itself as a `guard` failure on work that was right.
+  `step own` widens one without re-refining its plan.
+- **Do not reach for `serialises` to be careful.** It is the one thing that
+  really does serialise a round: every step naming a point runs alone against
+  every other step naming it. Four points spread across a plan's steps is a plan
+  that runs one step at a time whatever else is true. A point is only for what
+  git merges *cleanly and wrongly*. `doctor` prices every one that gates three or
+  more steps.
 - **Do not let a thin slice ship a thin brief.** The cost of a wider round is
   that each agent sees less of the whole. Spend some of what you save on
   context.
@@ -727,3 +865,18 @@ for exactly the kind of round that gets wider.
   ten-plan act is roughly 15 MB, and nothing prunes `.claude/orch/logs/`.
 - **Worktrees are named after the project**, beside it. A bare `wt-<key>` in the
   parent directory collides with every other project doing the same thing.
+- **A run is not finished until it has committed.** `run record` checks the
+  branch, not just the log: no commit on it, or tracked changes still sitting in
+  the worktree, and the run is not recorded as passing however well its log
+  reads. Neither is a reason to restart it — `sendback`.
+- **Agents copy the commit idiom they see in `git log`.** The merges this tool
+  writes are the loudest thing there, so a subject that is only a bookkeeping
+  word and a key gets copied onto their own commits, where it describes nothing.
+  The brief says not to, the merge message is now shaped like a merge, and
+  `run record` names any commit that slipped through with the `--amend` line.
+- **Cancelling severs an edge; it does not forget it.** `step rm` has to take a
+  cancelled step out of its dependents' `needs`, and recording that key again
+  puts the edge back. `doctor` names any still lying severed.
+- **`step own` exists so a short `owns` list is not a re-refine.** The registry
+  a step adds one line to and the fixture its proof command regenerates are not
+  in any plan; widening the step is the fix, not sending the work back.

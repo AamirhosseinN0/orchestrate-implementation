@@ -1636,12 +1636,42 @@ function cmdRefineDone(needle, flags) {
     });
     added++;
   }
+  // A task the report names and this cannot record is the one thing that must
+  // not pass quietly. `continue` skipped it and the count printed afterwards
+  // came from the report, which is true of the report whatever the register
+  // ended up holding — so a whole task could be announced and never exist.
+  const unrecordable = (rep.tasks || []).filter((t) => !t || !t.key || !t.owns);
+  if (unrecordable.length) {
+    console.error('✗ ' + unrecordable.length + ' of ' + (rep.tasks || []).length +
+      ' task(s) in the report cannot be recorded: every one needs a key and an owns list.');
+    for (const t of unrecordable.slice(0, 6))
+      console.error('    ' + JSON.stringify(t).slice(0, 120));
+    die('nothing from ' + p.path + ' was recorded. Have the agent fix ' + rel(src) + '.');
+  }
+  const revived = [];
   for (const t of rep.tasks || []) {
-    if (!t.key || !t.owns) continue;
     const ex = (r.tasks ||= []).findIndex((x) => x.key === t.key);
     if (ex >= 0) {
       // re-refining a plan mid-run must not reset a live task's state
       const cur = r.tasks[ex];
+      // It must, however, bring a cancelled one back. Merging the report's
+      // fields into a dead row and reporting success left the task cancelled:
+      // `board` still showed it gone and nothing would hand it out, with the
+      // command having printed the plan as refined. Naming a cancelled key in
+      // a fresh report is a deliberate act — it is what un-cancelling is.
+      //
+      // Except when it was absorbed. `bundle` cancels its members on purpose
+      // and their work now belongs to the chip that took them; quietly
+      // resurrecting one would hand the same work out twice, so that case is
+      // named and refused rather than guessed at.
+      if (cur.status === 'cancelled' && cur.bundledInto)
+        die(cur.key + ' was absorbed into ' + cur.bundledInto + ' and its work belongs to that chip now.\n' +
+            '       A report naming it again would hand the same work out twice. Either key this\n' +
+            '       step differently, or unbundle first.');
+      if (cur.status === 'cancelled') {
+        cur.status = 'planned'; cur.revivedAt = now();
+        revived.push(cur.key);
+      }
       cur.title = t.title || cur.title; cur.plan = p.path; cur.needs = t.needs || cur.needs;
       // widen, never narrow: pre-flight may have extended these since the last refine
       cur.owns = [...new Set([...(cur.owns || []), ...t.owns])];
@@ -1655,9 +1685,20 @@ function cmdRefineDone(needle, flags) {
         status: 'planned', reports: [] });
     }
   }
+  // What the register holds, not what the report claimed. The two were only
+  // ever the same by assumption.
+  const missing = (rep.tasks || []).map((t) => t.key)
+    .filter((k) => !(r.tasks || []).some((x) => x.key === k && !['cancelled', 'landed'].includes(x.status)));
+  if (missing.length) die(missing.length + ' task(s) from ' + p.path + ' did not reach the board: ' + missing.join(' ') +
+    '\n       They were accepted and written, and the register does not hold them as live work.\n' +
+    '       Nothing was committed.');
   commit(r);
   console.log(p.path + ' refined.');
-  console.log('  ' + (rep.tasks || []).length + ' task(s) proposed');
+  // The report's count, then the register's. Only the second one could ever
+  // have caught a task that was announced and never landed on the board.
+  console.log('  ' + (rep.tasks || []).length + ' task(s) proposed, ' +
+    (r.tasks || []).filter((t) => t.status !== 'cancelled').length + ' live in the register');
+  if (revived.length) console.log('  ' + revived.length + ' cancelled task(s) revived by this report: ' + revived.join(', '));
   console.log('  ' + (p.builtOn || []).length + ' existing thing(s) to build on');
   if (added) {
     console.log('\n⚠ ' + added + ' NEW undecided thing(s) found against the real code.');

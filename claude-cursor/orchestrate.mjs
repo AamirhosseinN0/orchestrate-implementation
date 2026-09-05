@@ -200,6 +200,20 @@ const cutFrom = (s, t) => {
     x.openedAt && Date.parse(x.openedAt) >= after);
 };
 
+// What moving these keys onto the main line actually opens up, and what it
+// does not. `join` used to answer this with its own two-line filter — planned,
+// needs me, nothing held — which knows about dependencies and nothing about
+// serialisation points. So it advertised a step, and `run open` then refused
+// the same step for moving a point that open work was already moving: two
+// commands, two different ideas of "can open now", and the one that printed the
+// advice was the one that was not going to enforce it. There is only one such
+// idea now, and it is `frontier`, which is what `run open` is checked against.
+function freedBy(s, keys) {
+  const f = frontier(s);
+  const mine = (x) => (x.needs || []).some((n) => keys.includes(n));
+  return { can: f.accepted.filter(mine), held: f.blocked.filter(({ t }) => mine(t)) };
+}
+
 function waves(s) {
   const ts = tasks(s).filter((t) => t.status !== 'cancelled');
   const placed = new Map(); const out = [];
@@ -247,6 +261,18 @@ function frontier(s) {
 // agent's steps in raw, which put a hole in the one invariant that matters on
 // the path that creates almost every step.
 const LIST_FIELDS = ['needs', 'owns', 'serialises', 'verify', 'context'];
+// Fields the tool keeps about a step, which whoever writes the step does not
+// get to set. `refine done` reads a file an agent wrote: a report carrying
+// `"status": "cancelled"` would merge straight into the record and leave a step
+// off the board while the command printed a tick, and one carrying
+// `"status": "landed"` would claim a proof that never ran. Refused rather than
+// stripped, because a report that says this is a report that has misunderstood
+// what it is writing, and silently ignoring half of it is how the last one got
+// through.
+const KEPT_FIELDS = ['status', 'runs', 'branch', 'worktree', 'chat', 'briefFile', 'briefSha',
+  'openedAt', 'landedAt', 'landedSha', 'joinedAt', 'joinedSha', 'joinAttempts', 'joinError',
+  'cancelledAt', 'revivedAt', 'guardedAt', 'guardedBase', 'guardedFiles', 'severed',
+  'sendbacks', 'conflictedOn', 'conflictedWith', 'model_by'];
 // The number a plan is known by. Steps are keyed from it, which is the whole of
 // what keeps two plans' keys apart, so a plan whose name this cannot read is a
 // round of colliding keys:
@@ -307,6 +333,8 @@ function stepProblems(s, it, existing) {
   if (existing && existing.plan && it.plan && !samePlan(existing.plan, it.plan))
     p.push(`key "${it.key}" already belongs to ${existing.plan} — keys are unique across every plan in the round, so key this one ${keyPrefix(it.plan)}.1, ${keyPrefix(it.plan)}.2 …`);
   for (const f of LIST_FIELDS) if (it[f] !== undefined && !Array.isArray(it[f])) p.push(`${f} must be a list`);
+  for (const f of KEPT_FIELDS) if (it[f] !== undefined)
+    p.push(`sets "${f}", which is the tool's own bookkeeping and not a step's to write — take it out`);
   for (const o of it.owns || []) {
     if (typeof o !== 'string' || !o.trim()) { p.push('owns has an empty entry'); continue; }
     if (/\s[—–]\s|\s--\s/.test(o)) p.push(`owns entry "${o}" is prose, not a path`);
@@ -332,6 +360,52 @@ function needsProblems(s, it, alsoKnown = new Set()) {
   }
   return p;
 }
+// ------------------------------------------------------------ severed edges
+// `step rm` has to take an edge out of a dependent's `needs`: a cancelled step
+// never reaches the main line, so `heldNeeds` would hold everything behind it
+// for ever. Taking it out silently is the other half of that trade and it is
+// the one that cost a round — cancelling eight steps stripped `needs` from the
+// survivors, re-refining brought the same keys back with nothing pointing at
+// them, and four steps were a `run open` away from building against a tree
+// that had none of the work they were written on top of.
+//
+// So the edge is moved rather than dropped. `severed` holds what was taken and
+// which cancellation took it, `restoreSevered` puts it back the moment that key
+// is recorded again, and `doctor` names the ones still lying severed. The rule
+// is the same one `step link` already enforces on itself: half a graph is worse
+// than none, because the half that landed is the harder half to see.
+function severNeeds(s, gone) {
+  const at = new Date().toISOString();
+  const cut = [];
+  for (const t of tasks(s)) {
+    if (gone.has(t.key)) continue;   // a doomed step keeps its own needs
+    const lost = (t.needs || []).filter((n) => gone.has(n));
+    if (!lost.length) continue;
+    t.needs = t.needs.filter((n) => !gone.has(n));
+    t.severed ||= [];
+    for (const n of lost) if (!t.severed.some((x) => x.key === n)) t.severed.push({ key: n, at });
+    cut.push({ key: t.key, lost });
+  }
+  return cut;
+}
+// What the tool took out, the tool puts back. Called wherever a key comes back
+// onto the board, so reviving a cancelled step is not a quieter way of deleting
+// every edge that pointed at it.
+function restoreSevered(s, key) {
+  const back = [];
+  for (const t of tasks(s)) {
+    if (!(t.severed || []).some((x) => x.key === key)) continue;
+    t.severed = t.severed.filter((x) => x.key !== key);
+    if (!t.severed.length) delete t.severed;
+    if (!(t.needs || []).includes(key)) (t.needs ||= []).push(key);
+    back.push(t.key);
+  }
+  return back;
+}
+// Edges still lying severed, with what became of the step at the other end.
+const severedEdges = (s) => tasks(s).filter((t) => !DEAD_STATUS.includes(t.status))
+  .flatMap((t) => (t.severed || []).map((x) => ({ t, lost: x.key, dep: depOf(s, x.key), at: x.at })));
+
 // Two steps sharing a file is not a reason to refuse the record — it only means
 // they cannot be open at the same time, which is `check`'s business and
 // `run open`'s gate. Refusing here would make refining impossible the moment
@@ -357,14 +431,21 @@ function putStep(s, it) {
     // again is a deliberate act, and merging fields into a dead record while
     // reporting success left it dead: `board` still showed it cancelled and
     // `run open` refused it, with nothing having said so. Recording it again is
-    // what un-cancels it, unless the record itself says to stay cancelled.
-    if (existing.status === 'cancelled' && it.status === undefined) {
+    // what un-cancels it, full stop. There used to be an exception for a record
+    // that carried its own `status`, which is the one shape that must never
+    // reach here at all — `stepProblems` refuses the whole step for it now, so
+    // the exception could only ever have fired on the case it was protecting.
+    if (existing.status === 'cancelled') {
       existing.status = 'planned';
       delete existing.cancelledAt;
       existing.revivedAt = new Date().toISOString();
     }
     Object.assign(existing, it);
   } else s.tasks.push(merged);
+  // Reviving a key restores the edges its cancellation severed, whether it came
+  // back through `step add` or through a second `refine done`. Cheap to run
+  // unconditionally: a key nothing was severed against finds nothing.
+  restoreSevered(s, it.key);
   return null;
 }
 function reportOverlaps(s, keys) {
@@ -750,7 +831,49 @@ function vetBatch(s, list) {
 
 CMDS.step = (argv) => {
   const s = readState();
-  const usage = 'step add < json | step link [--dry-run] [--only-shared] | step rm <key>… [--force] | step reset <plan> [--force]';
+  const usage = 'step add < json | step own <key> <path>… [--remove] | step link [--dry-run] [--only-shared] | ' +
+    'step rm <key>… [--force] | step reset <plan> [--force]';
+
+  // A refined `owns` list comes out short on shared ground far more often than
+  // it comes out long, and always in the same place: the registry the step has
+  // to add one line to, the migration journal its own migration writes, the
+  // seed file its own proof command touches. Each of those is work that was
+  // correct, failing `guard` on a list nobody could have written from the plan
+  // alone. The alternative was re-refining the whole plan to add one path.
+  //
+  // Widening ownership is a decision, so it is recorded like one, judged by the
+  // same gate `step add` uses, and it says at once what it now collides with.
+  if (argv[0] === 'own') {
+    const remove = argv.includes('--remove');
+    const rest = argv.slice(1).filter((a) => a !== '--remove');
+    const key = rest.shift();
+    if (!key || !rest.length) die('step own <key> <path>… [--remove]');
+    const t = getTask(s, key);
+    if (DEAD_STATUS.includes(t.status)) die(`${key} is ${t.status} — nothing is going to write those files`);
+    const probs = stepProblems(s, { key, owns: rest }, t);
+    if (probs.length) { for (const p of probs) console.error('✗ ' + p); process.exit(1); }
+    const before = (t.owns || []).map(norm);
+    if (remove) {
+      const absent = rest.filter((o) => !before.includes(norm(o)));
+      if (absent.length) die(`${key} does not own ${absent.join(', ')} — nothing to remove`);
+      t.owns = (t.owns || []).filter((o) => !rest.some((r) => norm(r) === norm(o)));
+    } else {
+      const added = rest.filter((o) => !before.includes(norm(o)));
+      if (!added.length) { ok(`${key} already owns all of those`); return; }
+      t.owns = [...(t.owns || []), ...added];
+    }
+    // The brief already in the agent's hands was written from the old list, and
+    // `doctor` will say so. Saying it here is what stops the round going out on
+    // instructions nobody revised.
+    commit(s, 'step own', argv);
+    ok(`${key} now owns ${(t.owns || []).length} path(s): ${(t.owns || []).join(' ')}`);
+    if (t.briefSha && OPEN_STATUSES.includes(t.status)) {
+      console.log(`\n  ⚠ ${key} is ${t.status} and its brief was written from the old list.`);
+      console.log(`     Rewrite it and tell the agent:  node ${SELF()} run open ${key} --rebrief`);
+    }
+    reportOverlaps(s, [key]);
+    return;
+  }
 
   // Plans are refined all at once, so when an agent writes its report the steps
   // of the plans it comes after usually do not exist yet and it cannot name
@@ -830,6 +953,17 @@ CMDS.step = (argv) => {
     // code alone never learned the ✗ line above had printed.
     if (!added.length) { ok('nothing to add — every plan already waits on what it says it comes after'); if (unknown.length) process.exit(1); return; }
     for (const a of added) console.log('  ' + a);
+    // What those edges cost, in the only unit that matters here. The
+    // cross-product is the safe default and it is also the one that turns a
+    // round into a queue, and until this printed there was nothing to notice
+    // that by: `check` shows a frontier either way.
+    {
+      const prof = waves(s).filter((w) => w.wave !== -1).map((w) => w.tasks.length);
+      console.log(`\n  With these, the round runs in ${prof.length} wave(s): ${prof.join(' → ')}`);
+      if (!onlyShared && prof.length > 2)
+        console.log('  `step link --only-shared --dry-run` shows the same thing with only the edges\n' +
+                    '  where two steps actually meet. It is usually far fewer, and far wider.');
+    }
     if (dry) { console.log(`\n${added.length} link(s) — not recorded (--dry-run)`); if (unknown.length) process.exit(1); return; }
     // A requires: chain that loops is a mistake in the plans, and recording it
     // would leave a register no wave can be built from.
@@ -864,20 +998,21 @@ CMDS.step = (argv) => {
     // existed and a step that never did are not the same fact.
     for (const t of doomed) { t.status = 'cancelled'; t.cancelledAt = new Date().toISOString(); }
     const gone = new Set(doomed.map((t) => t.key));
-    const orphaned = [];
-    for (const t of tasks(s)) {
-      if (gone.has(t.key) || !(t.needs || []).some((n) => gone.has(n))) continue;
-      t.needs = t.needs.filter((n) => !gone.has(n));
-      orphaned.push(t.key);
-    }
+    const cut = severNeeds(s, gone);
     commit(s, 'step ' + argv[0], argv);
     ok(`${doomed.length} step(s) cancelled: ${doomed.map((t) => t.key).join(' ')}`);
     // "Dropped from the needs of" reads as bookkeeping. What actually happened
     // is that `check` was correctly holding these back on work that has not
     // landed — cancelling the prerequisite does not satisfy it, and a dependent
     // that opens now is opening on a hole its author never got to fill.
-    if (orphaned.length) console.log(`  ${orphaned.length} step(s) unblocked, but not because their dependency landed — it was ` +
-      `cancelled instead: ${orphaned.join(' ')}`);
+    if (cut.length) {
+      console.log(`\n  ${cut.length} step(s) unblocked, but not because their dependency landed — it was`);
+      console.log('  cancelled instead. Those edges are severed, not forgotten:');
+      for (const c of cut) console.log(`    ${c.key.padEnd(12)} no longer needs ${c.lost.join(', ')}`);
+      console.log('  Recording any of those keys again puts its edges back, so re-refining a');
+      console.log('  cancelled plan does not leave a dependent opening on a hole. Until then');
+      console.log('  `doctor` names them, and nothing else waits on that work.');
+    }
     const leftovers = doomed.filter((t) => t.worktree);
     if (leftovers.length) {
       console.log(`\n${leftovers.length} of them had a worktree. Nothing here removes it — do it by hand:`);
@@ -898,11 +1033,22 @@ CMDS.step = (argv) => {
     process.exit(1);
   }
   const wasCancelled = new Set(list.map((it) => it && it.key).filter((k) => k && depOf(s, k)?.status === 'cancelled'));
+  const restored = [];
+  for (const it of list) restored.push(...restoreSevered(s, it.key).map((k) => `${k} needs ${it.key} again`));
   for (const it of list) putStep(s, it);
+  // What the board holds, not what the batch claimed. See `refine done`.
+  const missing = list.map((it) => it.key).filter((k) => { const t = depOf(s, k); return !t || DEAD_STATUS.includes(t.status); });
+  if (missing.length) die(`${missing.length} step(s) did not reach the board: ${missing.join(' ')}\n` +
+    '  They were judged and written, and the register does not hold them as live work.\n' +
+    '  Nothing was committed.', 1);
   commit(s, 'step add', argv);
-  ok(`${list.length} step(s) recorded. ${tasks(s).length} in the register.`);
+  ok(`${list.length} step(s) recorded. ${tasks(s).filter((t) => t.status !== 'cancelled').length} live in the register.`);
   const revived = [...wasCancelled].filter((k) => depOf(s, k)?.status !== 'cancelled');
   if (revived.length) console.log(`  ${revived.length} of them were cancelled and are revived by this: ${revived.join(' ')}`);
+  if (restored.length) {
+    console.log(`  ${restored.length} dependency edge(s) that cancelling them took out are back:`);
+    for (const r of restored) console.log('    ' + r);
+  }
   reportOverlaps(s, list.map((it) => it.key));
 };
 
@@ -1042,7 +1188,9 @@ CMDS.check = () => {
       const n = f.unblocks(t.key);
       console.log('  ' + t.key.padEnd(10) + (t.tier || '—').padEnd(10) + String(t.title || '').slice(0, 46) + (n ? `   → unblocks ${n}` : ''));
     }
-    console.log('\nOpen all of them. Opening one at a time is the slowest thing this can do.');
+    console.log('\nOpen all of them, in one command. Opening one at a time is the slowest thing');
+    console.log(`this can do, and it is what happens when it takes ${f.accepted.length} commands to start a round:`);
+    console.log(`  node ${SELF()} run open --all`);
   } else console.log('Nothing new can open right now.');
   if (f.merges.length) {
     console.log(`\n${f.merges.length} pair(s) share files. They still run together — whichever`);
@@ -1060,6 +1208,28 @@ CMDS.check = () => {
   // main line for a dependent to be cut from it. Saying "land" here described
   // the gate as it was before joining was enough.
   if (f.waiting.length) console.log('\nWaiting on work to reach the main line: ' + f.waiting.map((t) => t.key).join('  '));
+  // The shape of the whole graph, not just its first row. A round that opens
+  // one step at a time looks identical from here to a round that opens twelve —
+  // both print a frontier — and the difference is the difference between a day
+  // and a week. Nothing said it, so nothing was ever done about it: the profile
+  // is what makes "this is a queue, not a round" visible while the register can
+  // still be changed.
+  const prof = waves(s).filter((w) => w.wave !== -1);
+  if (prof.length > 1) {
+    const live = tasks(s).filter((t) => !DEAD_STATUS.includes(t.status)).length;
+    console.log(`\nThe shape of it: ${live} live step(s) in ${prof.length} wave(s) — ` +
+      prof.map((w) => w.tasks.length).join(' → '));
+    // Judged on the average width, not on the widest wave: an 18-step round
+    // that opens 3 and then 2 at a time for eight more waves is a queue, and a
+    // rule that looked only at its widest row would have called it a round.
+    if (prof.length >= 4 && live / prof.length < 2.5) {
+      console.log('  That is a queue, not a round. Before opening it, look at why:');
+      console.log('    `step link` without --only-shared gives every step of a plan a need on every');
+      console.log('    step of the plan it comes after — with two steps each that is four edges');
+      console.log('    where one is real. `step link --only-shared --dry-run` shows the difference.');
+      console.log('    `doctor` names any serialisation point gating three or more steps.');
+    }
+  }
   process.exit(bad ? 1 : 0);
 };
 
@@ -1102,6 +1272,21 @@ CMDS.board = () => {
 const MAX_STEPS_PER_PLAN = 2;
 const planSlug = (p) => String(p).replace(/[^A-Za-z0-9]+/g, '-').replace(/^-|-$/g, '');
 const refineReport = (p) => sub('refine', planSlug(p) + '.json');
+// Loaded plans other than this one that the working tree has changed. Only
+// tracked, committed plans can be judged — an untracked plan has no committed
+// text to differ from, and a repo that is not a repo cannot answer at all, so
+// both cases come back empty rather than guessing.
+function strayPlanEdits(s, mine) {
+  let changed;
+  // `git diff --name-only HEAD`, not `status --porcelain`: porcelain puts a
+  // two-column status code in front of every path, and `sh` trims its output,
+  // so the leading space of the first line's " M path" is eaten and every
+  // fixed-offset slice of that one line is off by one. This form has no status
+  // column to lose, and it already covers staged and unstaged alike.
+  try { changed = new Set(shq('git', ['diff', '--name-only', 'HEAD', '--']).split('\n').filter(Boolean).map(norm)); }
+  catch { return []; }   // no HEAD to diff against, or not a repo at all
+  return (s.plans || []).map((p) => p.path).filter((p) => !samePlan(p, mine) && changed.has(norm(slashes(p))));
+}
 
 CMDS.refine = (argv) => {
   const [what, plan] = argv;
@@ -1124,6 +1309,12 @@ ${pre}
 Read it in full, then read the code it talks about. Your job is to make the plan
 match the repository as it actually is — not to design anything new, and not to
 decide anything the plan deliberately left open.
+
+${rec.path} is the only file you may edit. Other plans are being refined at the
+same time by other agents; a change you make to one of those is a change its own
+agent will overwrite or contradict, and steps you key off text in it describe a
+round that will not exist. A report is refused whole if the working tree shows
+another plan changed.
 
 Do two things:
 
@@ -1165,19 +1356,44 @@ Do two things:
    \`needs\` names step keys, never plan ids. A key that is not a step in this
    round is refused.
 
-   \`owns\` is the important one. Two steps that own the same file cannot run at
-   the same time, so a list that is too narrow causes a collision nobody sees
-   until the merge. List what the step will actually write, including tests and
-   generated files.
+   \`owns\` is the important one, and it comes out short far more often than it
+   comes out long. Every file the step writes has to be on it or the work is
+   refused after the fact, on a diff, by a check the agent doing it never saw.
+   Walk it deliberately rather than copying the paths the plan happens to name:
 
-   \`serialises\` is the one that gets spelled six different ways. Use these
-   exact words for anything on this list:
+     · the source files the plan names, and the tests for them;
+     · anything your \`verify\` command WRITES — a snapshot it updates, a seed or
+       fixture it regenerates, a coverage or build artefact it leaves behind;
+     · the shared registry, barrel, index or manifest you have to add one line
+       to for your own work to be reachable at all;
+     · anything generated as a side effect of what you do: a migration file AND
+       the journal or lock beside it, a generated client, a schema snapshot.
+
+   The last three are the ones that get missed every time, because they are not
+   in the plan — they are in the repository's own habits. Go and look.
+
+   Two steps owning one file is fine and is not a reason to trim the list: they
+   build in separate worktrees and reconcile at the merge. A list that is too
+   narrow has no upside at all.
+
+   \`serialises\` is the opposite: put as little on it as you can defend. It is
+   a gate, not a note — every step naming a point runs alone against every other
+   step naming it, so a point across five steps is five rounds instead of one.
+   It is ONLY for something git merges cleanly and gets WRONG: a lockfile, a
+   migration head, a closed list a test asserts on exactly. A file two steps
+   both edit is not one of those — that is \`owns\`, and the merge sorts it out.
+   If you cannot say what a clean merge of it would break, leave it off.
+
+   When you do name one, use these exact words:
 
 ${vocabulary().map((v) => '     · ' + v).join('\n')}
 
    Invent a name only for something genuinely not on it, and then spell it the
    way the plan spells it. Two steps moving one shared thing are only held apart
-   when they call it the same name.
+   when they call it the same name. Where two steps move genuinely separate
+   instances of one kind of thing — a migration directory per package, a
+   lockfile per workspace — scope the name: "migration head: orders". Those run
+   at the same time; two bare names do not.
 
 Report the file written, not a summary in your reply.`);
     return;
@@ -1194,6 +1410,49 @@ Report the file written, not a summary in your reply.`);
     // than that is an agent carving up work that was already small enough.
     if (steps.length > MAX_STEPS_PER_PLAN) die(`the report splits ${rec.path} into ${steps.length} steps; ${MAX_STEPS_PER_PLAN} is the most a plan may become.
   Have the agent merge them and rewrite ${relCwd(f)}.`);
+    // A refining agent is told to edit one plan. Nothing checked that it did.
+    // One rewrote nine of them in a single run and keyed steps off text that
+    // was then reverted, so the register described plans that no longer said
+    // any of it — and `refine done` had already printed a tick for each.
+    // The other plans' diffs are the evidence, and they are read here, while
+    // the report can still be refused whole.
+    if (!argv.includes('--allow-plan-edits')) {
+      const touched = strayPlanEdits(s, rec.path);
+      if (touched.length) {
+        console.error(`✗ refining ${rec.path} also changed ${touched.length} plan(s) it was not given:`);
+        for (const p of touched) console.error('    ' + p);
+        console.error('\n  A refining agent edits its own plan and nothing else. Steps keyed off text');
+        console.error('  in somebody else\'s plan describe a round that will not exist once that plan');
+        console.error('  is refined by the agent it belongs to.');
+        console.error('\n  Look at what it did, then either revert those plans:');
+        console.error('    git checkout -- ' + touched.join(' '));
+        console.error(`  or, if the edits are right and you mean to keep them, say so:\n    node ${SELF()} refine done ${plan} --allow-plan-edits`);
+        console.error(`\nNothing from ${rec.path} was recorded.`);
+        process.exit(1);
+      }
+    }
+    // Keys belong to the plan they came out of. `stepProblems` catches a key
+    // another plan already holds; this catches the one it cannot see — a key
+    // claiming the namespace of a plan whose own steps have not been recorded
+    // yet, which is how a report registers work under a plan it was never
+    // given.
+    const mine = keyPrefix(rec.path);
+    const poached = [];
+    for (const it of steps) {
+      const k = String(it && it.key || '');
+      for (const other of s.plans || []) {
+        if (samePlan(other.path, rec.path)) continue;
+        const pre = keyPrefix(other.path);
+        if (pre !== mine && (k === pre || k.startsWith(pre + '.'))) poached.push([k, other.path, pre]);
+      }
+    }
+    if (poached.length) {
+      console.error(`✗ the report keys ${poached.length} step(s) into another plan's numbering:`);
+      for (const [k, p, pre] of poached) console.error(`    "${k}" is ${pre}…, which belongs to ${p}`);
+      console.error(`\n  Every step of ${rec.path} is keyed ${mine}.1, ${mine}.2. Have the agent`);
+      console.error(`  rewrite ${relCwd(f)}. Nothing was recorded.`);
+      process.exit(1);
+    }
     // Every step goes through the same gate as a hand-written one. The old
     // driver merged refined steps in raw, which put a hole in the one invariant
     // that matters on the path that creates almost every step. It is judged
@@ -1208,13 +1467,32 @@ Report the file written, not a summary in your reply.`);
       console.error(`\nNothing from ${rec.path} was recorded. Have the agent fix ${relCwd(f)} and run this again.`);
       process.exit(1);
     }
+    const restored = [];
+    for (const it of stamped) restored.push(...restoreSevered(s, it.key).map((k) => `${k} needs ${it.key} again`));
     for (const it of stamped) putStep(s, it);
     rec.refined = new Date().toISOString();
     rec.openQuestions = rep.openQuestions || [];
+    // A tick is a claim about the board, so it is read off the board. `refine
+    // done` used to print "✓ 1 step(s) recorded" from the report it had just
+    // read, which is true of the report whatever happened to the register: a
+    // key that came back still cancelled was announced as recorded three times
+    // running while the total beside it — the one number that would have said
+    // otherwise — sat unchanged at 18.
+    const missing = stamped.map((it) => it.key).filter((k) => {
+      const t = depOf(s, k);
+      return !t || DEAD_STATUS.includes(t.status);
+    });
+    if (missing.length) die(`${missing.length} step(s) from ${rec.path} did not reach the board: ${missing.join(' ')}\n` +
+      '  They were judged and written, and the register does not hold them as live work.\n' +
+      '  This is a fault in the tool, not in the report — nothing was committed. Say so with `events`.', 1);
     commit(s, 'refine done', argv);
     // The count that would have caught three plans overwriting each other is
     // the register's, not the report's. The report's number was always right.
     ok(`${steps.length} step(s) from ${rec.path}: ${steps.map((t) => t.key).join(' ')}  (${tasks(s).filter((t) => t.status !== 'cancelled').length} in the register)`);
+    if (restored.length) {
+      console.log(`\n  ${restored.length} dependency edge(s) that cancelling these took out are back:`);
+      for (const r of restored) console.log('    ' + r);
+    }
     // Refining rewrites its plan, and nothing used to say what it changed.
     try {
       const stat = shq('git', ['diff', '--stat', '--', rec.path]);
@@ -1243,17 +1521,212 @@ const sh = (cmd, args, opts = {}) => execFileSync(cmd, args, { encoding: 'utf8',
 // For probes that are expected to fail: their complaint is not the user's news.
 const shq = (cmd, args) => sh(cmd, args, { stdio: ['pipe', 'pipe', 'ignore'] });
 
+// How the launcher says the run ended, which is the one thing the log cannot
+// say about itself. Both launchers write the same four tab-separated fields on
+// every exit path, including the ones that die early:
+//
+//     exit 1<TAB>timeout<TAB>S-022.1<TAB>.claude/orch/logs/S-022.1.jsonl
+//
+// A backgrounded, detached run comes back as exit -1 whatever it did, so this
+// file is the only place the process's own ending survives.
+const statusFile = (key) => path.join(ORCH, 'runs', String(key) + '.status');
+function runStatus(key) {
+  const file = statusFile(key);
+  if (!fs.existsSync(file)) return null;
+  const line = String(fs.readFileSync(file, 'utf8')).split('\n').filter(Boolean).pop() || '';
+  const [ex, outcome, k, log] = line.split('\t');
+  if (!outcome) return null;
+  return { file, exit: String(ex || '').replace(/^exit\s*/, '').trim(), outcome: outcome.trim(), key: k, log };
+}
+// What the branch actually holds, asked of git rather than of the run's own
+// account of itself. Three separate facts, because they fail separately: a run
+// that committed nothing, a run that left work uncommitted, and the subjects of
+// whatever it did commit.
+function branchWork(t) {
+  if (!t.branch) return { error: `${t.key} has no branch — it was never opened` };
+  const base = guessBase();
+  try { shq('git', ['rev-parse', '--verify', t.branch]); }
+  catch { return { error: `${t.branch} does not exist — nothing was opened, or it was removed` }; }
+  let subjects = [];
+  try { subjects = shq('git', ['log', '--format=%s', `${base}..${t.branch}`]).split('\n').filter(Boolean); }
+  catch { return { error: `could not read ${base}..${t.branch}` }; }
+  let dirty = [];
+  if (t.worktree && fs.existsSync(t.worktree)) {
+    // Tracked changes only, and never this tool's own state directory: an
+    // untracked build directory is not an unfinished run.
+    try {
+      dirty = shq('git', ['-C', t.worktree, 'status', '--porcelain', '--', ':!.claude'])
+        .split('\n').filter((l) => l.trim() && !l.startsWith('??'));
+    } catch { /* a worktree git cannot read is reported by the branch checks above */ }
+  }
+  return { commits: subjects.length, subjects, dirty, base };
+}
+
+// Everything opening a step actually does: cut its worktree, mint its address,
+// write its brief, mark it out. Lifted out of `run open` so that opening one
+// step and opening the whole round are the same code — the round path used not
+// to exist, and one call per step is how a round that could run wide ran narrow.
+// Nothing here commits: the caller does, once, whether it opened one or nine.
+function openOne(s, t) {
+  const key = t.key;
+  const row = tierOf(t.tier);
+  t.branch = t.branch || `step/${key}`;
+  // Beside the project, named after it. A bare `wt-<key>` in the parent
+  // directory collides with every other project doing the same thing, and the
+  // second one to try inherits a worktree pointing at somebody else's repo.
+  const wtRoot = process.env.CURSOR_ORCH_WT || path.resolve(CWD, '..');
+  t.worktree = t.worktree || path.join(wtRoot, `${path.basename(CWD)}-wt-${key}`);
+  let justCreated = false;
+  if (!fs.existsSync(t.worktree)) {
+    try { sh('git', ['worktree', 'add', t.worktree, '-b', t.branch]); justCreated = true; }
+    catch (e) { return { error: `could not make a worktree at ${t.worktree}\n  ${String(e.stderr || e.message).trim()}` }; }
+  } else {
+    // Something is already there. If git does not know about it, it is not a
+    // worktree of this repo and opening onto it would write into a stranger.
+    // `git worktree list` always prints forward slashes; `t.worktree` was
+    // built with `path.join`, which on Windows prints backslashes — so this
+    // could never match there, and re-opening a step after any interruption
+    // died on the "not a worktree of this repo" branch every time.
+    const known = (() => { try { return slashes(shq('git', ['worktree', 'list'])).toLowerCase().includes(slashes(t.worktree).toLowerCase()); } catch { return false; } })();
+    if (!known) return { error: `${t.worktree} already exists and is not a worktree of this repo.\n` +
+      `  Move it, or if it is stale: git worktree remove ${t.worktree}` };
+  }
+  // Cursor needs an address before it has a conversation, so one is minted
+  // here. opencode puts `sessionID` on every event, so the address does not
+  // exist until the run does and is read out of the log afterwards — minting
+  // one would be inventing an id nothing will answer to.
+  t.runner = runnerOf(s);
+  if (t.runner === 'cursor' && !t.chat) {
+    // Unlike the worktree add above, this used to have no try/catch at all: a
+    // missing `agent` binary threw a raw stack trace straight past `commit()`,
+    // leaving a branch and a worktree on disk with nothing in the record to say
+    // so — `doctor` never mentions either. If this call made the worktree
+    // itself, undo that; if the worktree already existed (a retry), leave it
+    // and just say how to pick it up.
+    try { t.chat = sh('bash', [path.join(HERE, 'scripts', 'cursor-chat.sh')]); }
+    catch (e) {
+      const msg = String(e.stderr || e.message).trim();
+      if (justCreated) {
+        try { execFileSync('git', ['worktree', 'remove', '--force', t.worktree], { stdio: 'ignore' }); } catch { /* best effort */ }
+        try { execFileSync('git', ['branch', '-D', t.branch], { stdio: 'ignore' }); } catch { /* best effort */ }
+        return { error: `could not start a chat for ${key}: ${msg}\n  The worktree and branch this call made were removed. Nothing was recorded.` };
+      }
+      return { error: `could not start a chat for ${key}: ${msg}\n` +
+        `  Its worktree at ${t.worktree} is still there — fix the runner and \`run open ${key}\` again,\n` +
+        `  or remove it by hand: git worktree remove ${t.worktree}` };
+    }
+  }
+  const brief = sub('briefs', key + '.md');
+  fs.writeFileSync(brief, briefText(s, t, row));
+  t.briefFile = relCwd(brief);
+  // What the brief was written from. A step whose owns or verify changed
+  // afterwards is holding an agent to instructions nobody has revised.
+  t.briefSha = sha(JSON.stringify([t.owns, t.serialises, t.verify, t.needs, t.title, t.plan]));
+  t.status = 'open'; t.openedAt = new Date().toISOString();
+  const launcher = shortest(path.join(HERE, 'scripts', 'run.sh'));
+  return { launch: `  bash ${launcher} \\\n` +
+    `    --runner ${t.runner} --role chip --tier ${t.tier} --key ${key} --workspace ${t.worktree} \\\n` +
+    (t.chat ? `    --chat ${t.chat} ` : '    ') + `--prompt-file ${t.briefFile}` };
+}
+
 CMDS.run = (argv) => {
   const [what, key] = argv;
   const flag = (n) => { const i = argv.indexOf(n); return i === -1 ? null : argv[i + 1]; };
   const s = readState();
 
+  // Opening the whole round in one command, because opening it one step at a
+  // time is what actually happened. Every other part of this tool says to open
+  // the full set — `check` prints it, `run open` counts what was left behind —
+  // and then the only way to act on that was N invocations, each one a round
+  // trip, each one printing its own launcher line to be collected by hand. The
+  // set that can go is computed here already: `frontier().accepted` is exactly
+  // it, and it is checked against itself as well as against open work, which is
+  // what makes opening all of it at once safe.
+  if (what === 'open' && (key === '--all' || argv.includes('--all'))) {
+    if (key && key !== '--all')
+      die(`run open --all opens everything that can go; naming ${key} as well says two different things.\n  Drop one of them.`);
+    const f = frontier(s);
+    if (!f.accepted.length) {
+      console.log('Nothing new can open right now.');
+      if (f.blocked.length) {
+        console.log(`\n${f.blocked.length} step(s) are held by a serialisation point open work is moving:`);
+        for (const { t, why } of f.blocked) for (const { o, i } of why) console.log(`  ${t.key} ↔ ${o.key}: ${i.points.join('; ')}`);
+      }
+      if (f.waiting.length) console.log('\nWaiting on work to reach the main line: ' + f.waiting.map((t) => t.key).join(' '));
+      if (!f.blocked.length && !f.waiting.length && !f.open.length)
+        console.log('  Nothing is planned, open or waiting — this round is done.');
+      // Non-zero for "opened nothing", which is what a caller in a loop needs
+      // to know. The lines above say whether that is a round finished or a
+      // round held.
+      process.exit(1);
+    }
+    const noModel = f.accepted.filter((t) => !t.tier);
+    if (noModel.length) die(`${noModel.length} of them have no model yet: ${noModel.map((t) => t.key).join(' ')}\n  Run \`assess\` first — opening half a round is not opening it.`);
+    const lines = [];
+    for (const t of f.accepted) {
+      const r = openOne(s, t);
+      if (r.error) {
+        // Whatever opened before this did make a worktree and a branch, and
+        // those outlive the process. Recording them first is what keeps the
+        // register and the disk in step — dying with them unrecorded would
+        // leave `doctor` unable to mention either.
+        if (lines.length) commit(s, 'run open --all (partial)', argv);
+        die(`${t.key} could not open: ${r.error}\n` +
+          (lines.length
+            ? `  ${lines.length} step(s) opened before it and ARE recorded: ${f.accepted.slice(0, lines.length).map((x) => x.key).join(' ')}\n` +
+              '  Launch those, fix this, and run `run open --all` again for the rest.'
+            : '  Nothing was opened.'));
+      }
+      lines.push(r.launch);
+    }
+    commit(s, 'run open --all', argv);
+    ok(`${f.accepted.length} step(s) open: ${f.accepted.map((t) => t.key).join(' ')}`);
+    const outFile = sub('launch', new Date().toISOString().replace(/[:.]/g, '-') + '.txt');
+    fs.writeFileSync(outFile, lines.join('\n\n') + '\n');
+    console.log(`\nLaunch every one of them NOW, as its own backgrounded call, all in one`);
+    console.log(`message. Not a loop that waits on each in turn — that is the same round`);
+    console.log(`run end to end, and it is the single most expensive thing to get wrong here.`);
+    console.log(`\nAlso written to ${relCwd(outFile)}:\n`);
+    for (const l of lines) console.log(l + '\n');
+    if (f.merges.length) {
+      console.log(`${f.merges.length} pair(s) of them share files — they still run together, and`);
+      console.log('whichever lands second reconciles:');
+      for (const m of f.merges) console.log('  ' + m.a.padEnd(10) + '↔ ' + m.b + '  ' + m.files.join('; '));
+    }
+    if (f.blocked.length) {
+      console.log(`\n${f.blocked.length} step(s) stayed back on a serialisation point this round is moving:`);
+      for (const { t, why } of f.blocked) for (const { o, i } of why) console.log(`  ${t.key} ↔ ${o.key}: ${i.points.join('; ')}`);
+      console.log('  They open as soon as the step holding the point lands.');
+    }
+    return;
+  }
+
   if (what === 'open') {
     const t = getTask(s, key);
+    // A step whose `owns` or `verify` changed after it went out is holding an
+    // agent to instructions nobody revised — `doctor` says so, and this is how
+    // it is answered without cancelling the run.
+    if (argv.includes('--rebrief')) {
+      if (!OPEN_STATUSES.includes(t.status)) die(`${key} is ${t.status} — there is no agent holding a brief to replace`);
+      const bf = sub('briefs', key + '.md');
+      fs.writeFileSync(bf, briefText(s, t, tierOf(t.tier)));
+      t.briefFile = relCwd(bf);
+      t.briefSha = sha(JSON.stringify([t.owns, t.serialises, t.verify, t.needs, t.title, t.plan]));
+      commit(s, 'run open --rebrief', argv);
+      ok(`${key}'s brief rewritten at ${t.briefFile}`);
+      console.log('  It is a file on disk, not something the running agent re-reads. Send it:');
+      console.log(`    node ${SELF()} sendback ${key} --why "Your brief changed. Re-read ${t.briefFile} before going further."`);
+      return;
+    }
     if (t.status !== 'planned') die(`${key} is already ${t.status}`);
     if (!t.tier) die(`${key} has no model yet — run \`assess\` first`);
     const held = heldNeeds(s, t);
     if (held.length) die(`${key} needs ${held.join(', ')} on the main line first`);
+    // Edges `step rm` took out of this step's needs and nothing put back. The
+    // dependency was cancelled rather than landed, so nothing waited for it —
+    // which is right when that work is genuinely gone, and is a hole when it
+    // came back under another key.
+    const cutOff = (t.severed || []).map((x) => ({ ...x, dep: depOf(s, x.key) }));
     // Opened off a merge that has not been proven. Worth saying every time,
     // because it is what the send-back will have to work around if that merge
     // turns out to be wrong.
@@ -1266,66 +1739,21 @@ CMDS.run = (argv) => {
         '  git merges these cleanly and gets them wrong, so they go one at a time.');
     }
     const willReconcile = openTasks(s, key).map((o) => ({ o, m: willMerge(t, o) })).filter((x) => x.m);
-    const row = tierOf(t.tier);
-    t.branch = t.branch || `step/${key}`;
-    // Beside the project, named after it. A bare `wt-<key>` in the parent
-    // directory collides with every other project doing the same thing, and the
-    // second one to try inherits a worktree pointing at somebody else's repo.
-    const wtRoot = process.env.CURSOR_ORCH_WT || path.resolve(CWD, '..');
-    t.worktree = t.worktree || path.join(wtRoot, `${path.basename(CWD)}-wt-${key}`);
-    let justCreated = false;
-    if (!fs.existsSync(t.worktree)) {
-      try { sh('git', ['worktree', 'add', t.worktree, '-b', t.branch]); justCreated = true; }
-      catch (e) { die(`could not make a worktree at ${t.worktree}\n  ${String(e.stderr || e.message).trim()}`); }
-    } else {
-      // Something is already there. If git does not know about it, it is not a
-      // worktree of this repo and opening onto it would write into a stranger.
-      // `git worktree list` always prints forward slashes; `t.worktree` was
-      // built with `path.join`, which on Windows prints backslashes — so this
-      // could never match there, and re-opening a step after any interruption
-      // died on the "not a worktree of this repo" branch every time.
-      const known = (() => { try { return slashes(shq('git', ['worktree', 'list'])).toLowerCase().includes(slashes(t.worktree).toLowerCase()); } catch { return false; } })();
-      if (!known) die(`${t.worktree} already exists and is not a worktree of this repo.\n` +
-        `  Move it, or if it is stale: git worktree remove ${t.worktree}`);
-    }
-    // Cursor needs an address before it has a conversation, so one is minted
-    // here. opencode puts `sessionID` on every event, so the address does not
-    // exist until the run does and is read out of the log afterwards — minting
-    // one would be inventing an id nothing will answer to.
-    t.runner = runnerOf(s);
-    if (t.runner === 'cursor' && !t.chat) {
-      // Unlike the worktree add three lines up, this used to have no try/catch
-      // at all: a missing `agent` binary threw a raw stack trace straight past
-      // `commit()`, leaving a branch and a worktree on disk with nothing in the
-      // record to say so — `doctor` never mentions either. If this call made
-      // the worktree itself, undo that; if the worktree already existed (a
-      // retry), leave it and just say how to pick it up.
-      try { t.chat = sh('bash', [path.join(HERE, 'scripts', 'cursor-chat.sh')]); }
-      catch (e) {
-        const msg = String(e.stderr || e.message).trim();
-        if (justCreated) {
-          try { execFileSync('git', ['worktree', 'remove', '--force', t.worktree], { stdio: 'ignore' }); } catch { /* best effort */ }
-          try { execFileSync('git', ['branch', '-D', t.branch], { stdio: 'ignore' }); } catch { /* best effort */ }
-          die(`could not start a chat for ${key}: ${msg}\n  The worktree and branch this call made were removed. Nothing was recorded.`);
-        }
-        die(`could not start a chat for ${key}: ${msg}\n` +
-          `  Its worktree at ${t.worktree} is still there — fix the runner and \`run open ${key}\` again,\n` +
-          `  or remove it by hand: git worktree remove ${t.worktree}`);
-      }
-    }
-    const brief = sub('briefs', key + '.md');
-    fs.writeFileSync(brief, briefText(s, t, row));
-    t.briefFile = relCwd(brief);
-    // What the brief was written from. A step whose owns or verify changed
-    // afterwards is holding an agent to instructions nobody has revised.
-    t.briefSha = sha(JSON.stringify([t.owns, t.serialises, t.verify, t.needs, t.title, t.plan]));
-    t.status = 'open'; t.openedAt = new Date().toISOString();
+    const r = openOne(s, t);
+    if (r.error) die(r.error);
     commit(s, 'run open', argv);
     const rm = runnerModel(s, t.tier);
     ok(`${key} is open on ${rm.detail}`);
     if (!rm.verifiable) {
       console.log('  Its log will not name the model that answered, so the record says what was');
       console.log('  asked for and is marked unverified.');
+    }
+    if (cutOff.length) {
+      const alive = cutOff.filter((x) => x.dep && !DEAD_STATUS.includes(x.dep.status));
+      console.log(`  ⚠ it once needed ${cutOff.map((x) => x.key).join(', ')}, and cancelling those cut the edge.`);
+      console.log(`     Nothing waited for that work, because nothing landed it. If any of it came`);
+      console.log(`     back under a different key, this step is opening on a hole.`);
+      if (alive.length) console.log(`     ${alive.map((x) => x.key).join(', ')} is live again and still not needed here — that is the case to look at.`);
     }
     if (unproven.length) {
       console.log(`  built on ${unproven.join(', ')} — merged, not yet proven. Its worktree is`);
@@ -1339,10 +1767,7 @@ CMDS.run = (argv) => {
     console.log(`  worktree  ${t.worktree}\n  branch    ${t.branch}` +
       (t.chat ? `\n  chat      ${t.chat}` : `\n  session   (opencode mints one; it is read back out of the log)`) +
       `\n  brief     ${t.briefFile}`);
-    const launcher = shortest(path.join(HERE, 'scripts', 'run.sh'));
-    console.log(`\nLaunch it in the background:\n  bash ${launcher} \\\n` +
-      `    --runner ${t.runner} --role chip --tier ${t.tier} --key ${key} --workspace ${t.worktree} \\\n` +
-      (t.chat ? `    --chat ${t.chat} ` : '    ') + `--prompt-file ${t.briefFile}`);
+    console.log(`\nLaunch it in the background:\n${r.launch}`);
     // Opening one at a time is the slowest thing this can do, and it is easy to
     // do by accident — one `run open` reads like progress. So the ones still
     // waiting are counted here rather than left for somebody to run `check`.
@@ -1351,6 +1776,7 @@ CMDS.run = (argv) => {
       console.log(`\n⚠ ${more.length} more step(s) can open right now and are not: ${more.map((x) => x.key).join(' ')}`);
       console.log('  Open them in this same round. A shared serialisation point is the only');
       console.log('  reason to hold one back, and none of these shares one with open work.');
+      console.log(`  All of them at once, in one command:  node ${SELF()} run open --all`);
     }
     return;
   }
@@ -1387,27 +1813,93 @@ CMDS.run = (argv) => {
     // is learned. `chat` is the one address field for either runner, which is
     // what lets `sendback` resume without knowing which one it is talking to.
     if (rec.session && !t.chat) t.chat = rec.session;
+    // The log is one witness and it is the credulous one. A run the launcher
+    // had to kill at its wall-clock limit still holds every event it managed to
+    // emit, and a `step_finish` among them reads as a finished run — which is
+    // how a step stopped mid-gate with everything uncommitted was recorded
+    // `passed, 19m, 6 files changed` while its own status file said `exit 1
+    // timeout` and its branch held nothing at all.
+    //
+    // So the record is the worst of what three independent witnesses say: the
+    // log, the launcher's status line, and the branch. Anything less than all
+    // three agreeing is not a pass.
+    const doubts = [];
+    const st = runStatus(key);
+    if (st && st.outcome !== 'passed') doubts.push({ outcome: st.outcome,
+      why: `the launcher recorded "${st.outcome}" (exit ${st.exit}) in ${relCwd(st.file)}` });
+    else if (st && st.exit && st.exit !== '0') doubts.push({ outcome: 'failed',
+      why: `the launcher recorded exit ${st.exit} in ${relCwd(st.file)}` });
+    else if (!st && !flag('--json')) doubts.push({ outcome: null,
+      why: `no status file at ${relCwd(statusFile(key))} — this run was not started through the launcher, so how the process ended is not recorded anywhere` });
+    // What the branch has. A run that finished and did not commit did not
+    // finish: `join` would merge nothing, `guard` would pass on an empty diff,
+    // and the step would land as done having produced no work.
+    const w = branchWork(t);
+    if (w.error) doubts.push({ outcome: null, why: w.error });
+    else {
+      if (!w.commits) doubts.push({ outcome: 'no-commit',
+        why: `${t.branch} has no commit on it — whatever the run did is not on the branch` });
+      if (w.dirty.length) doubts.push({ outcome: 'uncommitted',
+        why: `${w.dirty.length} uncommitted path(s) left in ${t.worktree} — the run stopped before it committed` });
+    }
+    const worse = doubts.map((d) => d.outcome).filter(Boolean);
+    const outcome = rec.outcome === 'passed' && worse.length ? worse[0] : rec.outcome;
+    rec.outcome = outcome;
+    if (doubts.length) rec.doubts = doubts.map((d) => d.why);
     t.runs ||= [];
     const n = t.runs.length + 1;
     const out = sub('runs', key, n + '.json');
     fs.writeFileSync(out, JSON.stringify(rec, null, 2) + '\n');
-    t.runs.push({ n, at: new Date().toISOString(), outcome: rec.outcome, seconds: rec.seconds,
+    t.runs.push({ n, at: new Date().toISOString(), outcome, seconds: rec.seconds,
       files: (rec.files || []).length, model: rec.model, record: relCwd(out) });
-    t.status = rec.outcome === 'passed' ? 'reported' : t.status;
+    t.status = outcome === 'passed' ? 'reported' : t.status;
     // A run that died is a fact about the run, recorded where it can be seen —
     // not something for somebody to notice in a log tail and type in later.
-    if (rec.outcome !== 'passed') {
-      (s.notes ||= []).push({ at: new Date().toISOString(), key, kind: rec.outcome,
-        text: rec.trouble?.tail || `run ${n} ended ${rec.outcome}` });
+    if (outcome !== 'passed') {
+      (s.notes ||= []).push({ at: new Date().toISOString(), key, kind: outcome,
+        text: rec.trouble?.tail || doubts.map((d) => d.why).join('; ') || `run ${n} ended ${outcome}` });
     }
     commit(s, 'run record', argv);
-    ok(`${key} run ${n}: ${rec.outcome}, ${Math.round((rec.seconds || 0) / 60)}m, ${(rec.files || []).length} file(s) changed`);
+    const say = outcome === 'passed' ? ok : (m) => console.log('✗ ' + m);
+    say(`${key} run ${n}: ${outcome}, ${Math.round((rec.seconds || 0) / 60)}m, ${(rec.files || []).length} file(s) changed`);
+    if (worse.length) console.log(`  Its log says "passed". It is recorded as "${outcome}" because:`);
+    else if (doubts.length) console.log('  Worth knowing about this run:');
+    for (const d of doubts) console.log('    · ' + d.why);
+    if (worse.length) {
+      console.log(`  ${key} stays ${t.status}. Resume the agent that was doing it rather than`);
+      console.log(`  starting again — its worktree still holds the work:`);
+      console.log(`    node ${SELF()} sendback ${key} --why "<what to finish>"`);
+    }
+    // A commit named for what the orchestrator does with a branch, rather than
+    // for what the branch did. Agents read `git log`, and the merge commits this
+    // tool writes are the loudest thing in it — so the idiom gets copied back
+    // into their own commits, where it says nothing about the change.
+    // Anchored to the whole subject, not just its first word. `Merge branch
+    // 'main' into step/S-1` is the reconciliation `sendback --why conflict`
+    // asks for and is exactly right; what is wrong is a subject that is only a
+    // bookkeeping verb and a key, describing nothing.
+    const idiom = (w.subjects || []).filter((x) =>
+      new RegExp('^(land|join|merge)\\s+(step\\s+)?' + key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '[\\s.:;,—–-]*$', 'i').test(x.trim()));
+    if (idiom.length) {
+      console.log(`\n⚠ ${idiom.length} commit(s) on ${t.branch} are named for the merge, not for the change:`);
+      for (const x of idiom.slice(0, 6)) console.log('    ' + x);
+      console.log('    "land <key>" is this tool\'s own merge message. Amend before joining:');
+      console.log(`      git -C ${t.worktree} commit --amend -m "<what the change does>"`);
+    }
     // Files it wrote that it does not own. The log knows this; no second diff.
     const stray = (rec.files || []).map((f) => f.path).filter((p) => !(t.owns || []).some((o) => collides(o, p)));
     if (stray.length) {
       console.log(`\n⚠ ${stray.length} file(s) written that ${key} does not own:`);
       for (const p of stray.slice(0, 12)) console.log('    ' + p);
+      console.log(`  If the step really has to write them — a registry it adds a line to, the`);
+      console.log(`  journal its own migration writes, a fixture its proof command regenerates —`);
+      console.log(`  widen it rather than sending correct work back:`);
+      console.log(`    node ${SELF()} step own ${key} ${stray.slice(0, 12).join(' ')}`);
     }
+    // Recorded either way — the record is the point — but the exit code says
+    // what was recorded. A caller that reads only the code used to be told a
+    // timed-out run had gone in fine.
+    if (outcome !== 'passed') process.exit(1);
     return;
   }
   die('run open <key> | run record <key> --log <file>');
@@ -1443,7 +1935,12 @@ function briefText(s, t, row) {
   for (const o of t.owns || []) L.push(`  - ${o}`);
   L.push('', `Anything outside that list is another step's, and two steps writing one`,
          `file is the single failure this arrangement cannot survive. If you believe`,
-         `you need a file you do not own, stop and say so instead of taking it.`, '');
+         `you need a file you do not own, stop and say so instead of taking it.`, '',
+         `Say it as early as you notice, not at the end. A shared registry you have`,
+         `to add one line to, the journal your own migration writes, a fixture your`,
+         `proof command regenerates — those are ordinary and they are usually just`,
+         `missing from the list, not forbidden. Naming the path and why is what gets`,
+         `it added; writing it anyway is what gets correct work sent back.`, '');
   if ((t.serialises || []).length) {
     L.push(`## Shared ground`, '', `You move these, which other steps also depend on — change them once,`, `deliberately:`, '');
     for (const x of t.serialises) L.push(`  - ${x}`);
@@ -1454,9 +1951,21 @@ function briefText(s, t, row) {
     for (const v of t.verify) L.push(`  ${v}`);
     L.push('');
   }
-  L.push(`## Finishing`, '', `Commit on ${t.branch}. Your final answer should say what you changed, what`,
-         `you ran, and what came back. Do not add any co-author or generated-by`,
-         `trailer to the commit.`, '');
+  L.push(`## Finishing`, '',
+         `Commit on ${t.branch}, and leave nothing uncommitted. Work still sitting in`,
+         `the worktree is work that will not be merged: your branch is what gets read,`,
+         `not your reply. If you are running out of room, commit what is finished`,
+         `first and say what is left.`, '',
+         `Write the commit message for the change, in the ordinary way — a short line`,
+         `saying what the code now does. Do NOT write "land ${t.key}" or "merge`,
+         `${t.key}" or anything else shaped like a step key. Those are the`,
+         `orchestrator's own merge messages, which is why you will see them in`,
+         `\`git log\` on the main line; copying that idiom into your own commit puts a`,
+         `bookkeeping word where the description of the change should be, and it has`,
+         `to be amended by hand before your branch can go in.`, '',
+         `Do not add any co-author or generated-by trailer to the commit.`, '',
+         `Your final answer should say what you changed, what you ran, and what came`,
+         `back.`, '');
   L.push(`Everything about this run — the files you touched, the commands you ran and`,
          `their exit codes — is read out of your own log afterwards, so you do not`,
          `need to restate it. Say what a person could not read off a diff: what you`,
@@ -1464,29 +1973,30 @@ function briefText(s, t, row) {
   return L.join('\n') + '\n';
 }
 
+// The default branch, not "main" flatly — a repo with no remote has no
+// origin/HEAD to ask, and a repo that calls its trunk something else is not
+// wrong. Each fallback is tried in turn and the last one is a guess named as
+// such by the error if it is also absent.
+//
+// What the repo's own branches say has to win over what `init.defaultBranch`
+// merely prefers — Git for Windows ships that config set to "master" in its own
+// gitconfig, so on a `main` repo it out-voted the branch that actually exists
+// and `guard` died diffing a ref nothing pointed to. And every candidate is
+// verified with `rev-parse` before it is returned: a config value or a stray
+// local branch name is worth nothing if it does not resolve.
+function guessBase() {
+  const verified = (v) => { if (!v) return null; try { shq('git', ['rev-parse', '--verify', v]); return v; } catch { return null; } };
+  for (const fn of [
+    () => shq('git', ['symbolic-ref', '--short', 'refs/remotes/origin/HEAD']).split('/').pop(),
+    () => (shq('git', ['branch', '--format=%(refname:short)']).split('\n').find((b) => b === 'main' || b === 'master')),
+    () => shq('git', ['config', '--get', 'init.defaultBranch']),
+  ]) { try { const v = verified(fn()); if (v) return v; } catch { /* try the next */ } }
+  return 'main';
+}
+
 CMDS.guard = (argv) => {
   const s = readState();
   const t = getTask(s, argv[0]);
-  // The default branch, not "main" flatly — a repo with no remote has no
-  // origin/HEAD to ask, and a repo that calls its trunk something else is not
-  // wrong. Each fallback is tried in turn and the last one is a guess named as
-  // such by the error if it is also absent.
-  //
-  // What the repo's own branches say has to win over what `init.defaultBranch`
-  // merely prefers — Git for Windows ships that config set to "master" in its
-  // own gitconfig, so on a `main` repo it out-voted the branch that actually
-  // exists and `guard` died diffing a ref nothing pointed to. And every
-  // candidate is verified with `rev-parse` before it is returned: a config
-  // value or a stray local branch name is worth nothing if it does not resolve.
-  const guessBase = () => {
-    const verified = (v) => { if (!v) return null; try { shq('git', ['rev-parse', '--verify', v]); return v; } catch { return null; } };
-    for (const fn of [
-      () => shq('git', ['symbolic-ref', '--short', 'refs/remotes/origin/HEAD']).split('/').pop(),
-      () => (shq('git', ['branch', '--format=%(refname:short)']).split('\n').find((b) => b === 'main' || b === 'master')),
-      () => shq('git', ['config', '--get', 'init.defaultBranch']),
-    ]) { try { const v = verified(fn()); if (v) return v; } catch { /* try the next */ } }
-    return 'main';
-  };
   const base = argv.includes('--base') ? argv[argv.indexOf('--base') + 1] : guessBase();
   let changed;
   try { changed = sh('git', ['diff', '--name-only', `${base}...${t.branch}`]).split('\n').filter(Boolean); }
@@ -1496,8 +2006,35 @@ CMDS.guard = (argv) => {
   commit(s, 'guard', argv);
   console.log(`${changed.length} file(s) changed on ${t.branch} against ${base}`);
   for (const p of changed) console.log('  ' + ((t.owns || []).some((o) => collides(o, p)) ? ' ' : '✗') + ' ' + p);
-  if (stray.length) { console.error(`\n✗ ${stray.length} file(s) it does not own. Send it back.`); process.exit(1); }
-  ok('everything it touched, it owns');
+  if (!stray.length) { ok('everything it touched, it owns'); return; }
+  // Two different faults used to come out as one sentence. A file another live
+  // step owns is a trespass: two agents wrote it, one of them was not supposed
+  // to, and sending it back is right. A file nobody owns is almost always the
+  // opposite — the step's own plan or its own proof command required it to
+  // write there, and the refined `owns` list was short. That happened three
+  // times in one round, on shared registries every time, and each was correct
+  // work failed by a list nobody could have written from the plan alone.
+  const owners = (p) => tasks(s).filter((x) => x.key !== t.key && !DEAD_STATUS.includes(x.status) &&
+    (x.owns || []).some((o) => collides(o, p))).map((x) => x.key);
+  const trespass = stray.map((p) => ({ p, who: owners(p) })).filter((x) => x.who.length);
+  const unclaimed = stray.filter((p) => !owners(p).length);
+  console.error(`\n✗ ${stray.length} file(s) it does not own.`);
+  if (trespass.length) {
+    console.error(`\n  ${trespass.length} of them belong to another live step. That is the breach this whole`);
+    console.error('  arrangement exists to prevent — send it back:');
+    for (const { p, who } of trespass) console.error(`    ${p}  —  ${who.join(', ')} owns it`);
+    console.error(`    node ${SELF()} sendback ${t.key} --why "You wrote ${trespass[0].p}, which belongs to ${trespass[0].who[0]}. Revert it."`);
+  }
+  if (unclaimed.length) {
+    console.error(`\n  ${unclaimed.length} of them belong to nobody. Read the diff before sending anything back:`);
+    for (const p of unclaimed) console.error('    ' + p);
+    console.error('  A registry the step adds one line to, the journal its own migration writes, a');
+    console.error('  fixture its proof command regenerates — none of those come out of a plan, and');
+    console.error('  the work is right. Widen it and guard again:');
+    console.error(`    node ${SELF()} step own ${t.key} ${unclaimed.join(' ')}`);
+    console.error('  Only send it back if it had no business writing them.');
+  }
+  process.exit(1);
 };
 
 CMDS.land = (argv) => {
@@ -1531,10 +2068,10 @@ CMDS.land = (argv) => {
   }
   commit(s, 'land', argv);
   ok(ts.length === 1 ? `${ts[0].key} landed` : `${ts.length} step(s) landed: ${keys.join(' ')}`);
-  const freed = tasks(s).filter((x) => x.status === 'planned' &&
-    (x.needs || []).some((n) => inBatch.has(n)) && heldNeeds(s, x).length === 0);
-  if (freed.length) console.log(`  frees: ${freed.map((x) => x.key).join(' ')} — run \`check\` and open everything it names.`);
+  const { can, held } = freedBy(s, keys);
+  if (can.length) console.log(`  frees: ${can.map((x) => x.key).join(' ')} — open every one of them, in one round:\n    node ${SELF()} run open --all`);
   else console.log('  run `check`: a landing usually widens what can open.');
+  if (held.length) console.log(`  held back on a serialisation point open work is moving: ${held.map((x) => x.t.key).join(' ')}`);
 };
 
 // -------------------------------------------------------------------- the slot
@@ -1995,6 +2532,47 @@ CMDS.doctor = () => {
     console.log(`✗ ${contended.length} serialisation point(s) held by more than one open step:`);
     for (const v of contended) console.log(`    ${v.map((x) => x.key).join(' ↔ ')}: "${v[0].spelling}"`);
   }
+  // A point is a gate, and a gate across N steps costs N-1 rounds of
+  // wall-clock. It is the right price for a lockfile and the wrong one for a
+  // file that merely gets edited twice, and a refining agent that reaches for
+  // the vocabulary too readily turns a round that could run wide into a queue —
+  // which is exactly what it looks like from the outside: `check` names one
+  // step, over and over, and nothing says why the other forty are not running.
+  // So the price is printed with the name on it.
+  {
+    const wide = [...pts.entries()].map(([, v]) => v).filter((v) => v.length >= 3)
+      .sort((a, b) => b.length - a.length);
+    if (wide.length) {
+      console.log(`· ${wide.length} serialisation point(s) gate three or more steps — each is a queue:`);
+      for (const v of wide) console.log(`    ${String(v.length).padStart(2)}×  "${v[0].spelling}"  —  ${v.map((x) => x.key).join(' ')}`);
+      console.log('    Those steps go one at a time, however little else they share. A point is');
+      console.log('    for what git merges cleanly and gets wrong — a lockfile, a migration head,');
+      console.log('    a closed list a test asserts on. A file two steps both edit is not one:');
+      console.log('    that is `owns`, and they reconcile at the merge instead of queueing.');
+      console.log('    Where two of them genuinely move separate things, scope the name:');
+      console.log('    "migration head: orders" against "migration head: billing".');
+    }
+  }
+  // Edges `step rm` took out and nothing put back. The tool removed them, so
+  // the tool is the one that has to keep saying so until somebody decides.
+  {
+    const cut = severedEdges(s);
+    const alive = cut.filter((x) => x.dep && !DEAD_STATUS.includes(x.dep.status));
+    if (alive.length) {
+      bad += alive.length;
+      console.log(`✗ ${alive.length} dependency edge(s) were severed and the step at the other end is live again:`);
+      for (const x of alive) console.log(`    ${x.t.key} once needed ${x.lost}, which is ${x.dep.status} — and is not in its needs`);
+      console.log('    Recording that key again restores the edge. This is the tool failing to,');
+      console.log(`    and it opens ${alive[0].t.key} on work nothing is waiting for.`);
+    }
+    const dead = cut.filter((x) => !alive.includes(x));
+    if (dead.length) {
+      console.log(`· ${dead.length} dependency edge(s) were severed by a cancellation and never restored:`);
+      for (const x of dead) console.log(`    ${x.t.key} no longer needs ${x.lost} (cancelled)`);
+      console.log('    Right if that work is genuinely gone. If it came back under another key,');
+      console.log(`    say so: \`step add\` with the needs it should have, and nothing else changes.`);
+    }
+  }
 
   // Things worth knowing that are nobody's fault: a directory a step will
   // create, a plan edited by hand, a step that owns nothing yet.
@@ -2038,7 +2616,13 @@ function mergeOne(s, t) {
   const before = shq('git', ['rev-parse', 'HEAD']);
   let conflicted = [], failed = false, errMsg = '';
   try {
-    execFileSync('git', ['merge', '--no-ff', t.branch, '-m', `land ${t.key}`],
+    // Shaped like a merge, because it is one. It used to read `land S-4`, which
+    // is the orchestrator's word for its own bookkeeping and reads like an
+    // ordinary commit subject — and agents read `git log` to learn a project's
+    // conventions, so they copied it onto their own commits, where it says
+    // nothing about the change and had to be amended before joining.
+    execFileSync('git', ['merge', '--no-ff', t.branch, '-m',
+      `Merge step ${t.key}` + (t.title ? ` — ${t.title}` : '')],
       { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] });
   } catch (e) {
     failed = true;
@@ -2137,11 +2721,17 @@ function joinBatch(s, argv) {
   console.log('  Red:   the batch does not say which branch did it. Bisect from the');
   console.log(`         recorded base:  git reset --hard ${before}  then re-join in halves.`);
   console.log(`         The order is recorded: ${merged.map((t) => t.key).join(' → ')}`);
-  // Everything the batch put on the main line may already be built on.
-  const nowFree = tasks(s).filter((x) => x.status === 'planned' && heldNeeds(s, x).length === 0 &&
-    (x.needs || []).some((n) => merged.some((t) => t.key === n)));
-  if (nowFree.length) {
-    console.log(`\n  ${nowFree.length} step(s) can open off this batch now: ${nowFree.map((x) => x.key).join(' ')}`);
+  // Everything the batch put on the main line may already be built on — but
+  // only what `run open` will actually take. See `freedBy`.
+  const { can, held } = freedBy(s, merged.map((t) => t.key));
+  if (can.length) {
+    console.log(`\n  ${can.length} step(s) can open off this batch now: ${can.map((x) => x.key).join(' ')}`);
+    console.log(`    node ${SELF()} run open --all`);
+  }
+  if (held.length) {
+    console.log(`\n  ${held.length} step(s) this frees still cannot open — a serialisation point open`);
+    console.log('  work is already moving:');
+    for (const { t: x, why } of held) for (const { o, i } of why) console.log(`    ${x.key} ↔ ${o.key}: ${i.points.join('; ')}`);
   }
   if (failed.length) process.exit(1);
 }
@@ -2182,12 +2772,16 @@ CMDS.join = (argv) => {
   // it — that is the whole point of not waiting for the proof. Say it here,
   // where the merge just happened, rather than leaving it for `land`.
   if (OPEN_AT_JOIN) {
-    const freed = tasks(s).filter((x) => x.status === 'planned' &&
-      (x.needs || []).includes(t.key) && heldNeeds(s, x).length === 0);
-    if (freed.length) {
-      console.log(`\n  This merge is on HEAD, so ${freed.length} step(s) can open now without waiting`);
-      console.log(`  for the suite: ${freed.map((x) => x.key).join(' ')}`);
-      console.log('  Open them, then run the suite beside them. `check` names the full set.');
+    const { can, held } = freedBy(s, [t.key]);
+    if (can.length) {
+      console.log(`\n  This merge is on HEAD, so ${can.length} step(s) can open now without waiting`);
+      console.log(`  for the suite: ${can.map((x) => x.key).join(' ')}`);
+      console.log(`    node ${SELF()} run open --all`);
+    }
+    if (held.length) {
+      console.log(`\n  ${held.length} step(s) this frees still cannot open — they move a serialisation`);
+      console.log('  point open work is already moving:');
+      for (const { t: x, why } of held) for (const { o, i } of why) console.log(`    ${x.key} ↔ ${o.key}: ${i.points.join('; ')}`);
     }
   }
 };
@@ -2280,11 +2874,14 @@ const HELP = `orchestrate — plan to merged code, on Cursor, opencode or Claude
   refine brief <plan>       the prompt for a refining agent
   refine done <plan>        read its report; records the steps it found
   step add < json           record steps by hand, in one batch or not at all
-  step rm <key>…            cancel a step, and drop it from what needed it
+  step own <key> <path>…    widen what a step may write, without re-refining it
+  step rm <key>…            cancel a step; the edges into it are severed, not lost
   step link [--only-shared] turn each plan's requires: into needs between steps
   step reset <plan>         cancel every live step of one plan
   check                     which steps can open together, and what blocks the rest
-  run open <key>            worktree, chat, brief — everything a step needs to start
+  run open --all            open every step that can go, in one round. The usual form.
+  run open <key>            worktree, chat, brief — everything one step needs to start
+  run open <key> --rebrief  rewrite the brief of a step already out
   run record <key> --log L  harvest a finished run into the record
   guard <key>               did it touch anything it does not own
   join <key>                merge it into the main line; says when it conflicts

@@ -4339,23 +4339,26 @@ sect(() => {
   run(['assess', 'propose'], JSON.stringify([{ key: 'S-1', tier: 'medium', why: 'test' }]));
 
   // --- a tier picks a model AND an effort ---------------------------------
-  ok('the default tier resolves to Sonnet reaching',
-    mrun(['resolve', '--runner', 'claude', 'medium']).out.trim() === 'claude-sonnet-5\tclaude-sonnet-5\thigh',
+  // The default tier is Opus here, not the cheaper model — ordinary work gets
+  // the better model at a deliberately low effort. That is the whole shape of
+  // this ladder and the thing most likely to be "tidied" back by mistake.
+  ok('the default tier resolves to Opus at a deliberately low effort',
+    mrun(['resolve', '--runner', 'claude', 'medium']).out.trim() === 'claude-opus-5\tclaude-opus-5\tlow',
     mrun(['resolve', '--runner', 'claude', 'medium']).out);
-  // The rung above it swaps the model rather than the dial, so the effort goes
-  // DOWN while the ladder goes up. A test that assumed effort climbs with tier
-  // would be asserting the opposite of what this ladder says.
-  ok('and the rung above it swaps Sonnet reaching for Opus unhurried',
-    mrun(['resolve', '--runner', 'claude', 'high']).out.trim() === 'claude-opus-5\tclaude-opus-5\tmedium',
-    mrun(['resolve', '--runner', 'claude', 'high']).out);
-  ok('and the top of the ladder is Opus at the top effort',
-    mrun(['resolve', '--runner', 'claude', 'xhigh']).out.trim() === 'claude-opus-5\tclaude-opus-5\txhigh',
+  ok('a light tier is where the cheaper model lives',
+    mrun(['resolve', '--runner', 'claude', 'low']).out.trim() === 'claude-sonnet-5\tclaude-sonnet-5\tmedium',
+    mrun(['resolve', '--runner', 'claude', 'low']).out);
+  // Five tiers, three rungs: the dial stops climbing before the ladder does.
+  ok('and the top two tiers are one rung, not two',
+    mrun(['resolve', '--runner', 'claude', 'high']).out.trim() === 'claude-opus-5\tclaude-opus-5\tmedium' &&
+    mrun(['resolve', '--runner', 'claude', 'xhigh']).out.trim() === 'claude-opus-5\tclaude-opus-5\tmedium',
     mrun(['resolve', '--runner', 'claude', 'xhigh']).out);
   ok('the cursor ladder is untouched by any of it',
     mrun(['resolve', 'high']).out.startsWith('cursor-grok-4.6-high'), mrun(['resolve', 'high']).out);
   const eff = mrun(['efforts', '--runner', 'claude']);
-  ok('and the table says which tiers collapsed onto one effort',
-    has(eff.out, 'claude-sonnet-5') && has(eff.out, 'claude-opus-5') && has(eff.out, 'same effort here'), eff.out);
+  ok('and the table names BOTH collapses rather than implying a reach',
+    has(eff.out, 'composer and low are the same model at the same effort') &&
+    has(eff.out, 'high and xhigh are the same model at the same effort'), eff.out);
 
   // --- the run is checked against the model that answered -----------------
   // opencode cannot do this — its log names no model. Claude Code's does, in
@@ -4371,6 +4374,19 @@ sect(() => {
   const show = run(['runner']);
   ok('and it says which model each tier gets',
     has(show.out, 'claude-sonnet-5') && has(show.out, 'claude-opus-5'), show.out);
+
+  // A notch up the tier ladder that lands on the same model at the same effort
+  // is arithmetic, not a reach. `assess critical` does the arithmetic, so it is
+  // the thing that has to say when the move is empty.
+  run(['step', 'add'], JSON.stringify([
+    { key: 'S-hub', title: 'hub', plan: 'docs/1-a.md', owns: ['src/hub.ts'] },
+    { key: 'S-a', title: 'a', plan: 'docs/1-a.md', owns: ['src/x.ts'], needs: ['S-hub'] },
+    { key: 'S-b', title: 'b', plan: 'docs/1-a.md', owns: ['src/y.ts'], needs: ['S-a'] },
+    { key: 'S-c', title: 'c', plan: 'docs/1-a.md', owns: ['src/z.ts'], needs: ['S-b'] }]));
+  run(['assess', 'propose'], JSON.stringify([{ key: 'S-hub', tier: 'high', why: 'hub' }]));
+  const crit = run(['assess', 'critical']);
+  ok('a notch that lands on the same rung is named as buying nothing',
+    has(crit.out, 'change nothing') && has(crit.out, 'high → xhigh'), crit.out);
 
   const open = run(['run', 'open', 'S-1']);
   ok('a step opens on it', open.code === 0, open.out);
@@ -5313,7 +5329,7 @@ else console.log('\nsandboxes kept: ' + boxes.join('\n                '));
 // the suite still ends on "all green", because green is only ever measured
 // against however many checks happened to run. Under a shard the total is the
 // runner's to check, since no one process sees them all.
-const EXPECTED = 988;   // every check above counts; raise it deliberately when you add one
+const EXPECTED = 989;   // every check above counts; raise it deliberately when you add one
 const total = pass + failures.length;
 const partial = Boolean(SHARD || ONLY);
 

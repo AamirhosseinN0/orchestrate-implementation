@@ -141,11 +141,11 @@ Steps run on one of three CLIs, and the choice is made once for the whole round
 >   ✕ Each step costs more and takes longer, and on a wide round that is the
 >     whole round's bill.
 > · **Claude**
->   ✓ Sonnet takes the ordinary steps and Opus the hard ones, each thinking as
->     hard as its rung asks, and every run is checked against the model that
->     answered.
->   ✕ The two hardest rungs are the priciest work here, so a wide round that
->     lands on them is the largest bill of the three.
+>   ✓ Opus builds anything ordinary or harder, kept at a low reasoning setting
+>     so it stays quick, and every run is checked against the model that
+>     actually answered it.
+>   ✕ Opus on most of the round is the largest bill of the three, and the
+>     cheaper model only takes the steps you mark as light.
 > · **DeepSeek**
 >   ✓ Cheaper and faster, and one dial sets how hard it thinks.
 >   ✕ Nothing records which model answered, so a quiet drop to a weaker one
@@ -153,9 +153,10 @@ Steps run on one of three CLIs, and the choice is made once for the whole round
 
 Recommend Cursor unless the user has already said that cost or speed is the
 constraint. The ladder is the reason: it is what lets an easy step be cheap
-without leaving a hard one underpowered. Claude is the same argument with two
-models instead of five and a reasoning dial on top; reach for it when the round
-is small enough that Opus on its hard steps is worth paying for.
+without leaving a hard one underpowered. Claude trades that spread for a
+stronger model on almost every step — reach for it when the plans are well
+defined enough that what a step needs is a good model rather than a long
+think.
 
 Then set it:
 
@@ -193,19 +194,21 @@ Two models across the five tiers, and the tier chooses the effort as well:
 |---|---|---|---|
 | `composer` | Sonnet 5 | `medium` | mechanical work, no judgement |
 | `low` | Sonnet 5 | `medium` | verification, and light or well-specified work |
-| `medium` | Sonnet 5 | `high` | the default — ordinary feature work |
+| `medium` | Opus 5 | `low` | the default — ordinary feature work |
 | `high` | Opus 5 | `medium` | genuinely hard work |
-| `xhigh` | Opus 5 | `xhigh` | the top of the ladder only |
+| `xhigh` | Opus 5 | `medium` | the same rung as `high` — nothing sits above it |
 
-**The effort column is not sorted, and that is the point.** The model changes
-under it: Sonnet climbs to `high` at the default tier, and the rung above hands
-over to Opus at `medium` rather than pushing Sonnet harder. Going from `medium`
-to `high` turns the effort down and the model up — a stronger model taking its
-time, instead of a weaker one straining.
+**Five tiers, three rungs, and the dial is held down on purpose.** Against a
+well-defined plan a higher effort mostly buys wall clock: every step in a wide
+round paying again for reasoning the plan already did. So this ladder spends on
+the model and stops climbing early — `composer` and `low` are one rung, `high`
+and `xhigh` are another, and `assess` names both collapses rather than letting a
+row imply a reach that is not there.
 
-`composer` and `low` are the same model at the same effort. That collapse is
-real — moving a step between them changes nothing — and `assess` prints it
-rather than leaving it to be discovered.
+**`medium` is the default tier, so ordinary work runs on Opus here**, not on the
+cheaper model. Sonnet is what a step gets by being assessed *down* to `low` or
+`composer` — which on this runner is a real decision about cost rather than a
+formality, and the reason to make it deliberately.
 
 Two things this runner has that DeepSeek does not:
 

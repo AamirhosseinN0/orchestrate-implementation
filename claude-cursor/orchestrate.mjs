@@ -1259,6 +1259,20 @@ CMDS.assess = (argv) => {
     }
     if (frozen.length) console.log(`\n${frozen.length} row(s) left alone because you set them: ${frozen.map((r) => r.t.key).join(' ')}`);
     if (!moves.length) { console.log('\nNothing to change — every step is already at the tier its position argues for.'); return; }
+    // A notch is only worth taking if it lands somewhere else. On a runner
+    // whose ladder collapses two tiers onto one rung — Claude's `high` and
+    // `xhigh` are the same model at the same effort — the arithmetic above is
+    // still right and the move is still empty, and the row would read as a
+    // reach that never happens. Say which ones those are before they are spent.
+    const idle = moves.filter((r) => {
+      const a = runnerModel(s, r.t.tier), b = runnerModel(s, tiers[r.want]);
+      return a.model === b.model && a.effort === b.effort;
+    });
+    if (idle.length) {
+      console.log(`\n${idle.length} of those land on the same rung on ${runnerOf(s)} and change nothing:`);
+      for (const r of idle) console.log(`    ${r.t.key}  ${r.t.tier} → ${tiers[r.want]}   (both ${runnerModel(s, r.t.tier).detail})`);
+      console.log('    Taking them costs nothing either — the tier is recorded, the run is the same.');
+    }
     if (!apply) {
       console.log(`\n${moves.length} row(s) would move. Nothing written — run \`assess critical --apply\` to take them.`);
       return;

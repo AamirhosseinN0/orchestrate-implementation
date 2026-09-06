@@ -49,6 +49,9 @@ const r = {
 };
 
 const byPath = new Map();
+// Claude Code's Bash calls and their outcomes arrive in separate events, so a
+// command waits here between the two.
+const pending = new Map();
 let started = 0, completed = 0, sawResult = false, lastLine = '';
 
 for (const line of fs.readFileSync(LOG, 'utf8').split('\n')) {
@@ -69,7 +72,47 @@ for (const line of fs.readFileSync(LOG, 'utf8').split('\n')) {
       if (ev.subtype === 'init') { r.model = ev.model || null; r.session = ev.session_id || null; r.cwd = ev.cwd || null; }
       break;
     case 'thinking': if (ev.subtype === 'completed') r.counts.thinkingBlocks++; break;
-    case 'assistant': r.counts.assistantMessages++; break;
+    case 'assistant': {
+      r.counts.assistantMessages++;
+      // Claude Code has no `tool_call` events: its tool calls are content
+      // blocks inside this message. Without reading them a Claude run harvests
+      // as "0 file(s) changed, 0 command(s)" no matter what it did — the exact
+      // loss this whole file exists to prevent.
+      for (const b of (ev.message && ev.message.content) || []) {
+        if (!b || b.type !== 'tool_use') continue;
+        r.counts.toolCalls++; started++;
+        const inp = b.input || {};
+        if (inp.file_path && /^(Write|Edit|MultiEdit|NotebookEdit)$/.test(b.name)) {
+          // No line counts here: a Claude tool call carries the content it
+          // wrote, not a diff. The path and the number of edits are real, and
+          // `guard` reads the branch for the rest.
+          const prev = byPath.get(inp.file_path) || { path: inp.file_path, added: 0, removed: 0, edits: 0 };
+          prev.edits++; byPath.set(inp.file_path, prev);
+        } else if (b.name === 'Bash' && inp.command) {
+          const c = { command: clip(inp.command, 400), exitCode: null };
+          r.commands.push(c); pending.set(b.id, c);
+        } else if (inp.file_path || inp.pattern || inp.path) {
+          r.reads.push(clip(inp.file_path || inp.pattern || inp.path, 120));
+        }
+      }
+      break;
+    }
+    case 'user': {
+      // The other half of the pair: whether each of those calls worked. A
+      // Claude tool result carries no exit code, only `is_error` — so a failed
+      // command is recorded as 1, which is what every reader of this field
+      // actually asks of it.
+      for (const b of (ev.message && ev.message.content) || []) {
+        if (!b || b.type !== 'tool_result') continue;
+        completed++;
+        const c = pending.get(b.tool_use_id);
+        if (!c) continue;
+        c.exitCode = b.is_error ? 1 : 0;
+        if (b.is_error) c.stdout = clip(typeof b.content === 'string' ? b.content : JSON.stringify(b.content), 1500);
+        pending.delete(b.tool_use_id);
+      }
+      break;
+    }
     case 'connection': if (ev.subtype === 'reconnecting') r.trouble.reconnects++; break;
     case 'retry': if (ev.subtype === 'starting') r.trouble.retries++; break;
     case 'result':
@@ -141,7 +184,8 @@ if (MODE === 'probe') {
   const t = r.trouble;
   console.log(`${r.outcome.toUpperCase()}  ${mmss(r.seconds)}  ${r.model || 'unknown model'}`);
   console.log(`  ${r.files.length} file(s) changed, ${r.commands.length} command(s), ${r.counts.toolCalls} tool calls`);
-  for (const f of r.files.slice(0, 12)) console.log(`    +${f.added}/-${f.removed}  ${f.path}`);
+  for (const f of r.files.slice(0, 12))
+    console.log(`    ${f.added || f.removed ? `+${f.added}/-${f.removed}` : `${f.edits} edit(s)`}  ${f.path}`);
   if (r.files.length > 12) console.log(`    … ${r.files.length - 12} more`);
   const bad = r.commands.filter((c) => c.exitCode);
   if (bad.length) {

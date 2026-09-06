@@ -12,6 +12,11 @@ HARVEST="$SELF/harvest.mjs"
 STREAM="$SELF/stream.mjs"
 
 KEY= WS=. CHAT= ROLE= TIER= PROMPT_FILE= RUNNER=cursor
+# Whether $CHAT names a conversation that already exists. Cursor mints one
+# before the run either way, so it is always resuming; Claude Code is handed a
+# session id to CLAIM on a first run and to resume only afterwards, and passing
+# --resume for an id nothing has used yet is an error rather than a fresh start.
+RESUMING="${CURSOR_ORCH_RESUMING:-0}"
 MODEL="${CURSOR_ORCH_MODEL:-}"
 SHOWN_WANT="${CURSOR_ORCH_MODEL_SHOWN:-}"
 NODE_BIN="${CURSOR_ORCH_NODE_BIN:-}"
@@ -61,19 +66,18 @@ while [ $# -gt 0 ]; do
     --runner)       need "$1" $#; RUNNER=$2; shift 2 ;;
     --quiet)        QUIET=1; shift ;;
     --no-retry)     RETRY=0; shift ;;
+    --resuming)     RESUMING=1; shift ;;   # $CHAT is a conversation, not an id to claim
     --stream)       shift ;;   # kept so old call sites still work; streaming is the default
     *) die "unknown argument: $1" ;;
   esac
 done
 
-# The Claude Code runner has no command line — a step on it is spawned by the
-# orchestrator's own Agent tool. Saying so beats pretending to support it.
-if [ "$RUNNER" = claude ]; then
-  echo "This step runs on Claude Code, which has no launcher: spawn it with the Agent" >&2
-  echo "tool from the orchestrating session, then record the result with" >&2
-  echo "    node claude-cursor/orchestrate.mjs run record $KEY --json <file>" >&2
-  exit 2
-elif [ "$RUNNER" != cursor ]; then
+# Claude Code runs here rather than in a script of its own, because it and
+# Cursor differ in almost nothing this file does: both take `-p`, both emit the
+# same stream-json envelope, and both name the model that answered in their own
+# opening event — so the log, the status file, the probe, the model check and
+# the resume are all shared, and only the argument list below is not.
+if [ "$RUNNER" != cursor ] && [ "$RUNNER" != claude ]; then
   die "unknown runner: $RUNNER — expected cursor, opencode or claude"
 fi
 
@@ -81,6 +85,17 @@ fi
 [ -n "$ROLE" ] || die "--role <name> is required — it selects the model and the check"
 [ -n "$PROMPT_FILE" ] || die "--prompt-file <path> is required"
 [ -r "$PROMPT_FILE" ] || die "cannot read the prompt file at $PROMPT_FILE"
+
+# Which binary. Cursor's is `agent` and is assumed to be on PATH; Claude Code's
+# is looked up the way opencode's is, because a login profile is what puts it
+# there and a non-interactive shell does not get one.
+BIN=agent
+RESOLVE_AS=
+EFFORT=
+if [ "$RUNNER" = claude ]; then
+  BIN=$(node "$MODELS" which --runner claude) || exit 2
+  RESOLVE_AS="--runner claude"
+fi
 
 # The model, from the table rather than from a case statement in here.
 if [ -z "$MODEL" ]; then
@@ -93,9 +108,15 @@ if [ -z "$MODEL" ]; then
   # shown name instead (shifted one field left) and would still pass the
   # `-n "$MODEL"` check below — wrong, but not empty. Splitting the raw line
   # on tab by hand keeps every field, empty or not, exactly where it belongs.
-  _resolve_line=$(node "$MODELS" resolve "${TIER:-$ROLE}") || exit 2
+  # RESOLVE_AS is unquoted on purpose: it is either empty or two fixed literals,
+  # and the word split is the point. Claude's row answers with a third field —
+  # the effort its tier chose — which the Cursor form does not have, so the same
+  # two cuts read both.
+  _resolve_line=$(node "$MODELS" resolve $RESOLVE_AS "${TIER:-$ROLE}") || exit 2
   MODEL=${_resolve_line%%$'\t'*}
-  DEFAULT_SHOWN=${_resolve_line#*$'\t'}
+  _resolve_rest=${_resolve_line#*$'\t'}
+  DEFAULT_SHOWN=${_resolve_rest%%$'\t'*}
+  [ "$RUNNER" = claude ] && EFFORT=${_resolve_rest#*$'\t'}
   [ -n "$MODEL" ] || die "could not resolve a model for role $ROLE"
   SHOWN_WANT=${SHOWN_WANT:-$DEFAULT_SHOWN}
 elif [ -z "$SHOWN_WANT" ]; then
@@ -161,6 +182,36 @@ fi
 launch() {   # $1 = log to write, $2 = prompt
   local log=$1 prompt=$2
   local -a a=(-p --force --trust --output-format stream-json --model "$MODEL" --workspace "$WS")
+  if [ "$RUNNER" = claude ]; then
+    # Claude Code has no --workspace: it works in the directory it is started
+    # in, so the worktree is entered rather than named. Permissions are skipped
+    # for the reason `--force --trust` exists on Cursor and `--auto` on
+    # opencode — an unattended worktree run has nobody to answer a prompt.
+    #
+    # Three of these were confirmed against the binary rather than assumed
+    # (Claude Code 2.1.263): stream-json under -p is REFUSED without --verbose;
+    # --effort takes low|medium|high|xhigh|max; and --session-id is honoured in
+    # print mode, which is what lets a chat be minted before the run the way
+    # Cursor's is, so the resume below is always available.
+    a=(-p --output-format stream-json --verbose --model "$MODEL" --dangerously-skip-permissions)
+    [ -n "$EFFORT" ] && a+=(--effort "$EFFORT")
+    # A chat that already exists is resumed; one minted for a first run is
+    # claimed with --session-id. Same field either way, so `run open` and
+    # `sendback` do not have to know which this is.
+    if [ -n "$CHAT" ]; then
+      if [ "$RESUMING" = 1 ]; then a+=(--resume "$CHAT"); else a+=(--session-id "$CHAT"); fi
+    fi
+    # stdin is closed rather than inherited: Claude Code waits three seconds for
+    # piped input before giving up and warning about it, and a backgrounded run
+    # has no stdin anyone means it to read. Three seconds a step, times a wide
+    # round, for a warning.
+    if [ "$QUIET" = 1 ]; then
+      ( cd "$WS" && "$BIN" "${a[@]}" "$prompt" < /dev/null ) > "$log" 2>&1
+    else
+      ( cd "$WS" && "$BIN" "${a[@]}" "$prompt" < /dev/null ) 2>&1 | tee "$log" | node "$STREAM" --key "$KEY"
+    fi
+    return
+  fi
   [ -n "$CHAT" ] && a+=(--resume "$CHAT")
   if [ "$QUIET" = 1 ]; then
     agent "${a[@]}" "$prompt" > "$log" 2>&1
@@ -206,6 +257,7 @@ if [ "$HAS_RESULT" = 0 ] && [ -n "$CHAT" ] && [ "$RETRY" = 1 ]; then
   echo "⟳ $KEY ended without answering (${TAIL:-no tail}). Resuming once on the same chat." >&2
   STATE=$(cd "$WS" 2>/dev/null && git status --porcelain 2>/dev/null | head -40)
   COUNT=$(printf '%s' "$STATE" | grep -c . || true)
+  RESUMING=1
   LOG2="$LOG_DIR/$KEY.2.jsonl"
   : 2>/dev/null > "$LOG2" || die "cannot write the resume log at $LOG2"
   launch "$LOG2" "${NODE_PREAMBLE}Your previous run was cut off before it finished. The last thing on the

@@ -107,7 +107,7 @@ function overlap(t1, t2) {
 }
 // "a", "a and b", "a, b and c". Two callers wanted this and each had written
 // its own: five tiers collapsing onto three efforts is a three-way list, and
-// so is one file that three steps of a plan all claim. A bare join of three
+// so is the set of steps found to be claiming one file. A bare join of three
 // reads as one long name.
 const andList = (xs) => xs.length < 2 ? String(xs[0] ?? '')
   : xs.slice(0, -1).join(', ') + ' and ' + xs[xs.length - 1];
@@ -573,9 +573,10 @@ function tierOf(name) {
 //
 // Cursor runs a ladder of five models. opencode runs one model, DeepSeek V4
 // Flash, and the tier chooses how hard it thinks instead of which model
-// answers. The two are never compared: they share a tier vocabulary and
-// nothing else.
-const RUNNERS = ['cursor', 'opencode'];
+// answers. Claude Code does both at once: a tier picks Sonnet or Opus and the
+// effort it runs at. The three are never compared: they share a tier
+// vocabulary and nothing else.
+const RUNNERS = ['cursor', 'opencode', 'claude'];
 const runnerOf = (s) => s.runner || 'cursor';
 const runnerRow = (name) => (ladder().runners || {})[name] || null;
 // What a step will actually run on, as one line, for a table or a brief.
@@ -584,7 +585,16 @@ function runnerModel(s, tier) {
   if (name === 'cursor') { const row = tierOf(tier); return { name, model: modelName(row), detail: modelName(row), verifiable: true }; }
   const r = runnerRow(name);
   if (!r) return { name, model: '(unknown runner)', detail: '(unknown runner)', verifiable: false };
-  const effort = (r.efforts || {})[(ladder().roles[tier] || tier)];
+  const t = ladder().roles[tier] || tier;
+  // A runner with a ladder of its own picks a model per tier and the reasoning
+  // it runs at with it; one with a single model picks only the effort.
+  if (r.ladder) {
+    const row = r.ladder.find((x) => x.tier === t);
+    if (!row) return { name, model: `(no ${name} row for tier ${t})`, detail: `(no ${name} row for tier ${t})`, verifiable: false };
+    return { name, model: row.id, effort: row.effort,
+      detail: `${row.id} · ${row.effort}`, verifiable: !!r.verifiable };
+  }
+  const effort = (r.efforts || {})[t];
   return { name, model: r.model, effort,
     detail: `${r.shown || r.model} · ${effort || '?'}`, verifiable: !!r.verifiable };
 }
@@ -680,6 +690,12 @@ CMDS.runner = (argv) => {
     if (name === 'cursor') {
       console.log('  Five models, weakest to strongest. The model that answered is read out of');
       console.log('  the run\'s own opening event and checked against what was asked for.');
+    } else if (m && m.ladder) {
+      console.log('  A tier picks the model and the effort it runs at, together:');
+      for (const x of m.ladder)
+        console.log(`    ${x.tier.padEnd(10)} ${x.id.padEnd(18)} effort ${x.effort}`);
+      console.log('  The model that answered is named in the run\'s own opening event and is');
+      console.log('  checked against what was asked for.');
     } else if (m) {
       console.log(`  One model: ${m.shown || m.model}  (${m.model})`);
       console.log('  A tier chooses the effort, not the model:');
@@ -1270,16 +1286,30 @@ CMDS.assess = (argv) => {
   // effort. That collapse decides what these rows actually buy, so it is shown
   // here rather than left to be discovered in a launcher.
   const rn = runnerOf(s);
-  if (rn !== 'cursor') {
-    const r = runnerRow(rn);
-    console.log(`\nRunning on ${rn}: ${r ? (r.shown || r.model) : rn}, one model, so a tier is an effort.`);
-    if (r) {
-      const byEffort = {};
-      for (const [t, e] of Object.entries(r.efforts || {})) (byEffort[e] ||= []).push(t);
-      console.log('  ' + Object.entries(byEffort).map(([e, ts]) => `${ts.join('/')} → ${e}`).join('   '));
-      const shared = Object.entries(byEffort).filter(([, ts]) => ts.length > 1);
-      for (const [e, ts] of shared) console.log(`  ${andList(ts)} are the same effort (${e}), so moving between them changes nothing.`);
-    }
+  const r = rn === 'cursor' ? null : runnerRow(rn);
+  if (r) {
+    // Tier to effort, whichever way this runner spells it: a ladder row per
+    // tier, or one model and a map. Reading a ladder runner's `efforts` — an
+    // array of the vocabulary it accepts — as if it were that map printed the
+    // list's own indices as tiers ("0 → low   1 → medium"), which is a table
+    // of nothing dressed as the one thing this paragraph exists to say.
+    const byTier = r.ladder
+      ? Object.fromEntries(r.ladder.map((x) => [x.tier, x.effort]))
+      : (r.efforts || {});
+    console.log(r.ladder
+      ? `\nRunning on ${rn}: a tier picks the model and the effort together.`
+      : `\nRunning on ${rn}: ${r.shown || r.model}, one model, so a tier is an effort.`);
+    if (r.ladder) for (const x of r.ladder) console.log(`  ${x.tier.padEnd(10)} ${x.id}  ·  ${x.effort}`);
+    const byEffort = {};
+    for (const [t, e] of Object.entries(byTier)) (byEffort[e] ||= []).push(t);
+    if (!r.ladder) console.log('  ' + Object.entries(byEffort).map(([e, ts]) => `${ts.join('/')} → ${e}`).join('   '));
+    // Only a collapse WITHIN one model is a collapse: on a ladder runner two
+    // tiers at the same effort on different models buy something after all.
+    const same = r.ladder
+      ? Object.entries(r.ladder.reduce((a, x) => ((a[x.id + ' · ' + x.effort] ||= []).push(x.tier), a), {}))
+          .filter(([, ts]) => ts.length > 1).map(([what, ts]) => [ts, `the same model at the same effort (${what})`])
+      : Object.entries(byEffort).filter(([, ts]) => ts.length > 1).map(([e, ts]) => [ts, `the same effort (${e})`]);
+    for (const [ts, what] of same) console.log(`  ${andList(ts)} are ${what}, so moving between them changes nothing.`);
   }
 };
 
@@ -1385,36 +1415,43 @@ CMDS.board = () => {
 // ------------------------------------------------------------------- refining
 // A plan may become at most this many steps. See `refine done`.
 //
-// It was 2, which is the smallest cap that permits any widening at all, and a
-// round of 36 plans came back as 36 single steps under it — the cap was never
-// the binding constraint there, the refining prompt's bias towards one step
-// was. Three is what the cap is for: a plan with three genuinely disjoint file
-// sets runs on three agents instead of one, and the third was previously
-// refused for no reason but the number.
+// It was 2, then 3, and the round trip is the argument for being back at 2.
+// Raising it had a real case: a plan holding three disjoint file sets runs on
+// three agents instead of one, and the third part was being refused for no
+// reason but the number. What came with it was a brief that asked for one step
+// per disjoint set — and disjoint file sets are the easy thing to find. Almost
+// any plan names enough files to deal them into three piles, so almost every
+// plan was dealt into three: eight plans came back as twenty-two steps, the
+// ceiling read as a quota and applied to all of them rather than to the few
+// that had a seam in them.
 //
-// It does not go higher. The failure this guards is a plan carved into parts
-// that all write the same files, which is more agents contending over one piece
-// of work rather than more work in flight, and the taste for doing that grows
-// with the room allowed for it.
-const MAX_STEPS_PER_PLAN = 3;
+// So 2, and the brief below stops asking. Most plans are one step. A plan
+// becomes two when it is really two pieces of work, not whenever its paths can
+// be sorted into two piles.
+//
+// The failure both numbers guard is a plan carved into parts that all write the
+// same files, which is more agents contending over one piece of work rather
+// than more work in flight, and the taste for doing that grows with the room
+// allowed for it.
+const MAX_STEPS_PER_PLAN = 2;
 
 // The floor under that ceiling. `refine done` has always enforced the most a
 // plan may become and never once enforced the least. The test is stated in the
 // refining brief in prose — a part must land before another can start, or parts
 // write files that do not overlap at all — and nothing checked either half, so
-// a refiner that cut every plan into three because three was permitted passed
-// exactly as cleanly as one that found three real seams. Nine plans came back
-// as twenty-seven steps that way and the register took all of it without a
-// word: twenty-seven worktrees, merges and runs for nine plans whose gates
-// still passed or failed whole, which is the cost of the split with none of
-// what it is bought for.
+// a refiner that cut every plan to the cap because the cap was permitted passed
+// exactly as cleanly as one that found real seams. Nine plans came back as
+// twenty-seven steps that way and the register took all of it without a word:
+// twenty-seven worktrees, merges and runs for nine plans whose gates still
+// passed or failed whole, which is the cost of the split with none of what it
+// is bought for.
 //
-// So the ceiling stays a ceiling and stops being a target. Three is what a plan
-// reaches when it has three real seams.
+// So the ceiling stays a ceiling and stops being a target. One step is what a
+// plan comes back as unless it has a real seam in it.
 //
-// Judged per part rather than per report. Two genuinely disjoint steps with a
-// third carved out of one of them is a split that is mostly right, and naming
-// the third is more use than refusing the shape of the whole thing.
+// Judged per part rather than per report, so the refusal can name which half
+// did not earn its place and the file the two contend over, instead of
+// rejecting the shape of the whole report without saying where it went wrong.
 //
 // A part earns its place by ordering OR by disjointness. Ordering is a `needs`
 // edge in either direction between it and a sibling: the plan says this half
@@ -1438,9 +1475,11 @@ function splitProblems(steps) {
     const sibs = steps.filter((o) => keyOf(o) !== me);
     if (sibs.some((o) => (it.needs || []).includes(keyOf(o)) || (o.needs || []).includes(me)))
       continue;
-    // Grouped by the file, not by the pair. Three steps on one file is three
-    // pairs, and reporting it pairwise printed the same path to each of them
-    // twice over — the shape of the problem is one file with three claimants.
+    // Grouped by the file, not by the pair: the shape of the problem is one
+    // file with claimants, not one entry per pairing. Under a two-step cap that
+    // is a single other claimant and the grouping costs nothing to keep — it
+    // was written when a plan could come back as three parts, and reporting it
+    // pairwise printed the same path to each of them twice over.
     const shared = [];
     for (const a of it.owns || []) {
       if (typeof a !== 'string') continue;
@@ -1535,36 +1574,36 @@ Do two things:
    sentence beside it is worth almost nothing to them. Keep the paths
    repository-relative: it reads them from its own worktree, not from here.
 
-   How many steps. ${rec.lines < 120
-     ? `${rec.path} is ${rec.lines} lines, which is usually one step. Split it only if the
-   test below genuinely passes.`
-     : `${rec.path} is ${rec.lines} lines, which is long enough that it is worth asking
-   properly. Do not default to one step because one is simpler to write.`}
-   ${MAX_STEPS_PER_PLAN} is the most a plan may become, and a report with more is refused.
+   How many steps. One, unless this plan is genuinely two pieces of work — and
+   most plans are not. ${rec.lines < 120
+     ? `${rec.path} is ${rec.lines} lines, which is nearly always one step.`
+     : `${rec.path} is ${rec.lines} lines, which is long, and length is not a
+   seam: a long plan describing one coherent change is still one step.`}
+   ${MAX_STEPS_PER_PLAN} is the most a plan may become, and a report with more is
+   refused. It is the ceiling for the exception, not a shape to aim at.
 
-   Split it when EITHER holds, once per part:
+   A second step has to earn its place, and it earns it only when BOTH hold:
 
-     · a part must land before another can start; or
-     · parts write files that do not overlap at all, and could therefore run at
-       the same time on separate agents.
+     · the two halves are separable work — someone reading the plan would call
+       them two things, not one thing described in two sections; and
+     · either one half must land before the other can start, or their files do
+       not overlap at all, so the two can run at once on separate agents.
 
-   The second is the one that gets skipped, and skipping it is not free: a plan
-   left whole is a plan that runs on one agent, and a round of single-step plans
-   is a queue whatever the scheduler does with it. Where the file sets are
-   disjoint, one step per disjoint set is the answer — that is what the split is
-   for. What you must not do is carve one coherent piece of work into parts that
-   write the same files, to look thorough; that is several agents contending
-   over one piece of work where one agent would already have finished it.
+   Only the second of those can be checked mechanically, which is why the first
+   is the one to be honest about. Almost any plan names enough files to deal
+   them into two piles that do not overlap, and dealing them is not a seam. If
+   the halves look separate only because you sorted the paths, that is one step.
 
-   Both of those conditions are checked, not taken on trust. A part that writes
-   a file another part of this plan also writes, and that neither waits on one
-   of them nor is waited on by one of them, is refused — and the whole report
-   goes back with it. So split where you can point at which of the two holds,
-   and leave the plan whole where you cannot. ${MAX_STEPS_PER_PLAN} is a ceiling
-   a plan reaches when it has ${MAX_STEPS_PER_PLAN} real seams, never a number
-   to fill.
+   What is checked: a part that writes a file another part of this plan also
+   writes, and that neither waits on one of them nor is waited on by one of
+   them, is refused — and the whole report goes back with it.
 
-   Key every step from this plan: ${keyPrefix(rec.path)}.1, ${keyPrefix(rec.path)}.2, ${keyPrefix(rec.path)}.3.
+   When it is close, one step. A plan left whole is one agent finishing it; a
+   plan split badly is two agents contending over one piece of work, each
+   paying a worktree, a merge and a run, for a gate that still passes or fails
+   whole.
+
+   Key every step from this plan: ${keyPrefix(rec.path)}.1, ${keyPrefix(rec.path)}.2 — and the second only where there is a real second.
    Other plans in this round are being refined at the same time, and keys are
    unique across all of them: a report that reuses one another plan already
    holds is refused whole.
@@ -1645,10 +1684,11 @@ Report the file written, not a summary in your reply.`);
     let rep; try { rep = JSON.parse(fs.readFileSync(f, 'utf8')); } catch (e) { die(`the report at ${f} is not valid JSON: ${e.message}`); }
     const steps = rep.steps || [];
     if (!steps.length) die('the report names no steps');
-    // A plan is one step, and two or three only where the parts genuinely come
-    // apart. The ceiling is checked first because it is the cheaper answer to
-    // read: too many is too many whatever the reasons given for them.
+    // A plan is one step, and two only where the parts genuinely come apart.
+    // The ceiling is checked first because it is the cheaper answer to read:
+    // too many is too many whatever the reasons given for them.
     if (steps.length > MAX_STEPS_PER_PLAN) die(`the report splits ${rec.path} into ${steps.length} steps; ${MAX_STEPS_PER_PLAN} is the most a plan may become.
+  Most plans are one step, and the ceiling is for the ones that are really two.
   Have the agent merge them and rewrite ${relCwd(f)}.`);
     // Then whether the split it did make was worth making. See `splitProblems`.
     const unearned = splitProblems(steps);
@@ -1662,10 +1702,10 @@ Report the file written, not a summary in your reply.`);
       console.error('\n  Two parts of one plan are worth separating when one must land before the other');
       console.error('  can start, or when their files do not overlap at all and they can therefore run');
       console.error('  at the same time on separate agents. These do neither: they write the same');
-      console.error('  files and wait on nothing, so they are one piece of work handed to several');
+      console.error('  files and wait on nothing, so they are one piece of work handed to two');
       console.error('  agents to contend over — a merge, a run and a handover apiece, and slower than');
       console.error('  the single agent that would already have finished it.');
-      console.error(`\n  ${MAX_STEPS_PER_PLAN} steps is a ceiling a plan reaches when it has ${MAX_STEPS_PER_PLAN} real seams, not a number to fill.`);
+      console.error(`\n  Most plans are one step. ${MAX_STEPS_PER_PLAN} is the ceiling for the ones that are really two, not a number to fill.`);
       console.error('  Merge them back into one step; or, if they truly are separate work, give each');
       console.error('  its own files, or say in `needs` which of them has to land first.');
       console.error(`\nNothing from ${rec.path} was recorded. Have the agent rewrite ${relCwd(f)} and run this again.`);
@@ -1875,6 +1915,11 @@ function openOne(s, t) {
   // exist until the run does and is read out of the log afterwards — minting
   // one would be inventing an id nothing will answer to.
   t.runner = runnerOf(s);
+  // Claude Code takes a session id to claim (`--session-id`, confirmed against
+  // the binary), so its address can be minted here the way Cursor's is — which
+  // is what makes the launcher's automatic resume-after-a-cut-off available to
+  // it. It needs no subprocess to mint one, only a uuid.
+  if (t.runner === 'claude' && !t.chat) t.chat = crypto.randomUUID();
   if (t.runner === 'cursor' && !t.chat) {
     // Unlike the worktree add above, this used to have no try/catch at all: a
     // missing `agent` binary threw a raw stack trace straight past `commit()`,
@@ -2052,7 +2097,7 @@ CMDS.run = (argv) => {
       for (const { o, m } of willReconcile) console.log(`    ↔ ${o.key}: ${m.files.join('; ')}`);
     }
     console.log(`  worktree  ${t.worktree}\n  branch    ${t.branch}` +
-      (t.chat ? `\n  chat      ${t.chat}` : `\n  session   (opencode mints one; it is read back out of the log)`) +
+      (t.chat ? `\n  chat      ${t.chat}` : `\n  session   (${t.runner} mints one; it is read back out of the log)`) +
       `\n  brief     ${t.briefFile}`);
     console.log(`\nLaunch it in the background:\n${r.launch}`);
     // Opening one at a time is the slowest thing this can do, and it is easy to
@@ -2174,7 +2219,8 @@ CMDS.run = (argv) => {
       console.log(`      git -C ${t.worktree} commit --amend -m "<what the change does>"`);
     }
     // Files it wrote that it does not own. The log knows this; no second diff.
-    const stray = (rec.files || []).map((f) => f.path).filter((p) => !(t.owns || []).some((o) => collides(o, p)));
+    const stray = (rec.files || []).map((f) => f.path)
+      .filter((p) => p !== BUGFILE(key) && !(t.owns || []).some((o) => collides(o, p)));
     if (stray.length) {
       console.log(`\n⚠ ${stray.length} file(s) written that ${key} does not own:`);
       for (const p of stray.slice(0, 12)) console.log('    ' + p);
@@ -2198,6 +2244,14 @@ CMDS.run = (argv) => {
 // be added in three, and adding it in two makes every brief read as stale. One
 // list, asked by all of them.
 const briefKey = (t) => sha(JSON.stringify([t.owns, t.serialises, t.verify, t.needs, t.title, t.plan, t.context]));
+
+// Where a step writes down a problem it did not deal with. One file per step
+// rather than one shared file every step appends to: a shared one would be a
+// path every agent in the round writes, which is the one thing this whole
+// arrangement is built to avoid. It is owned implicitly — `guard` and
+// `run record` both skip it — so writing there is never a stray, and a step
+// never has to choose between reporting a problem and passing its guard.
+const BUGFILE = (key) => `docs/temp_bugs/${key}.md`;
 
 function briefText(s, t, row) {
   const plan = t.plan || '(no plan recorded)';
@@ -2275,6 +2329,14 @@ function briefText(s, t, row) {
     for (const v of t.verify) L.push(`  ${v}`);
     L.push('');
   }
+  L.push(`## A problem you did not deal with`, '',
+         `If you hit a bug or a problem you are not fixing — something already broken`,
+         `before you arrived, something outside what you own, something you worked`,
+         `around — write it down before you finish, in ${BUGFILE(t.key)}. That file is`,
+         `yours alone and you may write it even though it is not in the list above.`,
+         `Say what you saw, where, and what you did about it.`, '',
+         `It is not somewhere to send work you were asked to do. It is how a problem`,
+         `outlives the session that found it, instead of dying in a log nobody reads.`, '');
   L.push(`## Finishing`, '',
          `Commit on ${t.branch}, and leave nothing uncommitted. Work still sitting in`,
          `the worktree is work that will not be merged: your branch is what gets read,`,
@@ -2462,11 +2524,15 @@ CMDS.guard = (argv) => {
   let changed;
   try { changed = sh('git', ['diff', '--name-only', `${base}...${t.branch}`]).split('\n').filter(Boolean); }
   catch { die(`could not diff ${base}...${t.branch}`); }
-  const stray = changed.filter((p) => !(t.owns || []).some((o) => collides(o, p)));
+  // Its own bug file counts as owned wherever ownership is asked about: a step
+  // that reported a problem it could not fix must not fail its guard for having
+  // reported it.
+  const mine = (p) => p === BUGFILE(t.key) || (t.owns || []).some((o) => collides(o, p));
+  const stray = changed.filter((p) => !mine(p));
   t.guardedAt = new Date().toISOString(); t.guardedBase = base; t.guardedFiles = changed;
   commit(s, 'guard', argv);
   console.log(`${changed.length} file(s) changed on ${t.branch} against ${base}`);
-  for (const p of changed) console.log('  ' + ((t.owns || []).some((o) => collides(o, p)) ? ' ' : '✗') + ' ' + p);
+  for (const p of changed) console.log('  ' + (mine(p) ? ' ' : '✗') + ' ' + p);
   if (!stray.length) { ok('everything it touched, it owns'); return; }
   // Two different faults used to come out as one sentence. A file another live
   // step owns is a trespass: two agents wrote it, one of them was not supposed
@@ -3353,6 +3419,16 @@ Then re-run your proof and commit.`;
     console.log(`    ${bin.ok ? bin.path : 'opencode'} run --dir ${t.worktree} -s ${t.chat} \\`);
     console.log(`      -m ${rm.model} --variant ${rm.effort} --auto --format json \\`);
     console.log(`      "$(cat ${relCwd(f)})"`);
+  } else if ((t.runner || 'cursor') === 'claude') {
+    const bin = runnerBin('claude');
+    const rm = runnerModel(s, t.tier);
+    // Claude Code takes the directory by being started in it, not by a flag —
+    // so the prompt is read BEFORE the cd. The path printed here is relative to
+    // the main checkout, and reading it from inside the worktree would look
+    // exactly right and find nothing.
+    console.log(`    P="$(cat ${relCwd(f)})" && (cd ${t.worktree} && \\`);
+    console.log(`      ${bin.ok ? bin.path : 'claude'} -p --dangerously-skip-permissions \\`);
+    console.log(`      --model ${rm.model} --effort ${rm.effort} --resume ${t.chat} "$P" < /dev/null)`);
   } else {
     console.log(`    agent -p --force --trust --resume ${t.chat} "$(cat ${relCwd(f)})"`);
   }

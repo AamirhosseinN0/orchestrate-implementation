@@ -127,12 +127,12 @@ find the true cost. In `AskUserQuestion` the gain and the cost are the option's
 
 ## 0. Ask which runner, before anything else
 
-Steps run on one of two CLIs, and the choice is made once for the whole round —
-after that it is automated, so there is no later moment to ask.
+Steps run on one of three CLIs, and the choice is made once for the whole round
+— after that it is automated, so there is no later moment to ask.
 
 **Put this to the user before `load`:**
 
-> **Which should build this round — Cursor, or DeepSeek?**
+> **Which should build this round — Cursor, Claude, or DeepSeek?**
 >
 > · **Cursor (Recommended)**
 >   ✓ Five models, weakest to strongest, so an easy step is not paid for at a
@@ -140,6 +140,12 @@ after that it is automated, so there is no later moment to ask.
 >     actually answered it.
 >   ✕ Each step costs more and takes longer, and on a wide round that is the
 >     whole round's bill.
+> · **Claude**
+>   ✓ Sonnet takes the ordinary steps and Opus the hard ones, each thinking as
+>     hard as its rung asks, and every run is checked against the model that
+>     answered.
+>   ✕ The two hardest rungs are the priciest work here, so a wide round that
+>     lands on them is the largest bill of the three.
 > · **DeepSeek**
 >   ✓ Cheaper and faster, and one dial sets how hard it thinks.
 >   ✕ Nothing records which model answered, so a quiet drop to a weaker one
@@ -147,12 +153,14 @@ after that it is automated, so there is no later moment to ask.
 
 Recommend Cursor unless the user has already said that cost or speed is the
 constraint. The ladder is the reason: it is what lets an easy step be cheap
-without leaving a hard one underpowered.
+without leaving a hard one underpowered. Claude is the same argument with two
+models instead of five and a reasoning dial on top; reach for it when the round
+is small enough that Opus on its hard steps is worth paying for.
 
 Then set it:
 
 ```bash
-node $ORCH runner use cursor      # or: opencode
+node $ORCH runner use cursor      # or: claude, opencode
 node $ORCH runner                 # what this round is on, and what that means
 ```
 
@@ -171,6 +179,50 @@ If the ladder has drifted from what the account can actually run:
 ```bash
 node $ORCH models sync
 ```
+
+### Claude, through Claude Code
+
+```bash
+node $ORCH runner use claude
+node claude-cursor/scripts/models.mjs efforts --runner claude
+```
+
+Two models across the five tiers, and the tier chooses the effort as well:
+
+| tier | model | effort | for |
+|---|---|---|---|
+| `composer` | Sonnet 5 | `medium` | mechanical work, no judgement |
+| `low` | Sonnet 5 | `medium` | verification, and light or well-specified work |
+| `medium` | Sonnet 5 | `high` | the default — ordinary feature work |
+| `high` | Opus 5 | `medium` | genuinely hard work |
+| `xhigh` | Opus 5 | `xhigh` | the top of the ladder only |
+
+**The effort column is not sorted, and that is the point.** The model changes
+under it: Sonnet climbs to `high` at the default tier, and the rung above hands
+over to Opus at `medium` rather than pushing Sonnet harder. Going from `medium`
+to `high` turns the effort down and the model up — a stronger model taking its
+time, instead of a weaker one straining.
+
+`composer` and `low` are the same model at the same effort. That collapse is
+real — moving a step between them changes nothing — and `assess` prints it
+rather than leaving it to be discovered.
+
+Two things this runner has that DeepSeek does not:
+
+- **The run is checked afterwards.** Claude Code names the model that answered
+  in its own opening event, in the same place Cursor does, so a silent downgrade
+  is caught rather than merely unlikely. That is the whole of what DeepSeek
+  cannot do.
+- **The effort is checked against a fixed vocabulary**, not against a cache that
+  may never have been written. A ladder naming an effort outside it is refused
+  before the round rather than billed for.
+
+`--session-id` means the conversation exists before the run does, so a run cut
+off mid-stream is resumed automatically on the same conversation — the same
+recovery Cursor gets, which opencode cannot have.
+
+Its binary is not on a non-interactive `PATH` either, so `runner use` looks for
+it and refuses before a round is built on it.
 
 ### DeepSeek, through opencode
 
@@ -255,14 +307,28 @@ The worktree, the branch, the brief, `guard`, `join`, `land`, the slot, and the
 record's shape. A step does not know which runner it is on, and neither does
 anything downstream of `run record`.
 
+So does this, which every brief carries whichever runner is building it:
+
+> **A problem an agent did not deal with goes in `docs/temp_bugs/<key>.md`.**
+> Something already broken before it arrived, something outside what it owns,
+> something it worked around — written down before it finishes, one file per
+> step so twelve agents writing at once never meet. `guard` counts that file as
+> owned, so reporting a problem can never be the thing that fails a step.
+
+Read that directory when the round is done. It is the only place a bug an agent
+saw and could not fix survives the log it was found in — and a log is 3 MB that
+nobody opens.
+
 ### What differs
 
-| | Cursor | opencode |
-|---|---|---|
-| the conversation's address | a chat, minted before the run | a session, read out of the run's own log |
-| resuming it | `agent --resume <uuid>` | `opencode run --session <id>` |
-| the model that answered | checked against the ladder | not recorded anywhere |
-| tokens and cost | not in the log | in every `step_finish` |
+| | Cursor | Claude Code | opencode |
+|---|---|---|---|
+| the conversation's address | a chat, minted before the run | a session id, minted before the run | a session, read out of the run's own log |
+| resuming it | `agent --resume <uuid>` | `claude --resume <id>` | `opencode run -s <id>` |
+| the model that answered | checked against the ladder | checked against the ladder | not recorded anywhere |
+| a run cut off mid-stream | resumed once, automatically | resumed once, automatically | reported, and resumed by hand |
+| tokens and cost | not in the log | in the final `result` | in every `step_finish` |
+| what it wrote | from its `tool_call` events | from the tool blocks in its messages, without line counts | from its tool parts |
 
 `run open` prints the right launcher line for whichever is chosen, and
 `sendback` prints the right resume line. Neither is something to remember.
@@ -283,10 +349,11 @@ node $ORCH map
 ```
 
 **The width of a round is decided here, before any agent runs.** A plan becomes
-at most three steps, so ten plans cannot become more than thirty; and `step link`
-turns a plan-level `requires:` into a dependency between every pair of steps. A
-plan that is one coherent slice of files costs nothing under either rule. A plan
-holding four disjoint file sets pays under both.
+at most two steps and usually one, so ten plans is a round of ten or twelve
+steps, not thirty; and `step link` turns a plan-level `requires:` into a
+dependency between every pair of steps. A plan that is one coherent slice of
+files costs nothing under either rule. A plan holding four disjoint file sets
+pays under both, and no refining agent will rescue it — split it here.
 
 `map` reads the paths out of the plans' own prose and prints:
 
@@ -311,11 +378,12 @@ already names the usual ones: route table, schema registry, public exports, env
 schema, generated client.
 
 **Then split what is left into slices whose file sets do not intersect.** One
-slice is one plan. Where a slice still holds two or three disjoint file sets,
-that is what the cap is for, and the refining agent is now asked for one step per
-set rather than left to default to one step for the whole plan. A round of 36
-plans that came back as 36 single steps is a queue whatever the scheduler does
-with it, and the cap was never what held it at one.
+slice is one plan, and this is where the width of a round comes from. Do not
+leave it to the refining agents: each is asked for one step unless its plan is
+genuinely two pieces of work, so a slice you leave joined here stays joined. A
+round of 36 plans that came back as 36 single steps is a queue whatever the
+scheduler does with it — and the answer to that is more plans, not more parts
+carved out of each one.
 
 **Write the ordering as `requires:`, one line per real dependency.** This is the
 step that keeps the requirement intact: "first this part of the user API, then
@@ -691,12 +759,14 @@ alone:
   `step link --only-shared --dry-run` shows the same round with only the edges
   that order the work — one step uses a symbol another provides, or the two move
   one serialisation point. A file both write is not an edge.
-- **Every plan came back as one step.** This one is upstream of the scheduler
-  and no linking flag reaches it: 36 single-step plans is 36 waves however clean
-  the graph is. `check` says how many live steps are in how many waves; if the
-  step count is about the plan count, the refining is what to fix, by
-  re-refining the plans whose parts write disjoint files. A plan may become
-  three steps.
+- **The round is narrow and every plan came back as one step.** Most plans
+  *should* be one step; that is the default and on its own it is not the fault.
+  What it usually means is that the plan set is too coarse — 36 single-step
+  plans is 36 waves however clean the graph is, and no linking flag reaches it.
+  `check` says how many live steps are in how many waves. Fix it in `map` by
+  writing more and smaller plans, not by sending the refiners back to carve the
+  ones you have: a plan cut where it has no seam is two agents contending over
+  one piece of work.
 - **`serialises` used too readily.** A point is a gate: every step naming it runs
   alone against every other step naming it. Four points shared across a plan's
   steps is a plan that runs one step at a time whatever else is true.
@@ -955,18 +1025,21 @@ alternative — editing `state.json` and appending to `events.jsonl` by hand —
 writing directly to the record this owns, and it is how a register ends up
 disagreeing with itself.
 
-## Running on Claude Code instead
+## Running a step as a subagent instead
 
-Any step can run as a Claude Code subagent instead of on Cursor. Spawn it with
-the Agent tool, hand it `.claude/orch/briefs/<key>.md`, and record the result:
+`runner use claude` is the ordinary way to build on Claude — one process per
+step, launched and harvested like any other. A step can also run as a subagent
+of this session: spawn it with the Agent tool and hand it
+`.claude/orch/briefs/<key>.md`. That is worth doing only when the step needs
+something this session has and a fresh process does not, because nothing
+harvests a subagent's log — you write the record yourself:
 
 ```bash
 node $ORCH run record S-1 --json /tmp/S-1-record.json
 ```
 
 The record is the same shape either way — `{outcome, seconds, files, commands,
-answer}` — so everything downstream is unchanged. Cursor runs fill it from the
-log automatically; a Claude Code step needs the JSON written for it.
+answer}` — so everything downstream is unchanged.
 
 ## Watching a run
 
@@ -989,14 +1062,16 @@ with the timings it actually ran at.
 Every one of these was earned from a specific failure, and each is load-bearing
 for exactly the kind of round that gets wider.
 
-- **Do not raise the three-steps-per-plan cap, and do not read it as a target.**
+- **Do not raise the two-steps-per-plan cap, and do not read it as a target.**
   It is the guard against an agent carving one plan into six to look thorough
   and losing the intent across the seams. Width comes from writing four plans,
   not from a refiner splitting one four ways. `map` is how you decide where to
-  split; a person owns that call. `refine done` refuses a report above three,
-  and refuses one at two or three whose parts write the same files and wait on
-  nothing: nine plans once came back as twenty-seven steps that each cost a
-  worktree, a merge and a run, for gates that still passed or failed whole.
+  split; a person owns that call. The cap was 3 for a while, with a brief that
+  asked for one step per disjoint file set — and since almost any plan's paths
+  can be dealt into three piles, almost every plan was: eight plans came back as
+  twenty-two steps, each part paying a worktree, a merge and a run for a gate
+  that still passed or failed whole. `refine done` refuses a report above two,
+  and refuses one at two whose parts write the same files and wait on nothing.
 - **Do not skip the suite on the joined tree.** Batch it, run it beside the next
   round, but run it.
 - **Do not put two step keys on one agent.** It reads like a saving and it is the
@@ -1055,6 +1130,11 @@ for exactly the kind of round that gets wider.
 - **Every run needs `run_in_background: true`.** These take minutes, well past
   the foreground `Bash` timeout, and backgrounding is what makes the round
   parallel.
+- **A launcher line is good once, on Claude.** The session id `run open` mints
+  is claimed by the first run, and a second run on the same line is refused —
+  `Session ID … is already in use`. That is the right answer to re-running a
+  finished step by hand: what you want there is `sendback`, which resumes the
+  conversation instead of trying to start it twice.
 - **A chat is never shared between steps.** `run open` mints one per step.
   Reusing an address is the same defect as stacking two steps into one agent, and
   it arrives quietly.

@@ -2847,9 +2847,16 @@ sect(() => {
   ok('a pinned runtime is prepended', has(sent(), 'export PATH="/opt/node/bin:$PATH"'), sent());
   ok('and the prompt survives under it', has(sent(), 'do the work'), sent());
 
+  // Claude Code runs through this same launcher now. What it must not do is
+  // start when its binary is not where the table says — the failure has to be
+  // one sentence before the round, not `command not found` from inside twelve
+  // backgrounded runs. Nothing is on PATH in here, so this is that case.
   const claude = run(base('--role', 'chip', '--runner', 'claude'));
-  ok('the claude runner says it has no launcher', claude.code === 2, claude.out);
-  ok('and names what to record the result with', has(claude.out, 'run record'), claude.out);
+  ok('the claude runner refuses to start when its binary is missing', claude.code === 2, claude.out);
+  ok('and says where it looked for it', has(claude.out, 'not installed'), claude.out);
+  const bogus = run(base('--role', 'chip', '--runner', 'nonsense'));
+  ok('and an unknown runner names the three that exist',
+    bogus.code === 2 && has(bogus.out, 'cursor, opencode or claude'), bogus.out);
 });
 
 // -------------------------------------------- reading a run back out of its log
@@ -3973,12 +3980,14 @@ sect(() => {
       has(d.out, 'beside the next round'), d.out);
   }
 
-  // The cap. It was 2, and a round of 36 plans still came back as 36 single
-  // steps — the cap was never what held it there, the refining prompt's bias
-  // towards one step was. Three is what the cap is for: a plan with three
-  // disjoint file sets runs on three agents, and the third used to be refused
-  // for no reason but the number. It does not go higher, and the refusal is
-  // what keeps it from going higher by accident.
+  // The cap. It went 2 → 3 on the argument that a plan with three disjoint file
+  // sets runs on three agents and the third part was being refused for no reason
+  // but the number — and back to 2 because that argument, paired with a brief
+  // that asked for one step per disjoint set, made the cap a quota. Disjoint
+  // file sets are the easy thing to find: almost any plan's paths deal into
+  // three piles, so almost every plan was dealt into three, and eight plans came
+  // back as twenty-two steps. The number is not what makes a round wide; the
+  // plan set is.
   {
     const b = box('widen-cap', { '1-a.md': '# A\n' }, null, null);
     const report = (n) => JSON.stringify({
@@ -3990,22 +3999,28 @@ sect(() => {
       fs.mkdirSync(path.dirname(f), { recursive: true });
       fs.writeFileSync(f, report(n));
     };
-    put(4);
-    const four = b.run(['refine', 'done', 'docs/1-a.md']);
-    ok('a plan split four ways is refused', four.code !== 0 && has(four.out, 'is the most a plan may become'), four.out);
     put(3);
     const three = b.run(['refine', 'done', 'docs/1-a.md']);
-    ok('and three is accepted, which two never was',
-      three.code === 0 && has(three.out, 'S-1.1') && has(three.out, 'S-1.3'), three.out);
+    ok('a plan split three ways is refused', three.code !== 0 && has(three.out, 'is the most a plan may become'), three.out);
+    ok('and the refusal says most plans are one step',
+      has(three.out, 'Most plans are one step'), three.out);
+    put(2);
+    const two = b.run(['refine', 'done', 'docs/1-a.md']);
+    ok('and two disjoint parts are accepted',
+      two.code === 0 && has(two.out, 'S-1.1') && has(two.out, 'S-1.2'), two.out);
+    put(1);
+    const one = b.run(['refine', 'done', 'docs/1-a.md']);
+    ok('and one step — what most plans should come back as — is accepted',
+      one.code === 0 && has(one.out, 'S-1.1'), one.out);
   }
 
   // The floor under that ceiling. The ceiling was enforced from the first day
   // and the floor never was: the split test the refining brief states in prose
   // — one part must land before another, or their files do not overlap at all —
-  // was checked by nobody. So three steps carved out of one piece of work were
-  // recorded exactly as readily as three that had three real seams, and nine
-  // plans came back as twenty-seven steps, each paying a worktree, a merge and
-  // a run for a gate that still passed or failed whole.
+  // was checked by nobody. So parts carved out of one piece of work were
+  // recorded exactly as readily as parts with a real seam between them, and
+  // nine plans came back as twenty-seven steps, each paying a worktree, a merge
+  // and a run for a gate that still passed or failed whole.
   {
     const b = box('widen-earned', { '1-a.md': '# A\n' }, null, null);
     const put = (steps) => {
@@ -4015,33 +4030,32 @@ sect(() => {
     };
     const s = (key, owns, needs) => ({ key, title: key, owns, verify: ['true'], ...(needs ? { needs } : {}) });
 
-    put([s('S-1.1', ['src/a.ts']), s('S-1.2', ['src/a.ts']), s('S-1.3', ['src/a.ts'])]);
+    put([s('S-1.1', ['src/a.ts']), s('S-1.2', ['src/a.ts'])]);
     const carved = b.run(['refine', 'done', 'docs/1-a.md']);
-    ok('three parts writing one file and waiting on nothing are refused',
+    ok('two parts writing one file and waiting on nothing are refused',
       carved.code !== 0 && has(carved.out, 'have not earned it'), carved.out);
     ok('and the refusal names each of them and the file they contend over',
-      has(carved.out, 'S-1.1') && has(carved.out, 'S-1.2') && has(carved.out, 'S-1.3') &&
-      has(carved.out, 'src/a.ts'), carved.out);
+      has(carved.out, 'S-1.1') && has(carved.out, 'S-1.2') && has(carved.out, 'src/a.ts'), carved.out);
     ok('and says the ceiling is not a number to fill',
       has(carved.out, 'not a number to fill'), carved.out);
     ok('and records none of it',
       has(carved.out, 'Nothing from docs/1-a.md was recorded') &&
       has(b.run(['board']).out, 'Nothing yet.'), carved.out);
 
-    // Two real seams with a third carved out of one of them. The third is what
-    // is wrong, and refusing the shape of the whole report says less.
-    put([s('S-1.1', ['src/a.ts']), s('S-1.2', ['src/b.ts']), s('S-1.3', ['src/b.ts'])]);
-    const mixed = b.run(['refine', 'done', 'docs/1-a.md']);
-    ok('a report two thirds right names only the parts that did not earn it',
-      mixed.code !== 0 && has(mixed.out, 'S-1.2') && has(mixed.out, 'S-1.3') &&
-      !has(mixed.out, 'S-1.1'), mixed.out);
+    // One file in common is enough, even where the rest of the two lists comes
+    // apart cleanly: the halves still cannot run at once, which was the whole
+    // case for separating them.
+    put([s('S-1.1', ['src/a.ts', 'src/x.ts']), s('S-1.2', ['src/b.ts', 'src/x.ts'])]);
+    const brushed = b.run(['refine', 'done', 'docs/1-a.md']);
+    ok('parts overlapping on one file of several have still not earned it',
+      brushed.code !== 0 && has(brushed.out, 'src/x.ts') && !has(brushed.out, 'src/a.ts'), brushed.out);
 
     // Ordering earns it on its own: parts that share a file but were never
     // going to run at once, because one has to land before the next can start.
-    put([s('S-1.1', ['src/a.ts']), s('S-1.2', ['src/a.ts'], ['S-1.1']), s('S-1.3', ['src/a.ts'], ['S-1.2'])]);
+    put([s('S-1.1', ['src/a.ts']), s('S-1.2', ['src/a.ts'], ['S-1.1'])]);
     const chained = b.run(['refine', 'done', 'docs/1-a.md']);
     ok('a part that must land before another is a split worth making',
-      chained.code === 0 && has(chained.out, 'S-1.3'), chained.out);
+      chained.code === 0 && has(chained.out, 'S-1.2'), chained.out);
   }
 
   // `builtOn` — the reading the refining agent actually did — reached the report
@@ -4273,6 +4287,141 @@ sect(() => {
     ok('nor is a url', !has(m.out, 'x.dev'), m.out);
     ok('while a real path is found', has(m.out, '1 plan(s)'), m.out);
   }
+});
+
+// --------------------------------------------- a third runner: Claude Code
+// Cursor picks a model per tier and opencode picks an effort; Claude Code picks
+// both — Sonnet across the lower tiers, Opus across the upper ones, each at the
+// effort its tier chose. Its log is Cursor's envelope with the tool calls moved
+// inside the assistant message, which is the only thing downstream had to learn.
+say('running a round on Claude Code');
+sect(() => {
+  const ROOT = path.dirname(fileURLToPath(import.meta.url));
+  const O = path.join(ROOT, 'claude-cursor', 'orchestrate.mjs');
+  const MODELS = path.join(ROOT, 'claude-cursor', 'scripts', 'models.mjs');
+  const HARVEST = path.join(ROOT, 'claude-cursor', 'scripts', 'harvest.mjs');
+
+  const d = bare('cc-round');
+  const stub = path.join(d, 'stub');
+  fs.mkdirSync(stub, { recursive: true });
+  // Never executed: every test here stops before a run. It exists so the table
+  // can find a binary, which is what `runner use` insists on.
+  fs.writeFileSync(path.join(stub, 'claude'), '#!/usr/bin/env bash\nexit 0\n', { mode: 0o755 });
+  fs.writeFileSync(path.join(stub, 'agent'),
+    '#!/usr/bin/env bash\necho "Created chat 11111111-2222-3333-4444-555555555555"\n', { mode: 0o755 });
+  const real = JSON.parse(fs.readFileSync(path.join(ROOT, 'claude-cursor', 'models.json'), 'utf8'));
+  real.runners.claude = { ...real.runners.claude, search: [stub] };
+  const table = path.join(d, 'models.json');
+  fs.writeFileSync(table, JSON.stringify(real, null, 2));
+
+  const wts = path.join(d, 'wts');
+  fs.mkdirSync(wts, { recursive: true });
+  const env = { ...process.env, CURSOR_ORCH_WT: wts, CURSOR_ORCH_MODELS: table };
+  const run = (args, input) => {
+    try { return { code: 0, out: execFileSync('node', [O, ...args], { cwd: d, encoding: 'utf8', input, env, stdio: ['pipe', 'pipe', 'pipe'] }) }; }
+    catch (e) { return { code: e.status ?? -1, out: String(e.stdout || '') + String(e.stderr || '') }; }
+  };
+  const mrun = (args) => {
+    try { return { code: 0, out: execFileSync('node', [MODELS, ...args], { cwd: d, encoding: 'utf8', env, stdio: ['pipe', 'pipe', 'pipe'] }) }; }
+    catch (e) { return { code: e.status ?? -1, out: String(e.stdout || '') + String(e.stderr || '') }; }
+  };
+  const git = (args, cwd = d) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] });
+  git(['init', '-q', '-b', 'main']);
+  git(['config', 'user.email', 'ci@example.invalid']);
+  git(['config', 'user.name', 'ci']);
+  fs.mkdirSync(path.join(d, 'docs'), { recursive: true });
+  fs.mkdirSync(path.join(d, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(d, 'docs', '1-a.md'), '# A\n');
+  fs.writeFileSync(path.join(d, 'src', 'a.ts'), 'orig\n');
+  git(['add', '-A']); git(['commit', '-qm', 'init']);
+  run(['load', 'docs']);
+  run(['step', 'add'], JSON.stringify([{ key: 'S-1', title: 'one', plan: 'docs/1-a.md', owns: ['src/a.ts'], verify: ['true'] }]));
+  run(['assess', 'propose'], JSON.stringify([{ key: 'S-1', tier: 'medium', why: 'test' }]));
+
+  // --- a tier picks a model AND an effort ---------------------------------
+  ok('the default tier resolves to Sonnet reaching',
+    mrun(['resolve', '--runner', 'claude', 'medium']).out.trim() === 'claude-sonnet-5\tclaude-sonnet-5\thigh',
+    mrun(['resolve', '--runner', 'claude', 'medium']).out);
+  // The rung above it swaps the model rather than the dial, so the effort goes
+  // DOWN while the ladder goes up. A test that assumed effort climbs with tier
+  // would be asserting the opposite of what this ladder says.
+  ok('and the rung above it swaps Sonnet reaching for Opus unhurried',
+    mrun(['resolve', '--runner', 'claude', 'high']).out.trim() === 'claude-opus-5\tclaude-opus-5\tmedium',
+    mrun(['resolve', '--runner', 'claude', 'high']).out);
+  ok('and the top of the ladder is Opus at the top effort',
+    mrun(['resolve', '--runner', 'claude', 'xhigh']).out.trim() === 'claude-opus-5\tclaude-opus-5\txhigh',
+    mrun(['resolve', '--runner', 'claude', 'xhigh']).out);
+  ok('the cursor ladder is untouched by any of it',
+    mrun(['resolve', 'high']).out.startsWith('cursor-grok-4.6-high'), mrun(['resolve', 'high']).out);
+  const eff = mrun(['efforts', '--runner', 'claude']);
+  ok('and the table says which tiers collapsed onto one effort',
+    has(eff.out, 'claude-sonnet-5') && has(eff.out, 'claude-opus-5') && has(eff.out, 'same effort here'), eff.out);
+
+  // --- the run is checked against the model that answered -----------------
+  // opencode cannot do this — its log names no model. Claude Code's does, in
+  // the same `system/init` event Cursor uses, so a silent downgrade is caught.
+  ok('a Claude run that answers to its own alias verifies',
+    mrun(['verify', '--want', 'claude-opus-5', '--got', 'opus']).code === 0);
+  ok('and one that came back as the other model does not',
+    mrun(['verify', '--want', 'claude-opus-5', '--got', 'claude-sonnet-5']).code === 1);
+
+  // --- choosing it, and opening a step on it ------------------------------
+  const used = run(['runner', 'use', 'claude']);
+  ok('the runner can be chosen', used.code === 0 && has(used.out, 'runs on claude'), used.out);
+  const show = run(['runner']);
+  ok('and it says which model each tier gets',
+    has(show.out, 'claude-sonnet-5') && has(show.out, 'claude-opus-5'), show.out);
+
+  const open = run(['run', 'open', 'S-1']);
+  ok('a step opens on it', open.code === 0, open.out);
+  ok('the launcher line names the runner', has(open.out, '--runner claude'), open.out);
+  // Claude Code takes --session-id, so unlike opencode the address exists
+  // before the run — which is what makes the launcher's automatic resume
+  // after a cut-off available to it at all.
+  ok('and a conversation is minted for it up front', has(open.out, 'chat      '), open.out);
+
+  // --- an unhandled problem has somewhere to go --------------------------
+  const brief = fs.readFileSync(path.join(d, '.claude', 'orch', 'briefs', 'S-1.md'), 'utf8');
+  ok('the brief tells the agent where a problem it did not fix goes',
+    has(brief, 'docs/temp_bugs/S-1.md'), brief.slice(-1200));
+
+  // ...and writing there is not a trespass. A step that reported a problem it
+  // could not fix must not fail its guard for having reported it.
+  const wt = path.join(wts, path.basename(d) + '-wt-S-1');
+  fs.mkdirSync(path.join(wt, 'docs', 'temp_bugs'), { recursive: true });
+  fs.writeFileSync(path.join(wt, 'docs', 'temp_bugs', 'S-1.md'), '# left behind\n');
+  fs.writeFileSync(path.join(wt, 'src', 'a.ts'), 'changed\n');
+  git(['add', '-A'], wt); git(['commit', '-qm', 'work'], wt);
+  const guard = run(['guard', 'S-1']);
+  ok('and guard does not call the bug file a file the step does not own',
+    guard.code === 0 && has(guard.out, 'everything it touched, it owns'), guard.out);
+
+  // --- the log reads back ------------------------------------------------
+  // Claude Code emits no `tool_call` events: its calls are content blocks in
+  // the assistant message, answered by a tool_result in the next user message.
+  // Read without that, every Claude run harvests as "0 file(s) changed".
+  const log = path.join(d, 'cc.jsonl');
+  fs.writeFileSync(log, [
+    JSON.stringify({ type: 'system', subtype: 'init', cwd: '/w', session_id: 'ses-1', model: 'claude-opus-5' }),
+    JSON.stringify({ type: 'assistant', message: { content: [
+      { type: 'tool_use', id: 't1', name: 'Write', input: { file_path: '/w/src/a.ts', content: 'x' } },
+      { type: 'tool_use', id: 't2', name: 'Bash', input: { command: 'false' } }] } }),
+    JSON.stringify({ type: 'user', message: { content: [
+      { type: 'tool_result', tool_use_id: 't1', content: 'ok' },
+      { type: 'tool_result', tool_use_id: 't2', content: 'Exit code 1', is_error: true }] } }),
+    JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'done' }),
+  ].join('\n') + '\n');
+  const hv = (() => {
+    try { return execFileSync('node', [HARVEST, log], { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }); }
+    catch (e) { return String(e.stdout || ''); }
+  })();
+  const rec = JSON.parse(hv);
+  ok('a Claude log yields the files it wrote, relative to its own cwd',
+    rec.files.length === 1 && rec.files[0].path === 'src/a.ts', hv.slice(0, 600));
+  ok('and the command that failed, with an exit code readers understand',
+    rec.commands.length === 1 && rec.commands[0].command === 'false' && rec.commands[0].exitCode === 1, hv.slice(0, 900));
+  ok('and it is recorded as having passed on the model that answered',
+    rec.outcome === 'passed' && rec.model === 'claude-opus-5' && rec.session === 'ses-1', hv.slice(0, 400));
 });
 
 // -------------------------------------------------- a second runner: opencode
@@ -5164,7 +5313,7 @@ else console.log('\nsandboxes kept: ' + boxes.join('\n                '));
 // the suite still ends on "all green", because green is only ever measured
 // against however many checks happened to run. Under a shard the total is the
 // runner's to check, since no one process sees them all.
-const EXPECTED = 968;   // every check above counts; raise it deliberately when you add one
+const EXPECTED = 988;   // every check above counts; raise it deliberately when you add one
 const total = pass + failures.length;
 const partial = Boolean(SHARD || ONLY);
 

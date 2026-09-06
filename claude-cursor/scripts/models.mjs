@@ -107,7 +107,13 @@ const andList = (xs) => xs.length < 2 ? String(xs[0] ?? '')
 // Every spelling a row answers to. `shown` is the old single-string form and is
 // still read, so a table written before this change still works.
 export const namesOf = (row) => (row.accepts && row.accepts.length ? row.accepts : [row.shown]).filter(Boolean);
-const rowFor = (m, want) => m.ladder.find((r) => r.id === want || namesOf(r).includes(want));
+// Every row that could have run, whichever runner it belongs to. A runner with
+// a `ladder` of its own (Claude Code) reports a model in its opening event just
+// as Cursor does, so `verify` has to be able to find its accepted spellings —
+// searching only the Cursor ladder would leave every Claude run compared
+// against a single string and thrown away on the first alternate spelling.
+const allRows = (m) => [...m.ladder, ...Object.values(m.runners || {}).flatMap((r) => r.ladder || [])];
+const rowFor = (m, want) => allRows(m).find((r) => r.id === want || namesOf(r).includes(want));
 
 // The whole check. `-fast` is refused on its own line rather than folded into
 // the mismatch, so a fast run is reported for being fast instead of for being
@@ -197,9 +203,23 @@ switch (cmd) {
       process.stdout.write(row.id + '\t' + namesOf(row)[0] + '\n');
       break;
     }
-    // Another runner: one model, so a tier picks an effort instead. Same
-    // tab-separated shape, with the effort in the third field.
+    // A runner with a ladder of its own picks a model per tier, like Cursor,
+    // and the effort it runs at with it. Same tab-separated shape; the third
+    // field is that effort. It is checked against the vocabulary on the runner
+    // row — `--effort nonsense` is a hard error from Claude Code rather than
+    // the silence opencode answers a bad `--variant` with, but a round should
+    // still fail here rather than once per step inside a backgrounded run.
     const tier = m.roles[name] || name;
+    if (r.ladder) {
+      const row = r.ladder.find((x) => x.tier === tier);
+      if (!row) die(`runner "${flag('--runner')}" has no row for tier "${tier}".\n` +
+        `  tiers: ${r.ladder.map((x) => x.tier).join(', ')}`);
+      if (r.takesEfforts && !r.takesEfforts.includes(row.effort)) die(
+        `the ladder maps tier "${tier}" to effort "${row.effort}", which ${r.bin} does not accept.\n` +
+        `  it accepts: ${r.takesEfforts.join(', ')}`);
+      process.stdout.write(row.id + '\t' + namesOf(row)[0] + '\t' + row.effort + '\n');
+      break;
+    }
     const effort = (r.efforts || {})[tier];
     if (!effort) die(`runner "${flag('--runner')}" has no effort for tier "${tier}".\n` +
       `  tiers: ${Object.keys(r.efforts || {}).join(', ')}`);
@@ -261,6 +281,28 @@ switch (cmd) {
   case 'efforts': {
     const r = runnerOf(m, flag('--runner') || positionals[0]);
     if (!r) die('efforts is for a non-Cursor runner — try `models.mjs list`');
+    if (r.ladder) {
+      console.log(`${r.shown || r.bin}  (a model per tier, and the effort it runs at)`);
+      console.log(`  accepts: ${(r.takesEfforts || []).join(', ') || '(no vocabulary recorded)'}`);
+      console.log(`  verified after the run: ${r.verifiable ? 'yes — the log names the model' : 'no'}`);
+      console.log('\n  tier      model              effort');
+      for (const x of r.ladder) {
+        const bad = r.takesEfforts && !r.takesEfforts.includes(x.effort);
+        console.log('  ' + x.tier.padEnd(10) + x.id.padEnd(19) + x.effort + (bad ? '   ✗ not accepted' : ''));
+      }
+      // Grouped by model AND effort, not by effort alone. On this ladder the
+      // effort dial goes down where the model goes up, so two tiers can share
+      // an effort and buy something entirely different — calling Opus at
+      // medium the same rung as Sonnet at medium is the opposite of true.
+      const byRung = {};
+      for (const x of r.ladder) (byRung[x.id + " at " + x.effort] ||= []).push(x.tier);
+      const shared = Object.entries(byRung).filter(([, ts]) => ts.length > 1);
+      if (shared.length) {
+        console.log('');
+        for (const [rung, ts] of shared) console.log(`  ${andList(ts)} are the same model at the same effort here (${rung}).`);
+      }
+      break;
+    }
     const allowed = effortsOf(r);
     console.log(`${r.shown || r.model}  (${r.model})`);
     console.log(`  accepts: ${allowed.values ? allowed.values.join(', ') : `(${allowed.why} — nothing to check against)`}`);
@@ -307,9 +349,10 @@ switch (cmd) {
     const runnerFlag = flag('--runner');
     if (runnerFlag && runnerFlag !== 'cursor') die(
       `sync only regenerates the cursor ladder's "shown" names, from \`agent --list-models\`.\n` +
-      `  opencode has one model, and its accepted efforts are read live from its own\n` +
-      `  registry on every \`resolve\`/\`effort-check\` — there is nothing here to sync.\n` +
-      `  See \`models.mjs efforts --runner opencode\`.`);
+      `  No other runner has a listing to read: opencode's accepted efforts come live\n` +
+      `  from its own registry, and Claude Code's come from a fixed vocabulary — both\n` +
+      `  are checked on every \`resolve\`, so there is nothing here to regenerate.\n` +
+      `  See \`models.mjs efforts --runner ${runnerFlag}\`.`);
     const dry = rest.includes('--dry-run');
     const live = listModels();
     const changes = [], gone = [];
